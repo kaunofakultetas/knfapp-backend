@@ -66,4 +66,21 @@ def create_app():
     def health():
         return {"status": "ok", "service": "knfapp-backend"}
 
+    # JSON error handlers for API routes (Flask defaults return HTML)
+    @app.errorhandler(400)
+    def bad_request(e):
+        return {"error": "Bad request"}, 400
+
+    @app.errorhandler(404)
+    def not_found(e):
+        return {"error": "Not found"}, 404
+
+    @app.errorhandler(405)
+    def method_not_allowed(e):
+        return {"error": "Method not allowed"}, 405
+
+    @app.errorhandler(500)
+    def internal_error(e):
+        return {"error": "Internal server error"}, 500
+
     return app
