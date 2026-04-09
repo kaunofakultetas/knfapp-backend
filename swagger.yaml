@@ -1,0 +1,449 @@
+openapi: 3.0.3
+info:
+  title: KNFAPP API
+  description: Backend API for VU Kaunas Faculty mobile app
+  version: 1.0.0
+  contact:
+    name: VU KNF IT
+servers:
+  - url: /api
+    description: API server
+
+tags:
+  - name: health
+    description: Health check
+  - name: auth
+    description: Authentication & registration
+  - name: news
+    description: News feed
+  - name: schedule
+    description: Class timetable
+  - name: admin
+    description: Admin operations
+  - name: scraper
+    description: News scraper status
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /auth/register:
+    post:
+      tags: [auth]
+      summary: Register with invitation code
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [invitation_code, username, password, display_name, email]
+              properties:
+                invitation_code:
+                  type: string
+                username:
+                  type: string
+                password:
+                  type: string
+                  minLength: 6
+                display_name:
+                  type: string
+                email:
+                  type: string
+                  format: email
+      responses:
+        "201":
+          description: User created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          description: Invalid input or invitation code
+
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Login with username/email and password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "401":
+          description: Invalid credentials
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: Get current user info
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: User info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          description: Not authenticated
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Logout (invalidate session)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Logged out
+
+  /news:
+    get:
+      tags: [news]
+      summary: Get unified news feed
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 50
+        - name: source
+          in: query
+          schema:
+            type: string
+            enum: [knf.vu.lt, vu.lt, faculty, user, app]
+      responses:
+        "200":
+          description: Feed page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  posts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/NewsPost"
+                  page:
+                    type: integer
+                  perPage:
+                    type: integer
+                  total:
+                    type: integer
+                  hasMore:
+                    type: boolean
+
+  /news/{postId}:
+    get:
+      tags: [news]
+      summary: Get a single post
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Post details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NewsPost"
+        "404":
+          description: Not found
+
+  /news/{postId}/like:
+    post:
+      tags: [news]
+      summary: Toggle like on a post
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Like toggled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  liked:
+                    type: boolean
+                  likes:
+                    type: integer
+
+  /news/{postId}/comments:
+    get:
+      tags: [news]
+      summary: Get comments for a post
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+      responses:
+        "200":
+          description: Comments list
+    post:
+      tags: [news]
+      summary: Add a comment
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+      responses:
+        "201":
+          description: Comment created
+
+  /schedule:
+    get:
+      tags: [schedule]
+      summary: Get schedule/timetable
+      parameters:
+        - name: day
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 6
+        - name: group
+          in: query
+          schema:
+            type: string
+        - name: semester
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Lessons for the day
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lessons:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Lesson"
+
+  /admin/invitations:
+    post:
+      tags: [admin]
+      summary: Create invitation code
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role:
+                  type: string
+                  enum: [student, teacher, admin, curator]
+                  default: student
+                max_uses:
+                  type: integer
+                  default: 1
+                expires_hours:
+                  type: integer
+                  default: 168
+      responses:
+        "201":
+          description: Invitation created
+    get:
+      tags: [admin]
+      summary: List invitation codes
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Invitation list
+
+  /admin/users:
+    get:
+      tags: [admin]
+      summary: List all users
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: User list
+
+  /admin/stats:
+    get:
+      tags: [admin]
+      summary: Admin dashboard stats
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Stats
+
+  /scraper/status:
+    get:
+      tags: [scraper]
+      summary: Recent scraper runs
+      responses:
+        "200":
+          description: Scraper run history
+
+  /scraper/trigger:
+    post:
+      tags: [scraper]
+      summary: Manually trigger scrape (admin only)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Scrape results
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        email:
+          type: string
+        displayName:
+          type: string
+        role:
+          type: string
+        avatarUrl:
+          type: string
+          nullable: true
+
+    AuthResponse:
+      type: object
+      properties:
+        user:
+          $ref: "#/components/schemas/User"
+        token:
+          type: string
+
+    NewsPost:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        content:
+          type: string
+        summary:
+          type: string
+        imageUrl:
+          type: string
+          nullable: true
+        author:
+          type: string
+        source:
+          type: string
+        sourceUrl:
+          type: string
+          nullable: true
+        postType:
+          type: string
+        likes:
+          type: integer
+        comments:
+          type: integer
+        shares:
+          type: integer
+        date:
+          type: string
+        isPublic:
+          type: boolean
+
+    Lesson:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        teacher:
+          type: string
+        room:
+          type: string
+        timeStart:
+          type: string
+        timeEnd:
+          type: string
+        dayOfWeek:
+          type: integer
+        group:
+          type: string
+        semester:
+          type: string

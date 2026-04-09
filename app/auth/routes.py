@@ -1,0 +1,230 @@
+"""Authentication routes — invitation-based registration, login, sessions."""
+
+import uuid
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+
+import bcrypt
+import jwt
+from flask import Blueprint, current_app, jsonify, request
+
+from app.database import get_db
+
+auth_bp = Blueprint("auth", __name__)
+
+
+def get_current_user():
+    """Extract user from Authorization header. Returns user dict or None."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+
+    token = auth_header[7:]
+    db = get_db()
+    try:
+        session = db.execute(
+            "SELECT s.user_id, s.expires_at FROM sessions s WHERE s.token = ?",
+            (token,),
+        ).fetchone()
+
+        if not session:
+            return None
+
+        expires = datetime.fromisoformat(session["expires_at"]).replace(tzinfo=None)
+        if expires < datetime.utcnow():
+            db.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            db.commit()
+            return None
+
+        user = db.execute("SELECT * FROM users WHERE id = ?", (session["user_id"],)).fetchone()
+        return dict(user) if user else None
+    finally:
+        db.close()
+
+
+def require_auth(f):
+    """Decorator requiring valid authentication."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        user = get_current_user()
+        if not user:
+            return jsonify({"error": "Authentication required"}), 401
+        request.user = user
+        return f(*args, **kwargs)
+    return decorated
+
+
+def require_role(*roles):
+    """Decorator requiring specific role(s)."""
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            user = get_current_user()
+            if not user:
+                return jsonify({"error": "Authentication required"}), 401
+            if user["role"] not in roles:
+                return jsonify({"error": "Insufficient permissions"}), 403
+            request.user = user
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
+
+
+@auth_bp.route("/register", methods=["POST"])
+def register():
+    """Register a new user with an invitation code."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    required = ["invitation_code", "username", "password", "display_name", "email"]
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+
+    if len(data["password"]) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+
+    db = get_db()
+    try:
+        # Validate invitation code
+        invite = db.execute(
+            "SELECT * FROM invitation_codes WHERE code = ?",
+            (data["invitation_code"],),
+        ).fetchone()
+
+        if not invite:
+            return jsonify({"error": "Invalid invitation code"}), 400
+
+        if invite["use_count"] >= invite["max_uses"]:
+            return jsonify({"error": "Invitation code has been fully used"}), 400
+
+        invite_expires = datetime.fromisoformat(invite["expires_at"]).replace(tzinfo=None)
+        if invite_expires < datetime.utcnow():
+            return jsonify({"error": "Invitation code has expired"}), 400
+
+        # Check uniqueness
+        existing = db.execute(
+            "SELECT id FROM users WHERE username = ? OR email = ?",
+            (data["username"], data["email"]),
+        ).fetchone()
+        if existing:
+            return jsonify({"error": "Username or email already exists"}), 409
+
+        # Create user
+        user_id = str(uuid.uuid4())
+        password_hash = bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()
+
+        db.execute(
+            "INSERT INTO users (id, username, email, display_name, password_hash, role) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, data["username"], data["email"], data["display_name"], password_hash, invite["role"]),
+        )
+
+        # Increment invitation use count
+        db.execute(
+            "UPDATE invitation_codes SET use_count = use_count + 1 WHERE id = ?",
+            (invite["id"],),
+        )
+
+        # Create session
+        token = str(uuid.uuid4())
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        db.execute(
+            "INSERT INTO sessions (id, user_id, token, expires_at) VALUES (?, ?, ?, ?)",
+            (str(uuid.uuid4()), user_id, token, expires_at),
+        )
+        db.commit()
+
+        return jsonify({
+            "user": {
+                "id": user_id,
+                "username": data["username"],
+                "email": data["email"],
+                "displayName": data["display_name"],
+                "role": invite["role"],
+            },
+            "token": token,
+        }), 201
+
+    finally:
+        db.close()
+
+
+@auth_bp.route("/login", methods=["POST"])
+def login():
+    """Login with username/email and password."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    identifier = data.get("username") or data.get("email")
+    password = data.get("password")
+
+    if not identifier or not password:
+        return jsonify({"error": "Username/email and password required"}), 400
+
+    db = get_db()
+    try:
+        user = db.execute(
+            "SELECT * FROM users WHERE username = ? OR email = ?",
+            (identifier, identifier),
+        ).fetchone()
+
+        if not user:
+            return jsonify({"error": "Invalid credentials"}), 401
+
+        if not bcrypt.checkpw(password.encode(), user["password_hash"].encode()):
+            return jsonify({"error": "Invalid credentials"}), 401
+
+        # Create session
+        token = str(uuid.uuid4())
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        db.execute(
+            "INSERT INTO sessions (id, user_id, token, expires_at) VALUES (?, ?, ?, ?)",
+            (str(uuid.uuid4()), user["id"], token, expires_at),
+        )
+        db.commit()
+
+        return jsonify({
+            "user": {
+                "id": user["id"],
+                "username": user["username"],
+                "email": user["email"],
+                "displayName": user["display_name"],
+                "role": user["role"],
+                "avatarUrl": user["avatar_url"],
+            },
+            "token": token,
+        })
+
+    finally:
+        db.close()
+
+
+@auth_bp.route("/me", methods=["GET"])
+@require_auth
+def me():
+    """Get current user info."""
+    u = request.user
+    return jsonify({
+        "id": u["id"],
+        "username": u["username"],
+        "email": u["email"],
+        "displayName": u["display_name"],
+        "role": u["role"],
+        "avatarUrl": u["avatar_url"],
+    })
+
+
+@auth_bp.route("/logout", methods=["POST"])
+@require_auth
+def logout():
+    """Invalidate current session."""
+    token = request.headers.get("Authorization", "")[7:]
+    db = get_db()
+    try:
+        db.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        db.commit()
+        return jsonify({"message": "Logged out"})
+    finally:
+        db.close()
