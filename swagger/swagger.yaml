@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: KNFAPP API
   description: Backend API for VU Kaunas Faculty mobile app
-  version: 1.3.0
+  version: 1.4.0
   contact:
     name: VU KNF IT
 servers:
@@ -28,6 +28,8 @@ tags:
     description: Friends, profiles, wall posts
   - name: polls
     description: Post polls & voting
+  - name: uploads
+    description: File uploads (images)
 
 paths:
   /health:
@@ -1145,6 +1147,67 @@ paths:
       responses:
         "200":
           description: Scrape results
+
+  /uploads:
+    post:
+      tags: [uploads]
+      summary: Upload an image file
+      description: |
+        Upload an image (jpg, jpeg, png, gif, webp). Max 5 MB.
+        Returns a URL path to access the uploaded file.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "201":
+          description: File uploaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  url:
+                    type: string
+                    example: /api/uploads/abc123.png
+                  filename:
+                    type: string
+                    example: abc123.png
+        "400":
+          description: Bad request (no file, invalid type, too large)
+        "401":
+          description: Authentication required
+
+  /uploads/{filename}:
+    get:
+      tags: [uploads]
+      summary: Serve an uploaded file
+      description: No authentication required. Images are publicly accessible.
+      parameters:
+        - in: path
+          name: filename
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The image file
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: File not found
 
 components:
   securitySchemes:

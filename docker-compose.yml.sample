@@ -17,6 +17,7 @@ services:
       - SECRET_KEY=${SECRET_KEY}
       - JWT_SECRET=${JWT_SECRET}
       - DB_PATH=/data/knfapp.db
+      - UPLOAD_DIR=/data/uploads
       - INVITATION_EXPIRY_HOURS=${INVITATION_EXPIRY_HOURS:-168}
     volumes:
       - ./_DATA/knfapp-backend:/data

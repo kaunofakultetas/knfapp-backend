@@ -20,6 +20,7 @@ def create_app():
     app.config["DB_PATH"] = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "..", "data", "knfapp.db"))
     app.config["JWT_SECRET"] = os.environ.get("JWT_SECRET", "jwt-dev-secret-change-me")
     app.config["INVITATION_EXPIRY_HOURS"] = int(os.environ.get("INVITATION_EXPIRY_HOURS", "168"))
+    app.config["UPLOAD_DIR"] = os.environ.get("UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "..", "data", "uploads"))
 
     # ProxyFix for running behind Caddy
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
@@ -45,6 +46,7 @@ def create_app():
     from app.scraper.routes import scraper_bp
     from app.chat.routes import chat_bp
     from app.social.routes import social_bp
+    from app.uploads.routes import uploads_bp
 
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(news_bp, url_prefix="/api/news")
@@ -53,6 +55,7 @@ def create_app():
     app.register_blueprint(scraper_bp, url_prefix="/api/scraper")
     app.register_blueprint(chat_bp, url_prefix="/api/chat")
     app.register_blueprint(social_bp, url_prefix="/api/social")
+    app.register_blueprint(uploads_bp, url_prefix="/api/uploads")
 
     # Register Socket.IO events for real-time chat
     from app.chat.events import register_socket_events
