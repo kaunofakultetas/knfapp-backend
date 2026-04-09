@@ -111,7 +111,7 @@ def get_feed():
         rows = db.execute(query, params).fetchall()
         posts = [_post_to_dict(row) for row in rows]
 
-        # Add like status for authenticated users
+        # Add like status
         if user:
             post_ids = [p["id"] for p in posts]
             if post_ids:
@@ -123,6 +123,9 @@ def get_feed():
                 liked_set = {r["post_id"] for r in liked}
                 for p in posts:
                     p["liked"] = p["id"] in liked_set
+        else:
+            for p in posts:
+                p["liked"] = False
 
         # Total count for pagination
         count_row = db.execute(
@@ -253,6 +256,7 @@ def add_comment(post_id):
             "text": data["text"].strip(),
             "time": datetime.utcnow().isoformat(),
             "userName": request.user["display_name"],
+            "userAvatar": request.user.get("avatar_url"),
             "userId": request.user["id"],
         }), 201
     finally:

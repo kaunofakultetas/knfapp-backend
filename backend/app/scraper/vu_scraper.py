@@ -203,9 +203,11 @@ def _fetch_vu_article(url):
 
     published_at = datetime.utcnow().isoformat()
     if date_str:
+        # Strip timezone suffix if present (e.g. "+03:00", "Z")
+        clean = date_str.replace("Z", "").split("+")[0].split(".")[0]
         for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"]:
             try:
-                published_at = datetime.strptime(date_str[:len(fmt) - 2], fmt).isoformat()
+                published_at = datetime.strptime(clean, fmt).isoformat()
                 break
             except (ValueError, IndexError):
                 continue

@@ -1,19 +1,30 @@
 """Database initialization and helpers."""
 
+import logging
 import sqlite3
-import os
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import bcrypt
 
 _db_path = None
+logger = logging.getLogger(__name__)
 
 
 def init_db(db_path):
-    """Initialize the database with schema."""
+    """Initialize the database with schema and seed data."""
     global _db_path
     _db_path = db_path
 
     conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA)
     conn.commit()
+
+    # Seed default admin user if no users exist
+    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    if count == 0:
+        _seed_defaults(conn)
+
     conn.close()
 
 
@@ -24,6 +35,49 @@ def get_db():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _seed_defaults(conn):
+    """Create default admin user and initial invitation code."""
+    admin_id = str(uuid.uuid4())
+    pw_hash = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode()
+
+    conn.execute(
+        "INSERT INTO users (id, username, email, display_name, password_hash, role) VALUES (?, ?, ?, ?, ?, ?)",
+        (admin_id, "admin", "admin@knf.vu.lt", "Administratorius", pw_hash, "admin"),
+    )
+
+    # Create a reusable invitation code for testing
+    invite_id = str(uuid.uuid4())
+    code = "WELCOME-KNF-2026"
+    expires = (datetime.now(timezone.utc) + timedelta(days=365)).isoformat()
+    conn.execute(
+        "INSERT INTO invitation_codes (id, code, role, created_by, max_uses, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (invite_id, code, "student", admin_id, 100, expires),
+    )
+
+    # Seed schedule data
+    lessons = [
+        ("Kalbos kultūra ir akademinis raštingumas", "Doc. dr. R. Baranauskienė", "201", "08:30", "10:00", 0, "ISKS-1", "2025-pavasaris"),
+        ("Informacinės technologijos", "Lekt. T. Vanagas", "305", "10:15", "11:45", 0, "ISKS-1", "2025-pavasaris"),
+        ("Matematika", "Prof. dr. A. Kazlauskas", "101", "12:00", "13:30", 0, "ISKS-1", "2025-pavasaris"),
+        ("Filosofijos įvadas", "Doc. dr. V. Rimkus", "202", "14:00", "15:30", 0, "ISKS-1", "2025-pavasaris"),
+        ("Programavimo pagrindai", "Lekt. T. Vanagas", "305", "08:30", "10:00", 1, "ISKS-1", "2025-pavasaris"),
+        ("Anglų kalba B2", "Lekt. J. Brown", "203", "10:15", "11:45", 1, "ISKS-1", "2025-pavasaris"),
+        ("Statistika", "Doc. dr. S. Petravičius", "101", "08:30", "10:00", 2, "ISKS-1", "2025-pavasaris"),
+        ("Ekonomikos pagrindai", "Prof. dr. K. Jonaitis", "202", "10:15", "11:45", 2, "ISKS-1", "2025-pavasaris"),
+        ("Teisės pagrindai", "Doc. dr. A. Navickas", "201", "12:00", "13:30", 3, "ISKS-1", "2025-pavasaris"),
+        ("Psichologijos įvadas", "Prof. dr. L. Mikalauskaitė", "301", "14:00", "15:30", 3, "ISKS-1", "2025-pavasaris"),
+        ("Kūno kultūra", "Lekt. M. Sportininkas", "Sporto salė", "08:30", "10:00", 4, "ISKS-1", "2025-pavasaris"),
+    ]
+    for title, teacher, room, start, end, day, group, semester in lessons:
+        conn.execute(
+            "INSERT INTO schedule_lessons (id, title, teacher, room, time_start, time_end, day_of_week, group_name, semester) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), title, teacher, room, start, end, day, group, semester),
+        )
+
+    conn.commit()
+    logger.info("Seeded default admin (admin/admin123), invitation code WELCOME-KNF-2026, and schedule")
 
 
 _SCHEMA = """

@@ -53,29 +53,27 @@ def scrape_knf_news(pages=2):
 
             soup = BeautifulSoup(resp.text, "lxml")
 
-            # Find article links - knf.vu.lt uses h4 > a pattern in aktualijos
-            # Also try common Joomla blog patterns
+            # knf.vu.lt uses h2.article-title > a for article links
             article_links = []
 
-            # Pattern 1: h4 > a with /aktualijos/ links
-            for h4 in soup.find_all("h4"):
-                a = h4.find("a", href=True)
+            # Pattern 1: h2.article-title > a (current site structure)
+            for h2 in soup.select("h2.article-title"):
+                a = h2.find("a", href=True)
                 if a and "/aktualijos/" in a["href"]:
                     article_links.append(a)
 
-            # Pattern 2: h2 > a with /aktualijos/ links (some Joomla templates)
+            # Pattern 2: h4 > a (fallback for older Joomla templates)
             if not article_links:
-                for h2 in soup.find_all("h2"):
-                    a = h2.find("a", href=True)
+                for h4 in soup.find_all("h4"):
+                    a = h4.find("a", href=True)
                     if a and "/aktualijos/" in a["href"]:
                         article_links.append(a)
 
-            # Pattern 3: any link to /aktualijos/ that looks like an article
+            # Pattern 3: any heading with .article-title class
             if not article_links:
-                for a in soup.find_all("a", href=True):
-                    href = a["href"]
-                    if "/aktualijos/" in href and href != "/aktualijos" and a.get_text(strip=True):
-                        article_links.append(a)
+                for heading in soup.select("[class*='article-title'] a"):
+                    if "/aktualijos/" in heading.get("href", ""):
+                        article_links.append(heading)
 
             seen_hrefs = set()
             for link in article_links:
@@ -85,9 +83,9 @@ def scrape_knf_news(pages=2):
                 seen_hrefs.add(href)
 
                 full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
-                title = link.get_text(strip=True)
+                listing_title = link.get_text(strip=True)
 
-                if not title:
+                if not listing_title:
                     continue
 
                 articles_found += 1
@@ -104,6 +102,9 @@ def scrape_knf_news(pages=2):
                 if not article_data:
                     continue
 
+                # Use article page title if available, else listing title
+                title = article_data.get("title") or listing_title
+
                 post_id = str(uuid.uuid4())
                 db.execute(
                     """INSERT INTO news_posts
@@ -111,7 +112,7 @@ def scrape_knf_news(pages=2):
                        VALUES (?, ?, ?, ?, ?, ?, 'knf.vu.lt', ?, 'article', ?)""",
                     (
                         post_id,
-                        article_data.get("title", title),
+                        title,
                         article_data.get("content", ""),
                         article_data.get("summary", ""),
                         article_data.get("image_url"),
@@ -162,70 +163,100 @@ def _fetch_article(url):
 
     soup = BeautifulSoup(resp.text, "lxml")
 
-    # Title: try multiple selectors
+    # Title: prefer og:title (most reliable), strip site prefix
     title = ""
-    for selector in ["h2.item-title", "h1.item-title", "h2", "h1", ".page-header h2"]:
-        el = soup.select_one(selector)
-        if el:
-            title = el.get_text(strip=True)
-            break
+    og_title = soup.find("meta", {"property": "og:title"})
+    if og_title and og_title.get("content"):
+        title = og_title["content"]
+        # Strip common prefixes like "VU Kauno fakultetas - "
+        for prefix in ["VU Kauno fakultetas - ", "VU Kauno fakultetas – "]:
+            if title.startswith(prefix):
+                title = title[len(prefix):]
+                break
 
-    # Content: try article body selectors
+    # Fallback: article h1 tags — skip section headers like "Aktualijos"
+    if not title:
+        h1_tags = soup.find_all("h1")
+        for h1 in h1_tags:
+            text = h1.get_text(strip=True)
+            # Skip generic section headers
+            if text.lower() not in ("aktualijos", "naujienos", "renginiai", ""):
+                title = text
+                break
+
+    # Content: use .article-content which has the clean body text
     content = ""
-    for selector in [".item-page", ".article-content", ".item-content", "article", "#content .content"]:
+    for selector in [".article-content", ".item-page .article-body", ".item-content"]:
         el = soup.select_one(selector)
         if el:
-            # Remove scripts, styles, nav
             for tag in el.find_all(["script", "style", "nav", "header", "footer"]):
                 tag.decompose()
             content = el.get_text(separator="\n", strip=True)
             break
 
+    # Fallback: broader selectors
     if not content:
-        # Fallback: get main content area
-        main = soup.find("main") or soup.find("div", {"id": "content"}) or soup.find("div", {"class": "content"})
-        if main:
-            content = main.get_text(separator="\n", strip=True)
+        for selector in [".item-page", "article", "#content .content"]:
+            el = soup.select_one(selector)
+            if el:
+                for tag in el.find_all(["script", "style", "nav", "header", "footer"]):
+                    tag.decompose()
+                text = el.get_text(separator="\n", strip=True)
+                # Strip leading navigation text like "Smulkiau\nAktualijos\n..."
+                lines = text.split("\n")
+                # Find first line that's actual content (longer than 30 chars)
+                start = 0
+                for i, line in enumerate(lines):
+                    if len(line.strip()) > 30 and line.strip().lower() not in ("aktualijos", "naujienos"):
+                        start = i
+                        break
+                content = "\n".join(lines[start:])
+                break
 
     # Summary: first 200 chars of content
     summary = content[:200].rsplit(" ", 1)[0] + "..." if len(content) > 200 else content
 
-    # Image: first meaningful image
+    # Image: try og:image first, then article images
     image_url = None
-    for img in soup.find_all("img", src=True):
-        src = img["src"]
-        if any(skip in src.lower() for skip in ["logo", "icon", "banner", "pixel", "tracking"]):
-            continue
+    og_image = soup.find("meta", {"property": "og:image"})
+    if og_image and og_image.get("content"):
+        src = og_image["content"]
         if src.startswith("/"):
             src = f"{BASE_URL}{src}"
-        if src.startswith("http"):
-            image_url = src
-            break
-
-    # Date: look for date patterns
-    date_str = None
-    # Try meta tags
-    for meta in soup.find_all("meta", {"property": "article:published_time"}):
-        date_str = meta.get("content")
-        break
-
-    # Try common date selectors
-    if not date_str:
-        for selector in [".article-info time", ".published time", "time", ".date", ".article-date"]:
-            el = soup.select_one(selector)
-            if el:
-                date_str = el.get("datetime") or el.get_text(strip=True)
-                break
-
-    # Parse date or use now
-    published_at = datetime.utcnow().isoformat()
-    if date_str:
-        for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d %B %Y"]:
-            try:
-                published_at = datetime.strptime(date_str[:19], fmt[:len(date_str[:19])+2]).isoformat()
-                break
-            except (ValueError, IndexError):
+        image_url = src
+    else:
+        for img in soup.find_all("img", src=True):
+            src = img["src"]
+            if any(skip in src.lower() for skip in ["logo", "icon", "banner", "pixel", "tracking"]):
                 continue
+            if src.startswith("/"):
+                src = f"{BASE_URL}{src}"
+            if src.startswith("http"):
+                image_url = src
+                break
+
+    # Date: try <time> tag first (most reliable on knf.vu.lt)
+    published_at = datetime.utcnow().isoformat()
+    time_el = soup.find("time")
+    if time_el and time_el.get("datetime"):
+        dt_str = time_el["datetime"]
+        try:
+            # Parse ISO format like "2026-03-24T14:43:09+02:00"
+            parsed = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+            published_at = parsed.replace(tzinfo=None).isoformat()
+        except (ValueError, TypeError):
+            pass
+    else:
+        # Fallback: meta tags
+        for meta in soup.find_all("meta", {"property": "article:published_time"}):
+            dt_str = meta.get("content")
+            if dt_str:
+                try:
+                    parsed = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+                    published_at = parsed.replace(tzinfo=None).isoformat()
+                except (ValueError, TypeError):
+                    pass
+                break
 
     # Author
     author = "VU Kauno fakultetas"
