@@ -1,0 +1,528 @@
+"""Chat/messaging routes — conversations, messages, reactions."""
+
+import uuid
+from datetime import datetime
+
+from flask import Blueprint, jsonify, request
+
+from app.auth.routes import require_auth
+from app.database import get_db
+
+chat_bp = Blueprint("chat", __name__)
+
+
+def _format_time(iso_str):
+    """Format ISO datetime to HH:MM for display."""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime("%H:%M")
+    except (ValueError, TypeError):
+        return ""
+
+
+@chat_bp.route("/conversations", methods=["GET"])
+@require_auth
+def list_conversations():
+    """List all conversations the current user participates in."""
+    user_id = request.user["id"]
+    db = get_db()
+    try:
+        rows = db.execute(
+            """
+            SELECT c.id, c.type, c.title, c.avatar_emoji, c.created_at, c.updated_at,
+                   cp.pinned, cp.last_read_at
+            FROM conversations c
+            JOIN conversation_participants cp ON cp.conversation_id = c.id
+            WHERE cp.user_id = ?
+            ORDER BY cp.pinned DESC, c.updated_at DESC
+            """,
+            (user_id,),
+        ).fetchall()
+
+        conversations = []
+        for row in rows:
+            conv_id = row["id"]
+
+            # Get participants
+            participants = db.execute(
+                """
+                SELECT u.id, u.display_name, u.avatar_url
+                FROM conversation_participants cp
+                JOIN users u ON u.id = cp.user_id
+                WHERE cp.conversation_id = ?
+                """,
+                (conv_id,),
+            ).fetchall()
+
+            # Get last message
+            last_msg = db.execute(
+                """
+                SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id,
+                       u.display_name AS sender_name
+                FROM messages m
+                JOIN users u ON u.id = m.sender_id
+                WHERE m.conversation_id = ?
+                ORDER BY m.created_at DESC LIMIT 1
+                """,
+                (conv_id,),
+            ).fetchone()
+
+            # Count unread messages
+            last_read = row["last_read_at"] or "1970-01-01T00:00:00"
+            unread = db.execute(
+                """
+                SELECT COUNT(*) FROM messages
+                WHERE conversation_id = ? AND sender_id != ? AND created_at > ?
+                """,
+                (conv_id, user_id, last_read),
+            ).fetchone()[0]
+
+            # Build title for direct conversations
+            title = row["title"]
+            if row["type"] == "direct" and not title:
+                other = [p for p in participants if p["id"] != user_id]
+                title = other[0]["display_name"] if other else "Chat"
+
+            conv = {
+                "id": conv_id,
+                "type": row["type"],
+                "title": title,
+                "avatarEmoji": row["avatar_emoji"],
+                "pinned": bool(row["pinned"]),
+                "unreadCount": unread,
+                "lastUpdatedMs": int(
+                    datetime.fromisoformat(row["updated_at"]).timestamp() * 1000
+                ),
+                "participants": [
+                    {
+                        "id": p["id"],
+                        "displayName": p["display_name"],
+                        "avatarUrl": p["avatar_url"],
+                    }
+                    for p in participants
+                ],
+            }
+
+            if last_msg:
+                conv["lastMessage"] = {
+                    "id": last_msg["id"],
+                    "text": last_msg["text"] or "",
+                    "imageUrl": last_msg["image_url"],
+                    "time": _format_time(last_msg["created_at"]),
+                    "senderId": last_msg["sender_id"],
+                    "senderName": last_msg["sender_name"],
+                }
+
+            conversations.append(conv)
+
+        return jsonify({"conversations": conversations})
+    finally:
+        db.close()
+
+
+@chat_bp.route("/conversations", methods=["POST"])
+@require_auth
+def create_conversation():
+    """Create a new conversation (direct or group)."""
+    user_id = request.user["id"]
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    participant_ids = data.get("participantIds", [])
+    if not participant_ids:
+        return jsonify({"error": "At least one participant required"}), 400
+
+    conv_type = data.get("type", "direct")
+    title = data.get("title")
+    avatar_emoji = data.get("avatarEmoji")
+
+    # Ensure creator is included
+    all_ids = list(set([user_id] + participant_ids))
+
+    # For direct chats, check if conversation already exists between these two users
+    if conv_type == "direct" and len(all_ids) == 2:
+        db = get_db()
+        try:
+            other_id = [uid for uid in all_ids if uid != user_id][0]
+            existing = db.execute(
+                """
+                SELECT c.id FROM conversations c
+                WHERE c.type = 'direct'
+                AND EXISTS (SELECT 1 FROM conversation_participants WHERE conversation_id = c.id AND user_id = ?)
+                AND EXISTS (SELECT 1 FROM conversation_participants WHERE conversation_id = c.id AND user_id = ?)
+                """,
+                (user_id, other_id),
+            ).fetchone()
+
+            if existing:
+                return jsonify({"conversationId": existing["id"]}), 200
+        finally:
+            db.close()
+
+    db = get_db()
+    try:
+        # Validate all participant IDs exist
+        placeholders = ",".join("?" * len(all_ids))
+        found = db.execute(
+            f"SELECT id FROM users WHERE id IN ({placeholders})", all_ids
+        ).fetchall()
+        if len(found) != len(all_ids):
+            return jsonify({"error": "One or more participant IDs are invalid"}), 400
+
+        conv_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        db.execute(
+            "INSERT INTO conversations (id, type, title, avatar_emoji, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (conv_id, conv_type, title, avatar_emoji, user_id, now, now),
+        )
+
+        for uid in all_ids:
+            db.execute(
+                "INSERT INTO conversation_participants (conversation_id, user_id, last_read_at) VALUES (?, ?, ?)",
+                (conv_id, uid, now),
+            )
+
+        db.commit()
+        return jsonify({"conversationId": conv_id}), 201
+    finally:
+        db.close()
+
+
+@chat_bp.route("/conversations/<conv_id>/messages", methods=["GET"])
+@require_auth
+def get_messages(conv_id):
+    """Get messages for a conversation, paginated by cursor."""
+    user_id = request.user["id"]
+    db = get_db()
+    try:
+        # Verify user is participant
+        participant = db.execute(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not participant:
+            return jsonify({"error": "Not a participant"}), 403
+
+        before = request.args.get("before")  # cursor: created_at ISO string
+        limit = min(int(request.args.get("limit", 50)), 100)
+
+        if before:
+            rows = db.execute(
+                """
+                SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id,
+                       u.display_name AS sender_name, u.avatar_url AS sender_avatar
+                FROM messages m
+                JOIN users u ON u.id = m.sender_id
+                WHERE m.conversation_id = ? AND m.created_at < ?
+                ORDER BY m.created_at DESC LIMIT ?
+                """,
+                (conv_id, before, limit),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """
+                SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id,
+                       u.display_name AS sender_name, u.avatar_url AS sender_avatar
+                FROM messages m
+                JOIN users u ON u.id = m.sender_id
+                WHERE m.conversation_id = ?
+                ORDER BY m.created_at DESC LIMIT ?
+                """,
+                (conv_id, limit),
+            ).fetchall()
+
+        messages = []
+        for row in rows:
+            msg_id = row["id"]
+
+            # Get reactions for this message
+            reactions_rows = db.execute(
+                """
+                SELECT mr.emoji, mr.user_id, u.display_name
+                FROM message_reactions mr
+                JOIN users u ON u.id = mr.user_id
+                WHERE mr.message_id = ?
+                """,
+                (msg_id,),
+            ).fetchall()
+
+            # Group reactions by emoji
+            reaction_map = {}
+            for r in reactions_rows:
+                emoji = r["emoji"]
+                if emoji not in reaction_map:
+                    reaction_map[emoji] = {"emoji": emoji, "byUserIds": [], "byUserNames": []}
+                reaction_map[emoji]["byUserIds"].append(r["user_id"])
+                reaction_map[emoji]["byUserNames"].append(r["display_name"])
+
+            reactions = []
+            for emoji, data in reaction_map.items():
+                reactions.append({
+                    "emoji": emoji,
+                    "count": len(data["byUserIds"]),
+                    "bySelf": user_id in data["byUserIds"],
+                    "byUserIds": data["byUserIds"],
+                })
+
+            messages.append({
+                "id": msg_id,
+                "conversationId": conv_id,
+                "senderId": row["sender_id"],
+                "senderName": row["sender_name"],
+                "senderAvatar": row["sender_avatar"],
+                "text": row["text"],
+                "imageUrl": row["image_url"],
+                "time": _format_time(row["created_at"]),
+                "createdAt": row["created_at"],
+                "isOwn": row["sender_id"] == user_id,
+                "reactions": reactions,
+            })
+
+        # Reverse to chronological order
+        messages.reverse()
+
+        has_more = len(rows) == limit
+
+        return jsonify({"messages": messages, "hasMore": has_more})
+    finally:
+        db.close()
+
+
+@chat_bp.route("/conversations/<conv_id>/messages", methods=["POST"])
+@require_auth
+def send_message(conv_id):
+    """Send a message to a conversation."""
+    user_id = request.user["id"]
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    text = data.get("text", "").strip()
+    image_url = data.get("imageUrl")
+
+    if not text and not image_url:
+        return jsonify({"error": "Message must have text or image"}), 400
+
+    db = get_db()
+    try:
+        # Verify user is participant
+        participant = db.execute(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not participant:
+            return jsonify({"error": "Not a participant"}), 403
+
+        msg_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        db.execute(
+            "INSERT INTO messages (id, conversation_id, sender_id, text, image_url, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (msg_id, conv_id, user_id, text, image_url, now),
+        )
+
+        # Update conversation timestamp
+        db.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (now, conv_id),
+        )
+
+        # Update sender's last_read_at
+        db.execute(
+            "UPDATE conversation_participants SET last_read_at = ? WHERE conversation_id = ? AND user_id = ?",
+            (now, conv_id, user_id),
+        )
+
+        db.commit()
+
+        user = request.user
+        return jsonify({
+            "message": {
+                "id": msg_id,
+                "conversationId": conv_id,
+                "senderId": user_id,
+                "senderName": user["display_name"],
+                "text": text,
+                "imageUrl": image_url,
+                "time": _format_time(now),
+                "createdAt": now,
+                "isOwn": True,
+                "reactions": [],
+            }
+        }), 201
+    finally:
+        db.close()
+
+
+@chat_bp.route("/conversations/<conv_id>/messages/<msg_id>/react", methods=["POST"])
+@require_auth
+def react_to_message(conv_id, msg_id):
+    """Add or change reaction on a message. One emoji per user per message."""
+    user_id = request.user["id"]
+    data = request.get_json()
+    if not data or not data.get("emoji"):
+        return jsonify({"error": "emoji required"}), 400
+
+    emoji = data["emoji"]
+    db = get_db()
+    try:
+        # Verify user is participant
+        participant = db.execute(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not participant:
+            return jsonify({"error": "Not a participant"}), 403
+
+        # Verify message exists in this conversation
+        msg = db.execute(
+            "SELECT 1 FROM messages WHERE id = ? AND conversation_id = ?",
+            (msg_id, conv_id),
+        ).fetchone()
+        if not msg:
+            return jsonify({"error": "Message not found"}), 404
+
+        # Upsert: delete existing reaction, insert new one
+        db.execute(
+            "DELETE FROM message_reactions WHERE message_id = ? AND user_id = ?",
+            (msg_id, user_id),
+        )
+        db.execute(
+            "INSERT INTO message_reactions (message_id, user_id, emoji) VALUES (?, ?, ?)",
+            (msg_id, user_id, emoji),
+        )
+        db.commit()
+
+        return jsonify({"ok": True, "emoji": emoji})
+    finally:
+        db.close()
+
+
+@chat_bp.route("/conversations/<conv_id>/messages/<msg_id>/react", methods=["DELETE"])
+@require_auth
+def remove_reaction(conv_id, msg_id):
+    """Remove user's reaction from a message."""
+    user_id = request.user["id"]
+    db = get_db()
+    try:
+        db.execute(
+            "DELETE FROM message_reactions WHERE message_id = ? AND user_id = ?",
+            (msg_id, user_id),
+        )
+        db.commit()
+        return jsonify({"ok": True})
+    finally:
+        db.close()
+
+
+@chat_bp.route("/conversations/<conv_id>/pin", methods=["PUT"])
+@require_auth
+def toggle_pin(conv_id):
+    """Toggle pin status for a conversation."""
+    user_id = request.user["id"]
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT pinned FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "Not a participant"}), 403
+
+        new_pinned = 0 if row["pinned"] else 1
+        db.execute(
+            "UPDATE conversation_participants SET pinned = ? WHERE conversation_id = ? AND user_id = ?",
+            (new_pinned, conv_id, user_id),
+        )
+        db.commit()
+        return jsonify({"pinned": bool(new_pinned)})
+    finally:
+        db.close()
+
+
+@chat_bp.route("/conversations/<conv_id>/read", methods=["PUT"])
+@require_auth
+def mark_read(conv_id):
+    """Mark conversation as read up to now."""
+    user_id = request.user["id"]
+    now = datetime.utcnow().isoformat()
+    db = get_db()
+    try:
+        db.execute(
+            "UPDATE conversation_participants SET last_read_at = ? WHERE conversation_id = ? AND user_id = ?",
+            (now, conv_id, user_id),
+        )
+        db.commit()
+        return jsonify({"ok": True})
+    finally:
+        db.close()
+
+
+@chat_bp.route("/conversations/<conv_id>", methods=["DELETE"])
+@require_auth
+def leave_conversation(conv_id):
+    """Leave (remove self from) a conversation."""
+    user_id = request.user["id"]
+    db = get_db()
+    try:
+        db.execute(
+            "DELETE FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        )
+
+        # If no participants remain, delete the conversation and its messages
+        remaining = db.execute(
+            "SELECT COUNT(*) FROM conversation_participants WHERE conversation_id = ?",
+            (conv_id,),
+        ).fetchone()[0]
+
+        if remaining == 0:
+            db.execute("DELETE FROM message_reactions WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)", (conv_id,))
+            db.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+            db.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+
+        db.commit()
+        return jsonify({"ok": True})
+    finally:
+        db.close()
+
+
+@chat_bp.route("/users/search", methods=["GET"])
+@require_auth
+def search_users():
+    """Search users by name/username for starting new conversations."""
+    user_id = request.user["id"]
+    q = request.args.get("q", "").strip()
+    if len(q) < 1:
+        return jsonify({"users": []})
+
+    db = get_db()
+    try:
+        rows = db.execute(
+            """
+            SELECT id, username, display_name, avatar_url, role
+            FROM users
+            WHERE id != ? AND (
+                username LIKE ? OR display_name LIKE ?
+            )
+            LIMIT 20
+            """,
+            (user_id, f"%{q}%", f"%{q}%"),
+        ).fetchall()
+
+        return jsonify({
+            "users": [
+                {
+                    "id": r["id"],
+                    "username": r["username"],
+                    "displayName": r["display_name"],
+                    "avatarUrl": r["avatar_url"],
+                    "role": r["role"],
+                }
+                for r in rows
+            ]
+        })
+    finally:
+        db.close()
