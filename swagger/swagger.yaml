@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: KNFAPP API
   description: Backend API for VU Kaunas Faculty mobile app
-  version: 1.0.0
+  version: 1.1.0
   contact:
     name: VU KNF IT
 servers:
@@ -15,13 +15,19 @@ tags:
   - name: auth
     description: Authentication & registration
   - name: news
-    description: News feed
+    description: News feed & posts
   - name: schedule
     description: Class timetable
   - name: admin
     description: Admin operations
   - name: scraper
     description: News scraper status
+  - name: chat
+    description: Messaging & conversations
+  - name: social
+    description: Friends, profiles, wall posts
+  - name: polls
+    description: Post polls & voting
 
 paths:
   /health:
@@ -39,6 +45,8 @@ paths:
                   status:
                     type: string
                     example: ok
+
+  # ── Auth ──────────────────────────────────────────────────────────────────
 
   /auth/register:
     post:
@@ -73,6 +81,8 @@ paths:
                 $ref: "#/components/schemas/AuthResponse"
         "400":
           description: Invalid input or invitation code
+        "409":
+          description: Username or email already exists
 
   /auth/login:
     post:
@@ -126,10 +136,16 @@ paths:
         "200":
           description: Logged out
 
+  # ── News ──────────────────────────────────────────────────────────────────
+
   /news:
     get:
       tags: [news]
       summary: Get unified news feed
+      description: >
+        Returns a paginated, ranked feed mixing scraped news (knf.vu.lt, vu.lt),
+        faculty posts, and user/friend posts. Guest users see only public posts.
+        Authenticated users also see friend posts.
       parameters:
         - name: page
           in: query
@@ -167,6 +183,44 @@ paths:
                     type: integer
                   hasMore:
                     type: boolean
+    post:
+      tags: [news]
+      summary: Create a new post
+      description: >
+        Authenticated users can create posts. Source is auto-detected based on user role:
+        faculty for staff (admin/teacher/curator), user for students.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                title:
+                  type: string
+                content:
+                  type: string
+                image_url:
+                  type: string
+                is_public:
+                  type: boolean
+                  default: true
+                post_type:
+                  type: string
+                  enum: [social, announcement, poll]
+                  default: social
+      responses:
+        "201":
+          description: Post created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NewsPost"
+        "401":
+          description: Not authenticated
 
   /news/{postId}:
     get:
@@ -228,9 +282,29 @@ paths:
           schema:
             type: integer
             default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 20
       responses:
         "200":
           description: Comments list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comments:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Comment"
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  perPage:
+                    type: integer
     post:
       tags: [news]
       summary: Add a comment
@@ -255,6 +329,105 @@ paths:
       responses:
         "201":
           description: Comment created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Comment"
+
+  # ── Polls ─────────────────────────────────────────────────────────────────
+
+  /news/{postId}/poll:
+    get:
+      tags: [polls]
+      summary: Get poll for a post
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Poll data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Poll"
+        "404":
+          description: No poll for this post
+    post:
+      tags: [polls]
+      summary: Create a poll on a post (author or admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, options]
+              properties:
+                title:
+                  type: string
+                options:
+                  type: array
+                  minItems: 2
+                  maxItems: 10
+                  items:
+                    type: string
+                end_date:
+                  type: string
+                  format: date-time
+      responses:
+        "201":
+          description: Poll created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Poll"
+        "403":
+          description: Not the post author or admin
+
+  /news/{postId}/poll/vote:
+    post:
+      tags: [polls]
+      summary: Vote on a poll option
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [option_id]
+              properties:
+                option_id:
+                  type: string
+      responses:
+        "200":
+          description: Vote recorded (returns updated poll)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Poll"
+        "401":
+          description: Not authenticated
+
+  # ── Schedule ──────────────────────────────────────────────────────────────
 
   /schedule:
     get:
@@ -287,6 +460,584 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Lesson"
+
+  # ── Chat ──────────────────────────────────────────────────────────────────
+
+  /chat/conversations:
+    get:
+      tags: [chat]
+      summary: List all conversations for current user
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Conversation list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conversations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Conversation"
+    post:
+      tags: [chat]
+      summary: Create a new conversation (direct or group)
+      description: >
+        For direct chats between two users, if a conversation already exists
+        it returns the existing conversation ID instead of creating a duplicate.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [participantIds]
+              properties:
+                participantIds:
+                  type: array
+                  items:
+                    type: string
+                type:
+                  type: string
+                  enum: [direct, group]
+                  default: direct
+                title:
+                  type: string
+                  description: Group chat title
+                avatarEmoji:
+                  type: string
+                  description: Group chat emoji avatar
+      responses:
+        "201":
+          description: Conversation created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conversationId:
+                    type: string
+        "200":
+          description: Existing direct conversation found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  conversationId:
+                    type: string
+
+  /chat/conversations/{convId}/messages:
+    get:
+      tags: [chat]
+      summary: Get messages for a conversation (cursor-based pagination)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: before
+          in: query
+          description: Cursor — ISO datetime string; returns messages older than this
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 100
+      responses:
+        "200":
+          description: Messages list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Message"
+                  hasMore:
+                    type: boolean
+        "403":
+          description: Not a participant
+    post:
+      tags: [chat]
+      summary: Send a message to a conversation
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text:
+                  type: string
+                imageUrl:
+                  type: string
+      responses:
+        "201":
+          description: Message sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    $ref: "#/components/schemas/Message"
+        "403":
+          description: Not a participant
+
+  /chat/conversations/{convId}/messages/{msgId}/react:
+    post:
+      tags: [chat]
+      summary: Add or change reaction on a message (one per user)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: msgId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [emoji]
+              properties:
+                emoji:
+                  type: string
+      responses:
+        "200":
+          description: Reaction set
+    delete:
+      tags: [chat]
+      summary: Remove reaction from a message
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: msgId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Reaction removed
+
+  /chat/conversations/{convId}/pin:
+    put:
+      tags: [chat]
+      summary: Toggle pin status for a conversation
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Pin toggled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pinned:
+                    type: boolean
+
+  /chat/conversations/{convId}/read:
+    put:
+      tags: [chat]
+      summary: Mark conversation as read
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Marked as read
+
+  /chat/conversations/{convId}:
+    delete:
+      tags: [chat]
+      summary: Leave a conversation
+      description: Removes the user from the conversation. If no participants remain, the conversation and its messages are deleted.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Left conversation
+
+  /chat/users/search:
+    get:
+      tags: [chat]
+      summary: Search users by name/username for new conversations
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        "200":
+          description: User search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/UserSummary"
+
+  # ── Social ────────────────────────────────────────────────────────────────
+
+  /social/profile/{userId}:
+    get:
+      tags: [social]
+      summary: Get a user's public profile
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserProfile"
+        "404":
+          description: User not found
+
+  /social/profile:
+    put:
+      tags: [social]
+      summary: Update own profile
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name:
+                  type: string
+                avatar_url:
+                  type: string
+      responses:
+        "200":
+          description: Profile updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+
+  /social/friends/request:
+    post:
+      tags: [social]
+      summary: Send a friend request
+      description: >
+        If the target user already sent a friend request to you,
+        this auto-accepts the friendship (bidirectional).
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id:
+                  type: string
+      responses:
+        "201":
+          description: Friend request sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [pending]
+        "200":
+          description: Auto-accepted (mutual request)
+        "409":
+          description: Already friends or request already pending
+
+  /social/friends/requests:
+    get:
+      tags: [social]
+      summary: List pending friend requests
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: direction
+          in: query
+          schema:
+            type: string
+            enum: [received, sent]
+            default: received
+      responses:
+        "200":
+          description: Friend request list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requests:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FriendRequest"
+
+  /social/friends/requests/{requestId}/accept:
+    post:
+      tags: [social]
+      summary: Accept a friend request
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Request accepted
+        "404":
+          description: Request not found
+
+  /social/friends/requests/{requestId}/reject:
+    post:
+      tags: [social]
+      summary: Reject a friend request
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: requestId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Request rejected
+        "404":
+          description: Request not found
+
+  /social/friends:
+    get:
+      tags: [social]
+      summary: List current user's friends
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Friends list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  friends:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Friend"
+
+  /social/friends/{userId}:
+    delete:
+      tags: [social]
+      summary: Unfriend a user (bidirectional)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Unfriended
+        "404":
+          description: Not friends
+
+  /social/posts:
+    get:
+      tags: [social]
+      summary: Get posts by a specific user
+      parameters:
+        - name: user_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+        - name: per_page
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        "200":
+          description: User's posts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  posts:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/NewsPost"
+                  page:
+                    type: integer
+                  perPage:
+                    type: integer
+                  total:
+                    type: integer
+                  hasMore:
+                    type: boolean
+    post:
+      tags: [social]
+      summary: Create a wall post
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                title:
+                  type: string
+                image_url:
+                  type: string
+                is_public:
+                  type: boolean
+                  default: true
+      responses:
+        "201":
+          description: Post created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NewsPost"
+
+  /social/posts/{postId}:
+    put:
+      tags: [social]
+      summary: Edit own wall post
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                content:
+                  type: string
+                title:
+                  type: string
+                image_url:
+                  type: string
+      responses:
+        "200":
+          description: Post updated
+        "404":
+          description: Post not found or not yours
+    delete:
+      tags: [social]
+      summary: Delete own wall post
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Post deleted
+        "404":
+          description: Post not found or not yours
+
+  # ── Admin ─────────────────────────────────────────────────────────────────
 
   /admin/invitations:
     post:
@@ -342,6 +1093,8 @@ paths:
         "200":
           description: Stats
 
+  # ── Scraper ───────────────────────────────────────────────────────────────
+
   /scraper/status:
     get:
       tags: [scraper]
@@ -380,9 +1133,25 @@ components:
           type: string
         role:
           type: string
+          enum: [student, teacher, admin, curator]
         avatarUrl:
           type: string
           nullable: true
+
+    UserSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        displayName:
+          type: string
+        avatarUrl:
+          type: string
+          nullable: true
+        role:
+          type: string
 
     AuthResponse:
       type: object
@@ -408,13 +1177,18 @@ components:
           nullable: true
         author:
           type: string
+        authorId:
+          type: string
+          nullable: true
         source:
           type: string
+          enum: [knf.vu.lt, vu.lt, faculty, user, app]
         sourceUrl:
           type: string
           nullable: true
         postType:
           type: string
+          enum: [article, social, announcement, poll, link]
         likes:
           type: integer
         comments:
@@ -425,6 +1199,26 @@ components:
           type: string
         isPublic:
           type: boolean
+        liked:
+          type: boolean
+          description: Whether the current user has liked this post
+
+    Comment:
+      type: object
+      properties:
+        id:
+          type: string
+        text:
+          type: string
+        time:
+          type: string
+        userName:
+          type: string
+        userAvatar:
+          type: string
+          nullable: true
+        userId:
+          type: string
 
     Lesson:
       type: object
@@ -446,4 +1240,189 @@ components:
         group:
           type: string
         semester:
+          type: string
+
+    Conversation:
+      type: object
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+          enum: [direct, group]
+        title:
+          type: string
+        avatarEmoji:
+          type: string
+          nullable: true
+        pinned:
+          type: boolean
+        unreadCount:
+          type: integer
+        lastUpdatedMs:
+          type: integer
+          description: Unix timestamp in milliseconds
+        participants:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              displayName:
+                type: string
+              avatarUrl:
+                type: string
+                nullable: true
+        lastMessage:
+          type: object
+          nullable: true
+          properties:
+            id:
+              type: string
+            text:
+              type: string
+            imageUrl:
+              type: string
+              nullable: true
+            time:
+              type: string
+            senderId:
+              type: string
+            senderName:
+              type: string
+
+    Message:
+      type: object
+      properties:
+        id:
+          type: string
+        conversationId:
+          type: string
+        senderId:
+          type: string
+        senderName:
+          type: string
+        senderAvatar:
+          type: string
+          nullable: true
+        text:
+          type: string
+        imageUrl:
+          type: string
+          nullable: true
+        time:
+          type: string
+          description: "HH:MM format"
+        createdAt:
+          type: string
+          description: ISO datetime
+        isOwn:
+          type: boolean
+        reactions:
+          type: array
+          items:
+            type: object
+            properties:
+              emoji:
+                type: string
+              count:
+                type: integer
+              bySelf:
+                type: boolean
+              byUserIds:
+                type: array
+                items:
+                  type: string
+
+    Poll:
+      type: object
+      properties:
+        id:
+          type: string
+        postId:
+          type: string
+        title:
+          type: string
+        endDate:
+          type: string
+          nullable: true
+        totalVotes:
+          type: integer
+        createdAt:
+          type: string
+        userVote:
+          type: string
+          nullable: true
+          description: Option ID the current user voted for
+        options:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              text:
+                type: string
+              votes:
+                type: integer
+
+    UserProfile:
+      type: object
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        displayName:
+          type: string
+        avatarUrl:
+          type: string
+          nullable: true
+        role:
+          type: string
+        createdAt:
+          type: string
+        postCount:
+          type: integer
+        friendCount:
+          type: integer
+        friendshipStatus:
+          type: string
+          enum: [none, friends, request_sent, request_received]
+
+    FriendRequest:
+      type: object
+      properties:
+        id:
+          type: string
+        userId:
+          type: string
+        displayName:
+          type: string
+        username:
+          type: string
+        avatarUrl:
+          type: string
+          nullable: true
+        role:
+          type: string
+        createdAt:
+          type: string
+
+    Friend:
+      type: object
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        displayName:
+          type: string
+        avatarUrl:
+          type: string
+          nullable: true
+        role:
+          type: string
+        friendsSince:
           type: string
