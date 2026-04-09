@@ -4,9 +4,13 @@ import os
 
 from flask import Flask
 from flask_cors import CORS
+from flask_socketio import SocketIO
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from app.database import init_db
+
+# Module-level SocketIO instance so chat routes can import it
+socketio = SocketIO()
 
 
 def create_app():
@@ -21,6 +25,9 @@ def create_app():
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
     CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+    # Initialize Socket.IO with CORS allowed for all origins (mobile app)
+    socketio.init_app(app, cors_allowed_origins="*", async_mode="threading")
 
     # Ensure data directory exists
     db_dir = os.path.dirname(app.config["DB_PATH"])
@@ -46,6 +53,10 @@ def create_app():
     app.register_blueprint(scraper_bp, url_prefix="/api/scraper")
     app.register_blueprint(chat_bp, url_prefix="/api/chat")
     app.register_blueprint(social_bp, url_prefix="/api/social")
+
+    # Register Socket.IO events for real-time chat
+    from app.chat.events import register_socket_events
+    register_socket_events(socketio)
 
     # Start background scraper
     from app.scraper.scheduler import start_scraper_scheduler

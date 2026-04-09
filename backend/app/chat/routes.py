@@ -11,6 +11,12 @@ from app.database import get_db
 chat_bp = Blueprint("chat", __name__)
 
 
+def _get_socketio():
+    """Lazy import socketio to avoid circular imports."""
+    from app import socketio
+    return socketio
+
+
 def _format_time(iso_str):
     """Format ISO datetime to HH:MM for display."""
     try:
@@ -18,6 +24,29 @@ def _format_time(iso_str):
         return dt.strftime("%H:%M")
     except (ValueError, TypeError):
         return ""
+
+
+def _emit_reaction_update(db, conv_id, msg_id, current_user_id):
+    """Fetch current reactions for a message and emit to the conversation room."""
+    rows = db.execute(
+        "SELECT mr.emoji, mr.user_id FROM message_reactions mr WHERE mr.message_id = ?",
+        (msg_id,),
+    ).fetchall()
+
+    reaction_map = {}
+    for r in rows:
+        emoji = r["emoji"]
+        if emoji not in reaction_map:
+            reaction_map[emoji] = []
+        reaction_map[emoji].append(r["user_id"])
+
+    reactions = [
+        {"emoji": emoji, "count": len(uids), "byUserIds": uids}
+        for emoji, uids in reaction_map.items()
+    ]
+
+    from app.chat.events import emit_reaction_update
+    emit_reaction_update(_get_socketio(), conv_id, msg_id, reactions)
 
 
 @chat_bp.route("/conversations", methods=["GET"])
@@ -338,20 +367,24 @@ def send_message(conv_id):
         db.commit()
 
         user = request.user
-        return jsonify({
-            "message": {
-                "id": msg_id,
-                "conversationId": conv_id,
-                "senderId": user_id,
-                "senderName": user["display_name"],
-                "text": text,
-                "imageUrl": image_url,
-                "time": _format_time(now),
-                "createdAt": now,
-                "isOwn": True,
-                "reactions": [],
-            }
-        }), 201
+        msg_data = {
+            "id": msg_id,
+            "conversationId": conv_id,
+            "senderId": user_id,
+            "senderName": user["display_name"],
+            "text": text,
+            "imageUrl": image_url,
+            "time": _format_time(now),
+            "createdAt": now,
+            "reactions": [],
+        }
+
+        # Emit real-time event to all conversation participants
+        from app.chat.events import emit_new_message
+        emit_new_message(_get_socketio(), conv_id, msg_data)
+
+        # REST response includes isOwn=True for the sender
+        return jsonify({"message": {**msg_data, "isOwn": True}}), 201
     finally:
         db.close()
 
@@ -395,6 +428,9 @@ def react_to_message(conv_id, msg_id):
         )
         db.commit()
 
+        # Fetch updated reactions and emit to room
+        _emit_reaction_update(db, conv_id, msg_id, user_id)
+
         return jsonify({"ok": True, "emoji": emoji})
     finally:
         db.close()
@@ -412,6 +448,10 @@ def remove_reaction(conv_id, msg_id):
             (msg_id, user_id),
         )
         db.commit()
+
+        # Emit updated reactions to room
+        _emit_reaction_update(db, conv_id, msg_id, user_id)
+
         return jsonify({"ok": True})
     finally:
         db.close()

@@ -4,7 +4,7 @@
 import argparse
 import os
 
-from app import create_app
+from app import create_app, socketio
 
 
 def main():
@@ -18,7 +18,8 @@ def main():
 
     if args.http:
         debug = os.environ.get("APP_DEBUG", "0") == "1"
-        app.run(host=args.host, port=args.port, debug=debug)
+        # Use socketio.run() to handle both HTTP and WebSocket connections
+        socketio.run(app, host=args.host, port=args.port, debug=debug, allow_unsafe_werkzeug=True)
     else:
         parser.print_help()
 

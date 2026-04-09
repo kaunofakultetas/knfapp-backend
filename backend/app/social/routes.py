@@ -405,13 +405,34 @@ def get_user_posts():
         if not target:
             return jsonify({"error": "User not found"}), 404
 
-        rows = db.execute(
-            """SELECT * FROM news_posts
-               WHERE author_id = ? AND source = 'user'
-               ORDER BY published_at DESC
-               LIMIT ? OFFSET ?""",
-            (user_id, per_page, offset),
-        ).fetchall()
+        # Determine if viewer can see private posts (self or friend)
+        can_see_private = False
+        if current_user:
+            if current_user["id"] == user_id:
+                can_see_private = True
+            else:
+                is_friend = db.execute(
+                    "SELECT 1 FROM friendships WHERE user_id = ? AND friend_id = ?",
+                    (current_user["id"], user_id),
+                ).fetchone()
+                can_see_private = bool(is_friend)
+
+        if can_see_private:
+            rows = db.execute(
+                """SELECT * FROM news_posts
+                   WHERE author_id = ? AND source = 'user'
+                   ORDER BY published_at DESC
+                   LIMIT ? OFFSET ?""",
+                (user_id, per_page, offset),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT * FROM news_posts
+                   WHERE author_id = ? AND source = 'user' AND is_public = 1
+                   ORDER BY published_at DESC
+                   LIMIT ? OFFSET ?""",
+                (user_id, per_page, offset),
+            ).fetchall()
 
         posts = []
         for row in rows:
@@ -446,10 +467,16 @@ def get_user_posts():
             for p in posts:
                 p["liked"] = p["id"] in liked_set
 
-        total = db.execute(
-            "SELECT COUNT(*) as c FROM news_posts WHERE author_id = ? AND source = 'user'",
-            (user_id,),
-        ).fetchone()["c"]
+        if can_see_private:
+            total = db.execute(
+                "SELECT COUNT(*) as c FROM news_posts WHERE author_id = ? AND source = 'user'",
+                (user_id,),
+            ).fetchone()["c"]
+        else:
+            total = db.execute(
+                "SELECT COUNT(*) as c FROM news_posts WHERE author_id = ? AND source = 'user' AND is_public = 1",
+                (user_id,),
+            ).fetchone()["c"]
 
         return jsonify({"posts": posts, "page": page, "perPage": per_page, "total": total, "hasMore": offset + per_page < total})
     finally:

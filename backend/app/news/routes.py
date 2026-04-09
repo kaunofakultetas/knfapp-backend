@@ -229,12 +229,26 @@ def create_post():
 
 @news_bp.route("/<post_id>", methods=["GET"])
 def get_post(post_id):
-    """Get a single post by ID."""
+    """Get a single post by ID. Non-public posts require authentication and friendship."""
+    user = get_current_user()
     db = get_db()
     try:
         row = db.execute("SELECT * FROM news_posts WHERE id = ?", (post_id,)).fetchone()
         if not row:
             return jsonify({"error": "Post not found"}), 404
+
+        # Non-public posts only visible to author or friends
+        if not row["is_public"] and row["source"] == "user":
+            if not user:
+                return jsonify({"error": "Post not found"}), 404
+            if row["author_id"] != user["id"]:
+                is_friend = db.execute(
+                    "SELECT 1 FROM friendships WHERE user_id = ? AND friend_id = ?",
+                    (user["id"], row["author_id"]),
+                ).fetchone()
+                if not is_friend:
+                    return jsonify({"error": "Post not found"}), 404
+
         return jsonify(_post_to_dict(row))
     finally:
         db.close()
