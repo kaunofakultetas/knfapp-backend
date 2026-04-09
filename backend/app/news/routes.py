@@ -1,5 +1,6 @@
 """News feed API — unified feed with ranking, likes, comments, polls."""
 
+import html
 import uuid
 from datetime import datetime
 
@@ -7,6 +8,11 @@ from flask import Blueprint, jsonify, request
 
 from app.auth.routes import get_current_user, require_auth, require_role
 from app.database import get_db
+
+# Input length limits
+MAX_TITLE_LENGTH = 200
+MAX_CONTENT_LENGTH = 10000
+MAX_COMMENT_LENGTH = 2000
 
 news_bp = Blueprint("news", __name__)
 
@@ -174,6 +180,18 @@ def create_post():
     if not content:
         return jsonify({"error": "Content required"}), 400
 
+    title = (data.get("title") or "").strip() or content[:80]
+
+    # Input length validation
+    if len(title) > MAX_TITLE_LENGTH:
+        return jsonify({"error": f"Title must be at most {MAX_TITLE_LENGTH} characters"}), 400
+    if len(content) > MAX_CONTENT_LENGTH:
+        return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
+
+    # Sanitize HTML to prevent stored XSS
+    title = html.escape(title)
+    content = html.escape(content)
+
     role = request.user["role"]
     post_type = data.get("post_type")
     image_url = data.get("image_url")
@@ -189,7 +207,6 @@ def create_post():
         if not post_type:
             post_type = "social"
 
-    title = (data.get("title") or "").strip() or content[:80]
     post_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
 
@@ -250,6 +267,42 @@ def get_post(post_id):
                     return jsonify({"error": "Post not found"}), 404
 
         return jsonify(_post_to_dict(row))
+    finally:
+        db.close()
+
+
+@news_bp.route("/<post_id>", methods=["DELETE"])
+@require_auth
+def delete_post(post_id):
+    """
+    Delete a news post. Only the post author or an admin can delete.
+    Also cleans up related likes, comments, polls, and poll votes.
+    """
+    db = get_db()
+    try:
+        post = db.execute("SELECT id, author_id FROM news_posts WHERE id = ?", (post_id,)).fetchone()
+        if not post:
+            return jsonify({"error": "Post not found"}), 404
+
+        user = request.user
+        if post["author_id"] != user["id"] and user["role"] != "admin":
+            return jsonify({"error": "Only the post author or an admin can delete this post"}), 403
+
+        # Clean up related data
+        db.execute("DELETE FROM news_likes WHERE post_id = ?", (post_id,))
+        db.execute("DELETE FROM news_comments WHERE post_id = ?", (post_id,))
+
+        # Clean up polls if any
+        poll = db.execute("SELECT id FROM polls WHERE post_id = ?", (post_id,)).fetchone()
+        if poll:
+            db.execute("DELETE FROM poll_votes WHERE poll_id = ?", (poll["id"],))
+            db.execute("DELETE FROM poll_options WHERE poll_id = ?", (poll["id"],))
+            db.execute("DELETE FROM polls WHERE id = ?", (poll["id"],))
+
+        db.execute("DELETE FROM news_posts WHERE id = ?", (post_id,))
+        db.commit()
+
+        return jsonify({"status": "deleted"})
     finally:
         db.close()
 
@@ -332,6 +385,15 @@ def add_comment(post_id):
     if not data or not data.get("text", "").strip():
         return jsonify({"error": "Comment text required"}), 400
 
+    comment_text = data["text"].strip()
+
+    # Input length validation
+    if len(comment_text) > MAX_COMMENT_LENGTH:
+        return jsonify({"error": f"Comment must be at most {MAX_COMMENT_LENGTH} characters"}), 400
+
+    # Sanitize HTML to prevent stored XSS
+    comment_text = html.escape(comment_text)
+
     db = get_db()
     try:
         post = db.execute("SELECT id FROM news_posts WHERE id = ?", (post_id,)).fetchone()
@@ -341,14 +403,14 @@ def add_comment(post_id):
         comment_id = str(uuid.uuid4())
         db.execute(
             "INSERT INTO news_comments (id, post_id, user_id, text) VALUES (?, ?, ?, ?)",
-            (comment_id, post_id, request.user["id"], data["text"].strip()),
+            (comment_id, post_id, request.user["id"], comment_text),
         )
         db.execute("UPDATE news_posts SET comments_count = comments_count + 1 WHERE id = ?", (post_id,))
         db.commit()
 
         return jsonify({
             "id": comment_id,
-            "text": data["text"].strip(),
+            "text": comment_text,
             "time": datetime.utcnow().isoformat(),
             "userName": request.user["display_name"],
             "userAvatar": request.user.get("avatar_url"),

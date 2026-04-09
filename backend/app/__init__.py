@@ -26,7 +26,7 @@ def create_app():
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
     # CORS — restrict origins in production via ALLOWED_ORIGINS env var (comma-separated)
-    allowed_origins = os.environ.get("ALLOWED_ORIGINS", "*")
+    allowed_origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:8081")
     if allowed_origins != "*":
         allowed_origins = [o.strip() for o in allowed_origins.split(",") if o.strip()]
     CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
@@ -70,6 +70,17 @@ def create_app():
     # Start background scraper
     from app.scraper.scheduler import start_scraper_scheduler
     start_scraper_scheduler(app)
+
+    # Security headers middleware
+    @app.after_request
+    def add_security_headers(response):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self'"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        return response
 
     @app.route("/api/health")
     def health():

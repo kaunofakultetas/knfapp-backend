@@ -18,9 +18,19 @@ def get_schedule():
       - group (str, optional filter by group)
       - semester (str, optional filter by semester)
     """
-    day = request.args.get("day", type=int)
+    day_raw = request.args.get("day")
     group = request.args.get("group")
     semester = request.args.get("semester")
+
+    # Validate day param if provided
+    day = None
+    if day_raw is not None:
+        try:
+            day = int(day_raw)
+        except (ValueError, TypeError):
+            return jsonify({"error": "Parameter 'day' must be an integer (0=Monday..6=Sunday)"}), 400
+        if day < 0 or day > 6:
+            return jsonify({"error": "Parameter 'day' must be between 0 (Monday) and 6 (Sunday)"}), 400
 
     db = get_db()
     try:

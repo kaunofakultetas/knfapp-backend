@@ -276,6 +276,51 @@ def me():
     })
 
 
+@auth_bp.route("/me", methods=["PUT"])
+@require_auth
+def update_me():
+    """Update current user's display name and/or avatar."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    db = get_db()
+    try:
+        updates = []
+        params = []
+        if "display_name" in data and data["display_name"].strip():
+            display_name = data["display_name"].strip()
+            if len(display_name) > 100:
+                return jsonify({"error": "Display name must be at most 100 characters"}), 400
+            updates.append("display_name = ?")
+            params.append(display_name)
+        if "avatar_url" in data:
+            updates.append("avatar_url = ?")
+            params.append(data["avatar_url"])
+
+        if not updates:
+            return jsonify({"error": "No fields to update"}), 400
+
+        updates.append("updated_at = ?")
+        params.append(datetime.utcnow().isoformat())
+        params.append(request.user["id"])
+
+        db.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
+        db.commit()
+
+        user = db.execute("SELECT * FROM users WHERE id = ?", (request.user["id"],)).fetchone()
+        return jsonify({
+            "id": user["id"],
+            "username": user["username"],
+            "email": user["email"],
+            "displayName": user["display_name"],
+            "role": user["role"],
+            "avatarUrl": user["avatar_url"],
+        })
+    finally:
+        db.close()
+
+
 @auth_bp.route("/logout", methods=["POST"])
 @require_auth
 def logout():

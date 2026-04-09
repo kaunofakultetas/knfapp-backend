@@ -162,6 +162,34 @@ paths:
                 $ref: "#/components/schemas/User"
         "401":
           description: Not authenticated
+    put:
+      tags: [auth]
+      summary: Update current user profile (display name, avatar)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                display_name:
+                  type: string
+                  maxLength: 100
+                avatar_url:
+                  type: string
+      responses:
+        "200":
+          description: Profile updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          description: No fields to update
+        "401":
+          description: Not authenticated
 
   /auth/logout:
     post:
@@ -278,6 +306,32 @@ paths:
                 $ref: "#/components/schemas/NewsPost"
         "404":
           description: Not found
+    delete:
+      tags: [news]
+      summary: Delete a news post (author or admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Post deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: deleted
+        "403":
+          description: Not the post author or admin
+        "404":
+          description: Post not found
 
   /news/{postId}/like:
     post:

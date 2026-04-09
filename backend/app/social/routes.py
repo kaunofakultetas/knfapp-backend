@@ -1,5 +1,6 @@
 """Social API — friend requests, friendships, user profiles, wall posts."""
 
+import html
 import uuid
 from datetime import datetime
 
@@ -7,6 +8,10 @@ from flask import Blueprint, jsonify, request
 
 from app.auth.routes import get_current_user, require_auth
 from app.database import get_db
+
+# Input length limits (same as news)
+MAX_TITLE_LENGTH = 200
+MAX_CONTENT_LENGTH = 10000
 
 social_bp = Blueprint("social", __name__)
 
@@ -345,6 +350,17 @@ def create_post():
         return jsonify({"error": "Post content required"}), 400
 
     title = (data.get("title") or "").strip() or content[:80]
+
+    # Input length validation
+    if len(title) > MAX_TITLE_LENGTH:
+        return jsonify({"error": f"Title must be at most {MAX_TITLE_LENGTH} characters"}), 400
+    if len(content) > MAX_CONTENT_LENGTH:
+        return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
+
+    # Sanitize HTML to prevent stored XSS
+    title = html.escape(title)
+    content = html.escape(content)
+
     image_url = data.get("image_url")
     is_public = data.get("is_public", True)
 
@@ -504,13 +520,20 @@ def update_post(post_id):
         params = []
         if "content" in data and data["content"].strip():
             content = data["content"].strip()
+            if len(content) > MAX_CONTENT_LENGTH:
+                return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
+            content = html.escape(content)
             updates.append("content = ?")
             params.append(content)
             updates.append("summary = ?")
             params.append(content[:200])
         if "title" in data:
+            title = data["title"].strip()
+            if len(title) > MAX_TITLE_LENGTH:
+                return jsonify({"error": f"Title must be at most {MAX_TITLE_LENGTH} characters"}), 400
+            title = html.escape(title)
             updates.append("title = ?")
-            params.append(data["title"].strip())
+            params.append(title)
         if "image_url" in data:
             updates.append("image_url = ?")
             params.append(data["image_url"])

@@ -1,11 +1,9 @@
-version: "3.8"
-
 # knfapp Docker Compose — copy to docker-compose.yml and fill in secrets
 # See .env.sample for required environment variables
 
 services:
   knfapp-backend:
-    build: ./knfapp-backend
+    build: ./backend
     container_name: knfapp-backend
     restart: unless-stopped
     read_only: true
@@ -41,10 +39,10 @@ services:
     read_only: true
     user: "1000:1000"
     ports:
-      - "80:80"
-      - "443:443"
+      - "8080:80"
+      - "8443:443"
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./endpoint/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./_DATA/knfapp-caddy/data:/data
       - ./_DATA/knfapp-caddy/config:/config
       - /etc/localtime:/etc/localtime:ro
@@ -59,11 +57,10 @@ services:
     image: swaggerapi/swagger-ui:latest
     container_name: knfapp-swagger
     restart: unless-stopped
-    read_only: true
     environment:
       - SWAGGER_JSON=/app/swagger.yaml
     volumes:
-      - ./knfapp-backend/swagger.yaml:/app/swagger.yaml:ro
+      - ./swagger/swagger.yaml:/app/swagger.yaml:ro
       - /etc/localtime:/etc/localtime:ro
     networks:
       - isolated-knfapp
