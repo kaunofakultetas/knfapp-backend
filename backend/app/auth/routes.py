@@ -1,6 +1,8 @@
 """Authentication routes — invitation-based registration, login, sessions."""
 
+import time
 import uuid
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
@@ -11,6 +13,23 @@ from flask import Blueprint, current_app, jsonify, request
 from app.database import get_db
 
 auth_bp = Blueprint("auth", __name__)
+
+# Simple in-memory rate limiter for auth endpoints
+_rate_limit_store: dict[str, list[float]] = defaultdict(list)
+_RATE_LIMIT_WINDOW = 300  # 5 minutes
+_RATE_LIMIT_MAX = 10  # max attempts per window
+
+
+def _check_rate_limit(key: str) -> bool:
+    """Return True if rate limit exceeded."""
+    now = time.time()
+    attempts = _rate_limit_store[key]
+    # Prune old entries
+    _rate_limit_store[key] = [t for t in attempts if now - t < _RATE_LIMIT_WINDOW]
+    if len(_rate_limit_store[key]) >= _RATE_LIMIT_MAX:
+        return True
+    _rate_limit_store[key].append(now)
+    return False
 
 
 def get_current_user():
@@ -70,9 +89,46 @@ def require_role(*roles):
     return decorator
 
 
+@auth_bp.route("/validate-code", methods=["POST"])
+def validate_invitation_code():
+    """Validate an invitation code without consuming it. Returns code details."""
+    data = request.get_json()
+    if not data or not data.get("code"):
+        return jsonify({"error": "Code required"}), 400
+
+    db = get_db()
+    try:
+        invite = db.execute(
+            "SELECT * FROM invitation_codes WHERE code = ?",
+            (data["code"],),
+        ).fetchone()
+
+        if not invite:
+            return jsonify({"valid": False, "error": "Invalid invitation code"}), 200
+
+        if invite["use_count"] >= invite["max_uses"]:
+            return jsonify({"valid": False, "error": "Invitation code has been fully used"}), 200
+
+        invite_expires = datetime.fromisoformat(invite["expires_at"]).replace(tzinfo=None)
+        if invite_expires < datetime.utcnow():
+            return jsonify({"valid": False, "error": "Invitation code has expired"}), 200
+
+        return jsonify({
+            "valid": True,
+            "role": invite["role"],
+            "remainingUses": invite["max_uses"] - invite["use_count"],
+        })
+    finally:
+        db.close()
+
+
 @auth_bp.route("/register", methods=["POST"])
 def register():
     """Register a new user with an invitation code."""
+    client_ip = request.remote_addr or "unknown"
+    if _check_rate_limit(f"register:{client_ip}"):
+        return jsonify({"error": "Too many registration attempts. Please wait a few minutes."}), 429
+
     data = request.get_json()
     if not data:
         return jsonify({"error": "JSON body required"}), 400
@@ -153,6 +209,10 @@ def register():
 @auth_bp.route("/login", methods=["POST"])
 def login():
     """Login with username/email and password."""
+    client_ip = request.remote_addr or "unknown"
+    if _check_rate_limit(f"login:{client_ip}"):
+        return jsonify({"error": "Too many login attempts. Please wait a few minutes."}), 429
+
     data = request.get_json()
     if not data:
         return jsonify({"error": "JSON body required"}), 400

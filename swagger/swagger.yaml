@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: KNFAPP API
   description: Backend API for VU Kaunas Faculty mobile app
-  version: 1.1.0
+  version: 1.2.0
   contact:
     name: VU KNF IT
 servers:
@@ -109,6 +109,39 @@ paths:
                 $ref: "#/components/schemas/AuthResponse"
         "401":
           description: Invalid credentials
+
+  /auth/validate-code:
+    post:
+      tags: [auth]
+      summary: Validate invitation code without consuming it
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: Invitation code to validate
+      responses:
+        "200":
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid:
+                    type: boolean
+                  error:
+                    type: string
+                  role:
+                    type: string
+                    enum: [student, teacher, admin, curator]
+                  remainingUses:
+                    type: integer
 
   /auth/me:
     get:
