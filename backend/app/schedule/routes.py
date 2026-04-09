@@ -2,6 +2,7 @@
 
 from flask import Blueprint, jsonify, request
 
+from app.auth.routes import require_role
 from app.database import get_db
 
 schedule_bp = Blueprint("schedule", __name__)
@@ -66,6 +67,7 @@ def get_schedule():
 
 
 @schedule_bp.route("/seed", methods=["POST"])
+@require_role("admin")
 def seed_schedule():
     """Seed the schedule with demo data (for development)."""
     import uuid

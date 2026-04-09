@@ -175,16 +175,19 @@ def create_post():
         return jsonify({"error": "Content required"}), 400
 
     role = request.user["role"]
-    post_type = data.get("post_type", "social")
+    post_type = data.get("post_type")
     image_url = data.get("image_url")
     is_public = data.get("is_public", True)
 
-    # Determine source based on role and requested type
-    if post_type in ("announcement", "article") and role in ("admin", "curator", "teacher"):
+    # Determine source based on role
+    if role in ("admin", "curator", "teacher"):
         source = "faculty"
+        if not post_type:
+            post_type = "announcement"
     else:
         source = "user"
-        post_type = "social"
+        if not post_type:
+            post_type = "social"
 
     title = (data.get("title") or "").strip() or content[:80]
     post_id = str(uuid.uuid4())
