@@ -1,11 +1,11 @@
-"""News feed API — unified feed with ranking, likes, comments."""
+"""News feed API — unified feed with ranking, likes, comments, polls."""
 
 import uuid
 from datetime import datetime
 
 from flask import Blueprint, jsonify, request
 
-from app.auth.routes import get_current_user, require_auth
+from app.auth.routes import get_current_user, require_auth, require_role
 from app.database import get_db
 
 news_bp = Blueprint("news", __name__)
@@ -340,5 +340,197 @@ def add_comment(post_id):
             "userAvatar": request.user.get("avatar_url"),
             "userId": request.user["id"],
         }), 201
+    finally:
+        db.close()
+
+
+# ── Polls ────────────────────────────────────────────────────────────────────
+
+
+def _poll_to_dict(db, poll_row, user_id=None):
+    """Convert a poll + its options into an API response dict."""
+    poll_id = poll_row["id"]
+    options = db.execute(
+        "SELECT id, text, votes FROM poll_options WHERE poll_id = ? ORDER BY rowid",
+        (poll_id,),
+    ).fetchall()
+
+    user_vote = None
+    if user_id:
+        vote = db.execute(
+            "SELECT option_id FROM poll_votes WHERE poll_id = ? AND user_id = ?",
+            (poll_id, user_id),
+        ).fetchone()
+        if vote:
+            user_vote = vote["option_id"]
+
+    return {
+        "id": poll_id,
+        "postId": poll_row["post_id"],
+        "title": poll_row["title"],
+        "endDate": poll_row["end_date"],
+        "totalVotes": poll_row["total_votes"],
+        "createdAt": poll_row["created_at"],
+        "userVote": user_vote,
+        "options": [
+            {"id": o["id"], "text": o["text"], "votes": o["votes"]}
+            for o in options
+        ],
+    }
+
+
+@news_bp.route("/<post_id>/poll", methods=["GET"])
+def get_poll(post_id):
+    """Get the poll attached to a post, if any."""
+    user = get_current_user()
+    db = get_db()
+    try:
+        poll = db.execute("SELECT * FROM polls WHERE post_id = ?", (post_id,)).fetchone()
+        if not poll:
+            return jsonify({"error": "No poll found for this post"}), 404
+        return jsonify(_poll_to_dict(db, poll, user["id"] if user else None))
+    finally:
+        db.close()
+
+
+@news_bp.route("/<post_id>/poll", methods=["POST"])
+@require_auth
+def create_poll(post_id):
+    """Create a poll on an existing post. Only the post author or admin can do this."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    title = (data.get("title") or "").strip()
+    options = data.get("options", [])
+    end_date = data.get("end_date")
+
+    if not title:
+        return jsonify({"error": "Poll title required"}), 400
+    if len(options) < 2:
+        return jsonify({"error": "At least 2 options required"}), 400
+    if len(options) > 10:
+        return jsonify({"error": "Maximum 10 options allowed"}), 400
+
+    db = get_db()
+    try:
+        post = db.execute("SELECT id, author_id FROM news_posts WHERE id = ?", (post_id,)).fetchone()
+        if not post:
+            return jsonify({"error": "Post not found"}), 404
+
+        # Only author or admin can create polls
+        user = request.user
+        if post["author_id"] != user["id"] and user["role"] != "admin":
+            return jsonify({"error": "Only the post author or admin can create a poll"}), 403
+
+        # Check no poll already exists
+        existing = db.execute("SELECT id FROM polls WHERE post_id = ?", (post_id,)).fetchone()
+        if existing:
+            return jsonify({"error": "Post already has a poll"}), 409
+
+        poll_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+
+        db.execute(
+            "INSERT INTO polls (id, post_id, title, end_date, created_at) VALUES (?, ?, ?, ?, ?)",
+            (poll_id, post_id, title, end_date, now),
+        )
+
+        for opt_text in options:
+            opt_text = str(opt_text).strip()
+            if opt_text:
+                opt_id = str(uuid.uuid4())
+                db.execute(
+                    "INSERT INTO poll_options (id, poll_id, text) VALUES (?, ?, ?)",
+                    (opt_id, poll_id, opt_text),
+                )
+
+        # Update post type to poll
+        db.execute("UPDATE news_posts SET post_type = 'poll' WHERE id = ?", (post_id,))
+        db.commit()
+
+        poll = db.execute("SELECT * FROM polls WHERE id = ?", (poll_id,)).fetchone()
+        return jsonify(_poll_to_dict(db, poll, user["id"])), 201
+    finally:
+        db.close()
+
+
+@news_bp.route("/<post_id>/poll/vote", methods=["POST"])
+@require_auth
+def vote_poll(post_id):
+    """Vote on a poll. One vote per user per poll."""
+    data = request.get_json()
+    if not data or not data.get("option_id"):
+        return jsonify({"error": "option_id required"}), 400
+
+    option_id = data["option_id"]
+    user_id = request.user["id"]
+
+    db = get_db()
+    try:
+        poll = db.execute("SELECT * FROM polls WHERE post_id = ?", (post_id,)).fetchone()
+        if not poll:
+            return jsonify({"error": "No poll found for this post"}), 404
+
+        poll_id = poll["id"]
+
+        # Check end date
+        if poll["end_date"]:
+            try:
+                end = datetime.fromisoformat(poll["end_date"]).replace(tzinfo=None)
+                if datetime.utcnow() > end:
+                    return jsonify({"error": "Poll has ended"}), 400
+            except ValueError:
+                pass
+
+        # Validate option belongs to this poll
+        option = db.execute(
+            "SELECT id FROM poll_options WHERE id = ? AND poll_id = ?",
+            (option_id, poll_id),
+        ).fetchone()
+        if not option:
+            return jsonify({"error": "Invalid option"}), 400
+
+        # Check for existing vote
+        existing = db.execute(
+            "SELECT option_id FROM poll_votes WHERE user_id = ? AND poll_id = ?",
+            (user_id, poll_id),
+        ).fetchone()
+
+        if existing:
+            if existing["option_id"] == option_id:
+                return jsonify({"error": "Already voted for this option"}), 409
+            # Change vote: decrement old, increment new
+            db.execute(
+                "UPDATE poll_options SET votes = MAX(0, votes - 1) WHERE id = ?",
+                (existing["option_id"],),
+            )
+            db.execute(
+                "UPDATE poll_options SET votes = votes + 1 WHERE id = ?",
+                (option_id,),
+            )
+            db.execute(
+                "UPDATE poll_votes SET option_id = ?, created_at = ? WHERE user_id = ? AND poll_id = ?",
+                (option_id, datetime.utcnow().isoformat(), user_id, poll_id),
+            )
+        else:
+            # New vote
+            db.execute(
+                "INSERT INTO poll_votes (user_id, poll_id, option_id) VALUES (?, ?, ?)",
+                (user_id, poll_id, option_id),
+            )
+            db.execute(
+                "UPDATE poll_options SET votes = votes + 1 WHERE id = ?",
+                (option_id,),
+            )
+            db.execute(
+                "UPDATE polls SET total_votes = total_votes + 1 WHERE id = ?",
+                (poll_id,),
+            )
+
+        db.commit()
+
+        poll = db.execute("SELECT * FROM polls WHERE id = ?", (poll_id,)).fetchone()
+        return jsonify(_poll_to_dict(db, poll, user_id))
     finally:
         db.close()
