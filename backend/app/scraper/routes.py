@@ -37,9 +37,10 @@ def scraper_status():
 
 
 @scraper_bp.route("/trigger", methods=["POST"])
+@scraper_bp.route("/run", methods=["POST"])
 @require_role("admin")
 def trigger_scrape():
-    """Manually trigger a scrape (admin only)."""
+    """Manually trigger a scrape (admin only). Aliased as /run and /trigger."""
     knf_result = scrape_knf_news(pages=3)
     vu_result = scrape_vu_news(pages=1)
     return jsonify({
