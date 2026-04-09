@@ -25,10 +25,14 @@ def create_app():
     # ProxyFix for running behind Caddy
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
+    # CORS — restrict origins in production via ALLOWED_ORIGINS env var (comma-separated)
+    allowed_origins = os.environ.get("ALLOWED_ORIGINS", "*")
+    if allowed_origins != "*":
+        allowed_origins = [o.strip() for o in allowed_origins.split(",") if o.strip()]
+    CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
 
-    # Initialize Socket.IO with CORS allowed for all origins (mobile app)
-    socketio.init_app(app, cors_allowed_origins="*", async_mode="threading")
+    # Initialize Socket.IO with same CORS policy
+    socketio.init_app(app, cors_allowed_origins=allowed_origins, async_mode="threading")
 
     # Ensure data directory exists
     db_dir = os.path.dirname(app.config["DB_PATH"])
@@ -47,6 +51,7 @@ def create_app():
     from app.chat.routes import chat_bp
     from app.social.routes import social_bp
     from app.uploads.routes import uploads_bp
+    from app.info.routes import info_bp
 
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(news_bp, url_prefix="/api/news")
@@ -56,6 +61,7 @@ def create_app():
     app.register_blueprint(chat_bp, url_prefix="/api/chat")
     app.register_blueprint(social_bp, url_prefix="/api/social")
     app.register_blueprint(uploads_bp, url_prefix="/api/uploads")
+    app.register_blueprint(info_bp, url_prefix="/api/info")
 
     # Register Socket.IO events for real-time chat
     from app.chat.events import register_socket_events

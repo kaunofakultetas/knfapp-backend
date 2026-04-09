@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: KNFAPP API
   description: Backend API for VU Kaunas Faculty mobile app
-  version: 1.4.0
+  version: 1.5.0
   contact:
     name: VU KNF IT
 servers:
@@ -30,6 +30,8 @@ tags:
     description: Post polls & voting
   - name: uploads
     description: File uploads (images)
+  - name: info
+    description: Faculty information (contacts, links, hours, FAQ)
 
 paths:
   /health:
@@ -1262,6 +1264,98 @@ paths:
                 format: binary
         "404":
           description: File not found
+
+  /info:
+    get:
+      tags: [info]
+      summary: Get faculty information
+      description: Returns contacts, links, building hours, study programs, and FAQ
+      parameters:
+        - name: lang
+          in: query
+          schema:
+            type: string
+            enum: [lt, en]
+            default: lt
+          description: Language (lt or en)
+        - name: section
+          in: query
+          schema:
+            type: string
+            enum: [contacts, links, hours, programs, faq]
+          description: Filter to a single section
+      responses:
+        "200":
+          description: Faculty information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contacts:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        category:
+                          type: string
+                        items:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              name:
+                                type: string
+                              phone:
+                                type: string
+                              email:
+                                type: string
+                              room:
+                                type: string
+                  links:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title:
+                          type: string
+                        url:
+                          type: string
+                        icon:
+                          type: string
+                  hours:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        place:
+                          type: string
+                        address:
+                          type: string
+                        schedule:
+                          type: string
+                        note:
+                          type: string
+                  programs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        degree:
+                          type: string
+                        duration:
+                          type: string
+                  faq:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        q:
+                          type: string
+                        a:
+                          type: string
 
 components:
   securitySchemes:
