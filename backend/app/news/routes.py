@@ -72,6 +72,18 @@ def get_feed():
             # Guests: only public posts, no user posts from friends
             where_clauses.append("is_public = 1")
             where_clauses.append("source != 'user'")
+        else:
+            # Authenticated: see own posts + friends' posts + all public non-user posts
+            friend_ids = [r["friend_id"] for r in db.execute(
+                "SELECT friend_id FROM friendships WHERE user_id = ?", (user["id"],)
+            ).fetchall()]
+            visible_ids = [user["id"]] + friend_ids
+            if not source_filter or source_filter == "user":
+                placeholders = ",".join(["?"] * len(visible_ids))
+                where_clauses.append(
+                    f"(source != 'user' OR author_id IN ({placeholders}))"
+                )
+                params.extend(visible_ids)
 
         where_sql = " AND ".join(where_clauses)
 
@@ -142,6 +154,72 @@ def get_feed():
             "hasMore": offset + per_page < total,
         })
 
+    finally:
+        db.close()
+
+
+@news_bp.route("", methods=["POST"])
+@require_auth
+def create_post():
+    """
+    Create a news post.
+    Faculty staff (admin, curator, teacher) can create faculty/announcement posts.
+    Students can create user/social posts (same as social/posts endpoint).
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    content = (data.get("content") or "").strip()
+    if not content:
+        return jsonify({"error": "Content required"}), 400
+
+    role = request.user["role"]
+    post_type = data.get("post_type", "social")
+    image_url = data.get("image_url")
+    is_public = data.get("is_public", True)
+
+    # Determine source based on role and requested type
+    if post_type in ("announcement", "article") and role in ("admin", "curator", "teacher"):
+        source = "faculty"
+    else:
+        source = "user"
+        post_type = "social"
+
+    title = (data.get("title") or "").strip() or content[:80]
+    post_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+
+    db = get_db()
+    try:
+        db.execute(
+            """INSERT INTO news_posts
+               (id, title, content, summary, image_url, author_id, author_name,
+                source, source_url, post_type, is_public, published_at, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)""",
+            (post_id, title, content, content[:200], image_url,
+             request.user["id"], request.user["display_name"],
+             source, post_type, 1 if is_public else 0, now, now, now),
+        )
+        db.commit()
+
+        return jsonify({
+            "id": post_id,
+            "title": title,
+            "content": content,
+            "summary": content[:200],
+            "imageUrl": image_url,
+            "author": request.user["display_name"],
+            "authorId": request.user["id"],
+            "source": source,
+            "postType": post_type,
+            "likes": 0,
+            "comments": 0,
+            "shares": 0,
+            "date": now,
+            "isPublic": is_public,
+            "liked": False,
+        }), 201
     finally:
         db.close()
 

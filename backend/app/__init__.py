@@ -37,6 +37,7 @@ def create_app():
     from app.admin.routes import admin_bp
     from app.scraper.routes import scraper_bp
     from app.chat.routes import chat_bp
+    from app.social.routes import social_bp
 
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(news_bp, url_prefix="/api/news")
@@ -44,6 +45,7 @@ def create_app():
     app.register_blueprint(admin_bp, url_prefix="/api/admin")
     app.register_blueprint(scraper_bp, url_prefix="/api/scraper")
     app.register_blueprint(chat_bp, url_prefix="/api/chat")
+    app.register_blueprint(social_bp, url_prefix="/api/social")
 
     # Start background scraper
     from app.scraper.scheduler import start_scraper_scheduler
