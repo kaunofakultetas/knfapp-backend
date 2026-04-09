@@ -66,6 +66,33 @@ def get_schedule():
         db.close()
 
 
+@schedule_bp.route("/filters", methods=["GET"])
+def get_schedule_filters():
+    """
+    Get available groups and semesters for the schedule filter UI.
+
+    Returns:
+      { "groups": ["ISKS-1", ...], "semesters": ["2025-P", ...] }
+    """
+    db = get_db()
+    try:
+        groups = [
+            r["group_name"]
+            for r in db.execute(
+                "SELECT DISTINCT group_name FROM schedule_lessons WHERE group_name IS NOT NULL ORDER BY group_name"
+            ).fetchall()
+        ]
+        semesters = [
+            r["semester"]
+            for r in db.execute(
+                "SELECT DISTINCT semester FROM schedule_lessons WHERE semester IS NOT NULL ORDER BY semester DESC"
+            ).fetchall()
+        ]
+        return jsonify({"groups": groups, "semesters": semesters})
+    finally:
+        db.close()
+
+
 @schedule_bp.route("/seed", methods=["POST"])
 @require_role("admin")
 def seed_schedule():
@@ -73,6 +100,7 @@ def seed_schedule():
     import uuid
 
     demo_lessons = [
+        # ISKS-1, 2025-P (Spring)
         ("Programavimo pagrindai", "Doc. J. Kazlauskas", "207", "08:30", "10:00", 0, "ISKS-1", "2025-P"),
         ("Duomenų bazės", "Lekt. I. Petrauskaitė", "105", "10:15", "11:45", 0, "ISKS-1", "2025-P"),
         ("Tinklų pagrindai", "Asist. K. Jonaitis", "Lab-3", "12:00", "13:30", 0, "ISKS-1", "2025-P"),
@@ -84,6 +112,29 @@ def seed_schedule():
         ("Programavimo pagrindai (Lab)", "Doc. J. Kazlauskas", "Lab-1", "10:15", "11:45", 3, "ISKS-1", "2025-P"),
         ("Web technologijos", "Asist. K. Jonaitis", "Lab-3", "12:00", "13:30", 3, "ISKS-1", "2025-P"),
         ("Duomenų bazės (Lab)", "Lekt. I. Petrauskaitė", "Lab-2", "14:00", "15:30", 4, "ISKS-1", "2025-P"),
+        # ISKS-2, 2025-P (Spring)
+        ("Operacinės sistemos", "Doc. A. Rimkus", "207", "08:30", "10:00", 0, "ISKS-2", "2025-P"),
+        ("Algoritmų analizė", "Prof. V. Matulis", "Aula", "10:15", "11:45", 0, "ISKS-2", "2025-P"),
+        ("Programų inžinerija", "Doc. J. Kazlauskas", "105", "12:00", "13:30", 1, "ISKS-2", "2025-P"),
+        ("Duomenų struktūros", "Lekt. I. Petrauskaitė", "Lab-2", "08:30", "10:00", 1, "ISKS-2", "2025-P"),
+        ("Tinklų saugumas", "Asist. K. Jonaitis", "Lab-3", "10:15", "11:45", 2, "ISKS-2", "2025-P"),
+        ("Anglų kalba B2", "Lekt. S. Brown", "301", "12:00", "13:30", 2, "ISKS-2", "2025-P"),
+        ("Programų inžinerija (Lab)", "Doc. J. Kazlauskas", "Lab-1", "08:30", "10:00", 3, "ISKS-2", "2025-P"),
+        ("Operacinės sistemos (Lab)", "Doc. A. Rimkus", "Lab-2", "10:15", "11:45", 4, "ISKS-2", "2025-P"),
+        # VVB-1, 2025-P (Spring) — Business management group
+        ("Mikroekonomika", "Prof. R. Jankauskienė", "Aula", "08:30", "10:00", 0, "VVB-1", "2025-P"),
+        ("Verslo teisė", "Lekt. D. Stankevičius", "105", "10:15", "11:45", 0, "VVB-1", "2025-P"),
+        ("Apskaita ir finansai", "Doc. L. Navickienė", "207", "08:30", "10:00", 1, "VVB-1", "2025-P"),
+        ("Rinkodaros pagrindai", "Lekt. M. Žukauskaitė", "301", "10:15", "11:45", 2, "VVB-1", "2025-P"),
+        ("Vadyba", "Prof. R. Jankauskienė", "Aula", "12:00", "13:30", 2, "VVB-1", "2025-P"),
+        ("Verslo teisė (Sem.)", "Lekt. D. Stankevičius", "105", "08:30", "10:00", 3, "VVB-1", "2025-P"),
+        ("Statistika versle", "Prof. V. Matulis", "207", "10:15", "11:45", 4, "VVB-1", "2025-P"),
+        # ISKS-1, 2025-R (Autumn — previous semester for testing)
+        ("Informacinės technologijos", "Asist. K. Jonaitis", "Lab-3", "08:30", "10:00", 0, "ISKS-1", "2025-R"),
+        ("Matematinė analizė", "Prof. V. Matulis", "Aula", "10:15", "11:45", 0, "ISKS-1", "2025-R"),
+        ("Fizika", "Doc. P. Lapinskienė", "207", "12:00", "13:30", 1, "ISKS-1", "2025-R"),
+        ("Informacinės technologijos (Lab)", "Asist. K. Jonaitis", "Lab-1", "08:30", "10:00", 2, "ISKS-1", "2025-R"),
+        ("Matematinė analizė (Prat.)", "Prof. V. Matulis", "105", "10:15", "11:45", 3, "ISKS-1", "2025-R"),
     ]
 
     db = get_db()

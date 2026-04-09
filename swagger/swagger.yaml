@@ -496,6 +496,29 @@ paths:
                     items:
                       $ref: "#/components/schemas/Lesson"
 
+  /schedule/filters:
+    get:
+      tags: [schedule]
+      summary: Get available groups and semesters for filtering
+      responses:
+        "200":
+          description: Available filter values
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  groups:
+                    type: array
+                    items:
+                      type: string
+                    example: ["ISKS-1", "ISKS-2", "VVB-1"]
+                  semesters:
+                    type: array
+                    items:
+                      type: string
+                    example: ["2025-P", "2025-R"]
+
   # ── Chat ──────────────────────────────────────────────────────────────────
 
   /chat/conversations:
@@ -1117,6 +1140,37 @@ paths:
       responses:
         "200":
           description: User list
+
+  /admin/users/{userId}:
+    patch:
+      tags: [admin]
+      summary: Update user role or active status
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role:
+                  type: string
+                  enum: [student, teacher, curator, admin]
+                active:
+                  type: boolean
+      responses:
+        "200":
+          description: Updated user
+        "400":
+          description: Invalid role or nothing to update
+        "404":
+          description: User not found
 
   /admin/stats:
     get:

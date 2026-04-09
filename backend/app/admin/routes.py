@@ -132,6 +132,71 @@ def list_users():
         db.close()
 
 
+@admin_bp.route("/users/<user_id>", methods=["PATCH"])
+@require_role("admin")
+def update_user(user_id):
+    """
+    Update a user's role or active status.
+
+    Body:
+      - role: str (student, teacher, admin, curator) — optional
+      - active: bool — optional (false = deactivated)
+    """
+    data = request.get_json() or {}
+    new_role = data.get("role")
+    active = data.get("active")
+
+    if new_role is not None and new_role not in ("student", "teacher", "admin", "curator"):
+        return jsonify({"error": "Invalid role"}), 400
+
+    # Prevent admin from deactivating themselves
+    if active is False and user_id == request.user["id"]:
+        return jsonify({"error": "Cannot deactivate your own account"}), 400
+
+    if new_role is None and active is None:
+        return jsonify({"error": "Nothing to update"}), 400
+
+    db = get_db()
+    try:
+        user = db.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        if new_role is not None:
+            db.execute("UPDATE users SET role = ? WHERE id = ?", (new_role, user_id))
+
+        if active is not None:
+            # Use a status column — if it doesn't exist yet, add it
+            try:
+                db.execute("UPDATE users SET active = ? WHERE id = ?", (1 if active else 0, user_id))
+            except Exception:
+                # Column doesn't exist — add it and retry
+                db.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+                db.execute("UPDATE users SET active = ? WHERE id = ?", (1 if active else 0, user_id))
+
+            # If deactivating, also invalidate all their sessions
+            if not active:
+                db.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+
+        db.commit()
+
+        updated = db.execute(
+            "SELECT id, username, email, display_name, role, created_at FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+
+        return jsonify({
+            "id": updated["id"],
+            "username": updated["username"],
+            "email": updated["email"],
+            "displayName": updated["display_name"],
+            "role": updated["role"],
+            "createdAt": updated["created_at"],
+        })
+    finally:
+        db.close()
+
+
 @admin_bp.route("/stats", methods=["GET"])
 @require_role("admin")
 def admin_stats():
