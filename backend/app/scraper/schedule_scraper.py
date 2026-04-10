@@ -429,6 +429,17 @@ def scrape_knf_schedule(semester_weeks: int = 16) -> dict:
             "lessons_new": total_new,
         }
         logger.info("Schedule scrape complete: %s", result)
+
+        # Send push notification if new schedule entries were found (respects channel preferences)
+        if total_new > 0:
+            try:
+                from app.notifications.push import notify_channel
+                title = "Tvarkara\u0161\u010dio pakeitimai"
+                body = f"{total_new} nauji \u012fra\u0161ai tvarkara\u0161tyje" if total_new > 1 else "Naujas \u012fra\u0161as tvarkara\u0161tyje"
+                notify_channel("schedule", title, body, data={"type": "schedule_update", "newLessons": total_new})
+            except Exception:
+                logger.exception("Failed to send push notification for schedule changes")
+
         return result
 
     except Exception:

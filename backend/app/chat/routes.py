@@ -444,10 +444,10 @@ def send_message(conv_id):
         from app.chat.events import emit_new_message
         emit_new_message(_get_socketio(), conv_id, msg_data)
 
-        # Push notifications for offline participants
+        # Push notifications for offline participants (respects channel preferences)
         try:
             from app.chat.events import _connected_users
-            from app.notifications.push import notify_user
+            from app.notifications.push import notify_channel_user
 
             # Find which users are online in this conversation via Socket.IO
             online_user_ids = set(_connected_users.values())
@@ -463,7 +463,8 @@ def send_message(conv_id):
             for p in participants:
                 pid = p["user_id"]
                 if pid not in online_user_ids:
-                    notify_user(
+                    notify_channel_user(
+                        "chat",
                         pid,
                         sender_name,
                         preview,

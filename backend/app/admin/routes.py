@@ -260,12 +260,12 @@ def send_admin_notification():
     if len(body_text) > 1000:
         return jsonify({"error": "Body must be at most 1000 characters"}), 400
 
-    from app.notifications.push import notify_all_users
+    from app.notifications.push import notify_channel
 
     extra_data = data.get("data") if isinstance(data.get("data"), dict) else None
     if extra_data is None:
         extra_data = {"type": "admin_announcement"}
 
-    sent = notify_all_users(title, body_text, data=extra_data)
+    sent = notify_channel("admin", title, body_text, data=extra_data)
 
     return jsonify({"sent": sent, "message": f"Notification sent to {sent} devices"})

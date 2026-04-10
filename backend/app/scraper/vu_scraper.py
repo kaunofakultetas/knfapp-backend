@@ -128,13 +128,13 @@ def scrape_vu_news(pages=1):
 
         logger.info("vu.lt scrape complete: found=%d, new=%d", articles_found, articles_new)
 
-        # Send push notification if new articles were found
+        # Send push notification if new articles were found (respects channel preferences)
         if articles_new > 0:
             try:
-                from app.notifications.push import notify_all_users
+                from app.notifications.push import notify_channel
                 title = "VU naujienos" if articles_new == 1 else f"VU naujienos ({articles_new})"
                 body = f"Naujas straipsnis i\u0161 vu.lt" if articles_new == 1 else f"{articles_new} nauji straipsniai i\u0161 vu.lt"
-                notify_all_users(title, body, data={"type": "news", "source": "vu.lt"})
+                notify_channel("news", title, body, data={"type": "news", "source": "vu.lt"})
             except Exception:
                 logger.exception("Failed to send push notification for new vu.lt articles")
 

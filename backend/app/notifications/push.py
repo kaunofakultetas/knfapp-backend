@@ -189,6 +189,42 @@ def notify_all_users(title: str, body: str, data: Optional[dict] = None, exclude
     return send_push_batch(tokens, title, body, data)
 
 
+def notify_channel_user(channel: str, user_id: str, title: str, body: str, data: Optional[dict] = None) -> int:
+    """Send push notification to a specific user, but only if they have the channel enabled.
+
+    Users who haven't set any preference default to enabled (opt-out model).
+    Returns count of successfully sent notifications (0 if user opted out).
+    """
+    db = get_db()
+    try:
+        # Check if user has explicitly disabled this channel
+        row = db.execute(
+            "SELECT enabled FROM notification_channels WHERE user_id = ? AND channel = ?",
+            (user_id, channel),
+        ).fetchone()
+
+        # If explicit opt-out, skip
+        if row and not row["enabled"]:
+            return 0
+
+        # Get active push tokens for this user
+        tokens_rows = db.execute(
+            "SELECT token FROM push_tokens WHERE user_id = ? AND active = 1",
+            (user_id,),
+        ).fetchall()
+    finally:
+        db.close()
+
+    tokens = [r["token"] for r in tokens_rows]
+    if not tokens:
+        return 0
+
+    push_data = dict(data or {})
+    push_data["channel"] = channel
+
+    return send_push_batch(tokens, title, body, push_data)
+
+
 def notify_channel(channel: str, title: str, body: str, data: Optional[dict] = None, exclude_user_id: Optional[str] = None) -> int:
     """Send push notification only to users subscribed to a specific channel.
 

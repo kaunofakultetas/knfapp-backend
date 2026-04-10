@@ -135,13 +135,13 @@ def scrape_knf_news(pages=2):
 
         logger.info("knf.vu.lt scrape complete: found=%d, new=%d", articles_found, articles_new)
 
-        # Send push notification if new articles were found
+        # Send push notification if new articles were found (respects channel preferences)
         if articles_new > 0:
             try:
-                from app.notifications.push import notify_all_users
+                from app.notifications.push import notify_channel
                 title = "KNF naujienos" if articles_new == 1 else f"KNF naujienos ({articles_new})"
                 body = f"Naujas straipsnis i\u0161 knf.vu.lt" if articles_new == 1 else f"{articles_new} nauji straipsniai i\u0161 knf.vu.lt"
-                notify_all_users(title, body, data={"type": "news", "source": "knf.vu.lt"})
+                notify_channel("news", title, body, data={"type": "news", "source": "knf.vu.lt"})
             except Exception:
                 logger.exception("Failed to send push notification for new knf.vu.lt articles")
 
