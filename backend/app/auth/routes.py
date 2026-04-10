@@ -217,6 +217,9 @@ def register():
                 "displayName": data["display_name"],
                 "role": role,
                 "invited": bool(invited),
+                "studentNumber": None,
+                "studyGroup": None,
+                "studyProgram": None,
             },
             "token": token,
         }), 201
@@ -266,15 +269,7 @@ def login():
 
         user_dict = dict(user)
         return jsonify({
-            "user": {
-                "id": user_dict["id"],
-                "username": user_dict["username"],
-                "email": user_dict["email"],
-                "displayName": user_dict["display_name"],
-                "role": user_dict["role"],
-                "avatarUrl": user_dict["avatar_url"],
-                "invited": bool(user_dict.get("invited", 1)),
-            },
+            "user": _serialize_user(user_dict),
             "token": token,
         })
 
@@ -282,12 +277,9 @@ def login():
         db.close()
 
 
-@auth_bp.route("/me", methods=["GET"])
-@require_auth
-def me():
-    """Get current user info."""
-    u = request.user
-    return jsonify({
+def _serialize_user(u):
+    """Serialize a user dict/Row to the JSON shape the client expects."""
+    return {
         "id": u["id"],
         "username": u["username"],
         "email": u["email"],
@@ -295,7 +287,17 @@ def me():
         "role": u["role"],
         "avatarUrl": u["avatar_url"],
         "invited": bool(u.get("invited", 1)),
-    })
+        "studentNumber": u.get("student_number"),
+        "studyGroup": u.get("study_group"),
+        "studyProgram": u.get("study_program"),
+    }
+
+
+@auth_bp.route("/me", methods=["GET"])
+@require_auth
+def me():
+    """Get current user info."""
+    return jsonify(_serialize_user(request.user))
 
 
 @auth_bp.route("/me", methods=["PUT"])
@@ -320,6 +322,23 @@ def update_me():
             updates.append("avatar_url = ?")
             params.append(data["avatar_url"])
 
+        # Student ID fields (max 50 chars each)
+        for field, col in [
+            ("student_number", "student_number"),
+            ("study_group", "study_group"),
+            ("study_program", "study_program"),
+        ]:
+            if field in data:
+                val = data[field]
+                if val is not None:
+                    val = str(val).strip()
+                    if len(val) > 50:
+                        return jsonify({"error": f"{field} must be at most 50 characters"}), 400
+                    if not val:
+                        val = None
+                updates.append(f"{col} = ?")
+                params.append(val)
+
         if not updates:
             return jsonify({"error": "No fields to update"}), 400
 
@@ -331,16 +350,7 @@ def update_me():
         db.commit()
 
         user_row = db.execute("SELECT * FROM users WHERE id = ?", (request.user["id"],)).fetchone()
-        u = dict(user_row)
-        return jsonify({
-            "id": u["id"],
-            "username": u["username"],
-            "email": u["email"],
-            "displayName": u["display_name"],
-            "role": u["role"],
-            "avatarUrl": u["avatar_url"],
-            "invited": bool(u.get("invited", 1)),
-        })
+        return jsonify(_serialize_user(dict(user_row)))
     finally:
         db.close()
 

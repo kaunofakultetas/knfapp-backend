@@ -12,7 +12,7 @@ _db_path = None
 logger = logging.getLogger(__name__)
 
 # Migration version — bump this to re-run migrations
-_CURRENT_MIGRATION_VERSION = 4
+_CURRENT_MIGRATION_VERSION = 5
 
 
 def init_db(db_path):
@@ -103,6 +103,7 @@ def _run_migrations(conn):
         2: ("Reverse double-escaped HTML entities (input-escaping removed)", _migration_v2_unescape_double_escapes),
         3: ("Add invited column to users for trust levels", _migration_v3_add_invited_column),
         4: ("Add faculty_info table for scraped faculty data", _migration_v4_add_faculty_info_table),
+        5: ("Add student fields to users table", _migration_v5_add_student_fields),
     }
 
     for version in sorted(_MIGRATIONS.keys()):
@@ -318,6 +319,25 @@ def _migration_v4_add_faculty_info_table(conn):
     logger.info("  Created faculty_info table")
 
 
+def _migration_v5_add_student_fields(conn):
+    """Migration v5: Add student_number, study_group, study_program to users.
+
+    These fields support the Student ID card feature, letting students
+    display their number, group, and program on the digital ID.
+    """
+    for col, default in [
+        ("student_number", "NULL"),
+        ("study_group", "NULL"),
+        ("study_program", "NULL"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT DEFAULT {default}")
+            logger.info("  Added '%s' column to users table", col)
+        except Exception:
+            logger.info("  '%s' column already exists, skipping", col)
+    conn.commit()
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -327,6 +347,9 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'student' CHECK(role IN ('student', 'teacher', 'admin', 'curator')),
     avatar_url TEXT,
+    student_number TEXT,
+    study_group TEXT,
+    study_program TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

@@ -98,6 +98,23 @@ def update_profile():
             updates.append("avatar_url = ?")
             params.append(data["avatar_url"])
 
+        # Student ID fields
+        for field, col in [
+            ("student_number", "student_number"),
+            ("study_group", "study_group"),
+            ("study_program", "study_program"),
+        ]:
+            if field in data:
+                val = data[field]
+                if val is not None:
+                    val = str(val).strip()
+                    if len(val) > 50:
+                        return jsonify({"error": f"{field} must be at most 50 characters"}), 400
+                    if not val:
+                        val = None
+                updates.append(f"{col} = ?")
+                params.append(val)
+
         if not updates:
             return jsonify({"error": "No fields to update"}), 400
 
@@ -116,6 +133,9 @@ def update_profile():
             "displayName": user["display_name"],
             "avatarUrl": user["avatar_url"],
             "role": user["role"],
+            "studentNumber": user["student_number"],
+            "studyGroup": user["study_group"],
+            "studyProgram": user["study_program"],
         })
     finally:
         db.close()
