@@ -13,9 +13,45 @@ uploads_bp = Blueprint("uploads", __name__)
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp"}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
+# Magic bytes for allowed image formats
+_MAGIC_BYTES = {
+    b"\xff\xd8\xff": "jpg",       # JPEG
+    b"\x89PNG\r\n\x1a\n": "png",  # PNG
+    b"GIF87a": "gif",              # GIF87a
+    b"GIF89a": "gif",              # GIF89a
+    b"RIFF": "webp",               # WebP (RIFF container, further checked below)
+}
+
 
 def _allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def _validate_magic_bytes(file_obj) -> bool:
+    """Check that the file's magic bytes match an allowed image format.
+
+    Reads the first 16 bytes, then seeks back to start.
+    """
+    header = file_obj.read(16)
+    file_obj.seek(0)
+
+    if len(header) < 4:
+        return False
+
+    # JPEG: starts with FF D8 FF
+    if header[:3] == b"\xff\xd8\xff":
+        return True
+    # PNG: 8-byte signature
+    if header[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    # GIF: GIF87a or GIF89a
+    if header[:6] in (b"GIF87a", b"GIF89a"):
+        return True
+    # WebP: RIFF....WEBP
+    if header[:4] == b"RIFF" and len(header) >= 12 and header[8:12] == b"WEBP":
+        return True
+
+    return False
 
 
 def _get_upload_dir() -> str:
@@ -54,6 +90,10 @@ def upload_file():
 
     if size == 0:
         return jsonify({"error": "Empty file"}), 400
+
+    # Validate magic bytes match an allowed image format
+    if not _validate_magic_bytes(file):
+        return jsonify({"error": "File content does not match an allowed image format"}), 400
 
     # Generate unique filename
     ext = file.filename.rsplit(".", 1)[1].lower()

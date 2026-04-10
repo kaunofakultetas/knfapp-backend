@@ -1,6 +1,8 @@
 """Socket.IO event handlers for real-time chat."""
 
 import logging
+import time
+from collections import defaultdict
 from datetime import datetime
 
 from flask import request as flask_request
@@ -13,6 +15,34 @@ logger = logging.getLogger(__name__)
 
 # Track connected users: sid -> user_id
 _connected_users: dict[str, str] = {}
+
+# ── Simple per-user socket event rate limiter ─────────────────────────────
+# Maps (user_id, event_name) -> list of timestamps
+_socket_rate: dict[tuple[str, str], list[float]] = defaultdict(list)
+_SOCKET_RATE_WINDOW = 10  # seconds
+_SOCKET_RATE_LIMITS: dict[str, int] = {
+    "typing": 20,         # 20 per 10s
+    "stop_typing": 20,    # 20 per 10s
+    "mark_read": 10,      # 10 per 10s
+    "join_conversation": 10,
+    "leave_conversation": 10,
+}
+
+
+def _socket_rate_check(user_id: str, event: str) -> bool:
+    """Return True if the event should be REJECTED (rate exceeded)."""
+    limit = _SOCKET_RATE_LIMITS.get(event)
+    if not limit:
+        return False
+    key = (user_id, event)
+    now = time.monotonic()
+    timestamps = _socket_rate[key]
+    # Prune old entries
+    _socket_rate[key] = [t for t in timestamps if now - t < _SOCKET_RATE_WINDOW]
+    if len(_socket_rate[key]) >= limit:
+        return True
+    _socket_rate[key].append(now)
+    return False
 
 
 def _authenticate_socket():
@@ -114,6 +144,8 @@ def register_socket_events(socketio):
         user_id = _connected_users.get(sid)
         if not user_id:
             return
+        if _socket_rate_check(user_id, "typing"):
+            return
 
         conv_id = data.get("conversationId")
         if not conv_id:
@@ -145,6 +177,8 @@ def register_socket_events(socketio):
         user_id = _connected_users.get(sid)
         if not user_id:
             return
+        if _socket_rate_check(user_id, "stop_typing"):
+            return
 
         conv_id = data.get("conversationId")
         if conv_id:
@@ -162,6 +196,8 @@ def register_socket_events(socketio):
         sid = flask_request.sid
         user_id = _connected_users.get(sid)
         if not user_id:
+            return
+        if _socket_rate_check(user_id, "mark_read"):
             return
 
         conv_id = data.get("conversationId")

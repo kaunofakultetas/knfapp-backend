@@ -18,7 +18,8 @@ def parse_pagination(max_per_page=100, default_per_page=20):
     raw_page = request.args.get("page")
     raw_per_page = request.args.get("per_page")
 
-    # Validate page
+    # Validate page (cap at 10000 to prevent absurd OFFSET values)
+    _MAX_PAGE = 10_000
     if raw_page is not None:
         try:
             page = int(raw_page)
@@ -26,6 +27,8 @@ def parse_pagination(max_per_page=100, default_per_page=20):
             return None, None, (jsonify({"error": "page must be a positive integer"}), 400)
         if page < 1:
             return None, None, (jsonify({"error": "page must be a positive integer"}), 400)
+        if page > _MAX_PAGE:
+            return None, None, (jsonify({"error": f"page must be at most {_MAX_PAGE}"}), 400)
     else:
         page = 1
 
