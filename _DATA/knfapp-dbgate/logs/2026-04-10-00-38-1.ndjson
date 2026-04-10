@@ -5,3 +5,4 @@
 {"pid":1,"caller":"useController","name":"main","level":30,"msg":"Calling init controller for controller /scheduler","time":1775781505482,"msgcode":"DBGM-00096"}
 {"pid":1,"caller":"directories","name":"main","level":30,"msg":"Cleaning directory /root/.dbgate/run","time":1775781505483,"msgcode":"DBGM-00170"}
 {"pid":1,"caller":"main","name":"main","level":30,"msg":"DbGate API listening on port 3000 (docker build)","time":1775781505484,"msgcode":"DBGM-00028"}
+{"pid":1,"caller":"main","name":"main","level":30,"msg":"Shutting down DbGate API server","time":1775792253381,"msgcode":"DBGM-00034"}

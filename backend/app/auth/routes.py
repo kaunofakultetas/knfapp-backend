@@ -312,22 +312,27 @@ def update_me():
     try:
         updates = []
         params = []
-        if "display_name" in data and data["display_name"].strip():
-            display_name = data["display_name"].strip()
+        # Accept both camelCase (what GET returns) and snake_case
+        dn_key = "displayName" if "displayName" in data else "display_name"
+        if dn_key in data and data[dn_key] and str(data[dn_key]).strip():
+            display_name = str(data[dn_key]).strip()
             if len(display_name) > 100:
                 return jsonify({"error": "Display name must be at most 100 characters"}), 400
             updates.append("display_name = ?")
             params.append(display_name)
-        if "avatar_url" in data:
+        av_key = "avatarUrl" if "avatarUrl" in data else "avatar_url"
+        if av_key in data:
             updates.append("avatar_url = ?")
-            params.append(data["avatar_url"])
+            params.append(data[av_key])
 
         # Student ID fields (max 50 chars each)
-        for field, col in [
-            ("student_number", "student_number"),
-            ("study_group", "study_group"),
-            ("study_program", "study_program"),
+        # Accept both camelCase (what GET returns) and snake_case
+        for camel, snake, col in [
+            ("studentNumber", "student_number", "student_number"),
+            ("studyGroup", "study_group", "study_group"),
+            ("studyProgram", "study_program", "study_program"),
         ]:
+            field = camel if camel in data else snake
             if field in data:
                 val = data[field]
                 if val is not None:
