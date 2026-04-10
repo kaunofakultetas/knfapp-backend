@@ -55,17 +55,22 @@ paths:
   /auth/register:
     post:
       tags: [auth]
-      summary: Register with invitation code
+      summary: Register (invitation code optional)
+      description: |
+        Register a new user. Invitation code is optional:
+        - With valid code: user gets the code's role and invited=true (higher trust).
+        - Without code: user registers as student with invited=false (guest, limited features).
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [invitation_code, username, password, display_name, email]
+              required: [username, password, display_name, email]
               properties:
                 invitation_code:
                   type: string
+                  description: Optional invitation code for higher-trust registration
                 username:
                   type: string
                 password:
@@ -73,6 +78,7 @@ paths:
                   minLength: 6
                 display_name:
                   type: string
+                  maxLength: 100
                 email:
                   type: string
                   format: email
@@ -1435,6 +1441,9 @@ components:
         avatarUrl:
           type: string
           nullable: true
+        invited:
+          type: boolean
+          description: Whether user registered via invitation code (true = higher trust)
 
     UserSummary:
       type: object
