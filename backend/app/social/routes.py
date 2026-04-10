@@ -76,6 +76,41 @@ def get_profile(user_id):
         db.close()
 
 
+@social_bp.route("/profile", methods=["GET"])
+@require_auth
+def get_own_profile():
+    """Get the authenticated user's own social profile."""
+    user = request.user
+    db = get_db()
+    try:
+        post_count = db.execute(
+            "SELECT COUNT(*) as c FROM news_posts WHERE author_id = ? AND source = 'user'",
+            (user["id"],),
+        ).fetchone()["c"]
+
+        friend_count = db.execute(
+            "SELECT COUNT(*) as c FROM friendships WHERE user_id = ?",
+            (user["id"],),
+        ).fetchone()["c"]
+
+        return jsonify({
+            "id": user["id"],
+            "username": user["username"],
+            "email": user["email"],
+            "displayName": user["display_name"],
+            "avatarUrl": user["avatar_url"],
+            "role": user["role"],
+            "createdAt": user["created_at"],
+            "postCount": post_count,
+            "friendCount": friend_count,
+            "studentNumber": user.get("student_number"),
+            "studyGroup": user.get("study_group"),
+            "studyProgram": user.get("study_program"),
+        })
+    finally:
+        db.close()
+
+
 @social_bp.route("/profile", methods=["PUT"])
 @require_auth
 def update_profile():
