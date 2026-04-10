@@ -707,7 +707,7 @@ def search_messages(conv_id):
     user_id = request.user["id"]
     q = request.args.get("q", "").strip()
     if len(q) < 1:
-        return jsonify({"messages": [], "total": 0})
+        return jsonify({"error": "q parameter is required and must not be empty"}), 400
 
     limit = min(int(request.args.get("limit", 20)), 50)
 

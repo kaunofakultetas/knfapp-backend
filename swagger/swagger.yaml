@@ -768,6 +768,8 @@ paths:
                         createdAt: { type: string }
                         isOwn: { type: boolean }
                   total: { type: integer }
+        "400":
+          description: Empty or missing q parameter
         "403":
           description: Not a participant
 
