@@ -24,8 +24,16 @@ def create_invitation():
     """
     data = request.get_json() or {}
     role = data.get("role", "student")
-    max_uses = max(1, data.get("max_uses", 1))
-    expires_hours = data.get("expires_hours", 168)
+    raw_max_uses = data.get("max_uses", 1)
+    raw_expires_hours = data.get("expires_hours", 168)
+
+    if not isinstance(raw_max_uses, int) or isinstance(raw_max_uses, bool):
+        return jsonify({"error": "max_uses must be an integer"}), 400
+    if not isinstance(raw_expires_hours, int) or isinstance(raw_expires_hours, bool):
+        return jsonify({"error": "expires_hours must be an integer"}), 400
+
+    max_uses = max(1, raw_max_uses)
+    expires_hours = raw_expires_hours
 
     if role not in ("student", "teacher", "admin", "curator"):
         return jsonify({"error": "Invalid role"}), 400
