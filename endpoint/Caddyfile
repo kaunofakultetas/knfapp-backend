@@ -1,4 +1,4 @@
-{$DOMAIN:localhost} {
+:80 {
     # API backend
     handle /api/* {
         reverse_proxy knfapp-backend:8000
