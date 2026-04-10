@@ -12,7 +12,7 @@ _db_path = None
 logger = logging.getLogger(__name__)
 
 # Migration version — bump this to re-run migrations
-_CURRENT_MIGRATION_VERSION = 1
+_CURRENT_MIGRATION_VERSION = 2
 
 
 def init_db(db_path):
@@ -98,24 +98,29 @@ def _run_migrations(conn):
     """)
     conn.commit()
 
-    applied = conn.execute(
-        "SELECT version FROM _migrations WHERE version = ?",
-        (_CURRENT_MIGRATION_VERSION,),
-    ).fetchone()
+    _MIGRATIONS = {
+        1: ("XSS payload cleanup + oversized data trim", _migration_v1_xss_cleanup),
+        2: ("Reverse double-escaped HTML entities (input-escaping removed)", _migration_v2_unescape_double_escapes),
+    }
 
-    if applied:
-        return  # Already ran this migration version
+    for version in sorted(_MIGRATIONS.keys()):
+        applied = conn.execute(
+            "SELECT version FROM _migrations WHERE version = ?",
+            (version,),
+        ).fetchone()
 
-    logger.info("Running data migration v%d: XSS payload cleanup + oversized data trim", _CURRENT_MIGRATION_VERSION)
+        if applied:
+            continue
 
-    _migration_v1_xss_cleanup(conn)
-
-    conn.execute(
-        "INSERT INTO _migrations (version) VALUES (?)",
-        (_CURRENT_MIGRATION_VERSION,),
-    )
-    conn.commit()
-    logger.info("Data migration v%d complete", _CURRENT_MIGRATION_VERSION)
+        desc, fn = _MIGRATIONS[version]
+        logger.info("Running data migration v%d: %s", version, desc)
+        fn(conn)
+        conn.execute(
+            "INSERT INTO _migrations (version) VALUES (?)",
+            (version,),
+        )
+        conn.commit()
+        logger.info("Data migration v%d complete", version)
 
 
 def _migration_v1_xss_cleanup(conn):
@@ -211,6 +216,66 @@ def _migration_v1_xss_cleanup(conn):
         except Exception:
             conn.execute("UPDATE users SET avatar_url = NULL WHERE id = ?", (row[0],))
             logger.info("  Cleared unparseable avatar_url for user %s", row[0])
+
+    conn.commit()
+
+
+def _migration_v2_unescape_double_escapes(conn):
+    """Migration v2: Reverse accumulated double-escaping from v1 + input-time
+    html.escape().
+
+    The old before_request middleware ran html.escape() on every write, so
+    round-trip edits accumulated escape layers:
+        & -> &amp; -> &amp;amp; -> &amp;amp;amp; ...
+
+    Now that escaping happens on OUTPUT only, stored data must be raw text.
+    This migration repeatedly unescapes until stable, restoring original text.
+
+    Scraper content (source IN ('knf.vu.lt', 'vu.lt')) is also unescaped
+    because the scraper already stores raw text and v1 escaped it.
+    """
+
+    def _unescape_column(table, column, id_column="id"):
+        """html.unescape all non-NULL values in a text column until stable."""
+        rows = conn.execute(
+            f"SELECT {id_column}, {column} FROM {table} WHERE {column} IS NOT NULL"
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            current = row[1]
+            # Repeatedly unescape until the string stops changing
+            unescaped = html.unescape(current)
+            while unescaped != current:
+                current = unescaped
+                unescaped = html.unescape(current)
+            if unescaped != row[1]:
+                conn.execute(
+                    f"UPDATE {table} SET {column} = ? WHERE {id_column} = ?",
+                    (unescaped, row[0]),
+                )
+                updated += 1
+        if updated:
+            logger.info("  Unescaped %d rows in %s.%s", updated, table, column)
+
+    # Users
+    _unescape_column("users", "display_name")
+
+    # News posts (all sources, including scraper)
+    _unescape_column("news_posts", "title")
+    _unescape_column("news_posts", "content")
+    _unescape_column("news_posts", "summary")
+    _unescape_column("news_posts", "author_name")
+
+    # Comments
+    _unescape_column("news_comments", "text")
+
+    # Chat
+    _unescape_column("messages", "text")
+    _unescape_column("conversations", "title")
+
+    # Polls
+    _unescape_column("polls", "title")
+    _unescape_column("poll_options", "text")
 
     conn.commit()
 

@@ -1,6 +1,7 @@
 """knfapp-backend Flask application factory."""
 
 import html
+import json as json_mod
 import os
 from urllib.parse import urlparse
 
@@ -73,28 +74,21 @@ def create_app():
     from app.scraper.scheduler import start_scraper_scheduler
     start_scraper_scheduler(app)
 
-    # ── Global XSS sanitization middleware ─────────────────────────────────
-    # Centralised html.escape() for ALL user-supplied string fields.
-    # Runs before every request so individual endpoints never need to
-    # call html.escape() themselves.  Also enforces avatar_url scheme
-    # whitelist (http/https only) and max length (2048 chars).
+    # ── Global XSS protection middleware ──────────────────────────────────
+    # Architecture: store RAW text, escape on OUTPUT.
+    #
+    # before_request:  validate avatar_url scheme (input validation only,
+    #                  NO html.escape — that caused double-escaping).
+    # after_request:   html.escape all string values in JSON responses
+    #                  so clients always receive safe HTML.
 
     _AVATAR_URL_MAX_LENGTH = 2048
     _ALLOWED_URL_SCHEMES = {"http", "https"}
 
-    def _sanitize_value(value):
-        """Recursively HTML-escape every string in a JSON structure."""
-        if isinstance(value, str):
-            return html.escape(value, quote=True)
-        if isinstance(value, dict):
-            return {k: _sanitize_value(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [_sanitize_value(item) for item in value]
-        return value
-
     def _validate_avatar_url(url):
         """Return (is_valid, error_message) for avatar_url.
-        Whitelist http:// and https:// schemes only.
+        Whitelist http:// and https:// schemes, OR relative paths
+        starting with /api/uploads/ (own uploaded avatars).
         Case-insensitive to block JaVaScRiPt: etc."""
         if url is None or url == "":
             return True, None
@@ -102,33 +96,61 @@ def create_app():
             return False, "avatar_url must be a string"
         if len(url) > _AVATAR_URL_MAX_LENGTH:
             return False, f"avatar_url must be at most {_AVATAR_URL_MAX_LENGTH} characters"
+        # Allow relative upload paths (e.g. /api/uploads/abc-123.jpg)
+        if url.startswith("/api/uploads/"):
+            return True, None
         try:
             parsed = urlparse(url)
             if parsed.scheme.lower() not in _ALLOWED_URL_SCHEMES:
-                return False, "avatar_url must use http:// or https:// scheme"
+                return False, "avatar_url must use http:// or https:// scheme, or be a relative /api/uploads/ path"
         except Exception:
             return False, "avatar_url is not a valid URL"
         return True, None
 
     @app.before_request
-    def sanitize_json_input():
-        """HTML-escape all string values in JSON request bodies and
-        validate avatar_url scheme before any endpoint sees the data."""
-        if request.content_type and "json" in request.content_type:
+    def validate_json_input():
+        """Validate avatar_url scheme in JSON request bodies.
+        No html.escape here — escaping is done on OUTPUT to prevent
+        double-escaping on round-trip edits."""
+        if request.content_type and "json" in request.content_type.lower():
             data = request.get_json(silent=True)
             if data and isinstance(data, dict):
-                # Validate avatar_url BEFORE escaping so we check the
-                # raw scheme (javascript:, data:, etc.)
                 if "avatar_url" in data:
                     valid, err = _validate_avatar_url(data["avatar_url"])
                     if not valid:
                         return jsonify({"error": err}), 400
 
-                # HTML-escape every string value in the body
-                sanitized = _sanitize_value(data)
-                # Replace the cached parsed JSON so endpoints see
-                # the escaped version via request.get_json()
-                request._cached_json = (sanitized, sanitized)
+    def _escape_value(value):
+        """Recursively HTML-escape every string in a JSON-serializable
+        structure.  Used on OUTPUT (responses), never on input."""
+        if isinstance(value, str):
+            return html.escape(value, quote=True)
+        if isinstance(value, dict):
+            return {k: _escape_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_escape_value(item) for item in value]
+        return value
+
+    @app.after_request
+    def escape_json_output(response):
+        """HTML-escape all string values in JSON API responses.
+        This is the single point of XSS protection — raw text is
+        stored in DB and escaped only when sent to clients."""
+        if (
+            response.content_type
+            and "json" in response.content_type.lower()
+            and response.status_code < 400
+        ):
+            try:
+                data = response.get_json(silent=True)
+                if data is not None:
+                    escaped = _escape_value(data)
+                    response.set_data(
+                        json_mod.dumps(escaped, ensure_ascii=False)
+                    )
+            except Exception:
+                pass  # Don't break responses if escaping fails
+        return response
 
     # Security headers middleware
     @app.after_request

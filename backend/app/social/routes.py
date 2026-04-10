@@ -5,6 +5,7 @@ from datetime import datetime
 
 from flask import Blueprint, jsonify, request
 
+from app.api import parse_pagination
 from app.auth.routes import get_current_user, require_auth
 from app.database import get_db
 
@@ -356,7 +357,7 @@ def create_post():
     if len(content) > MAX_CONTENT_LENGTH:
         return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
 
-    # NOTE: HTML sanitization is handled globally by before_request middleware
+    # NOTE: XSS protection handled by after_request output escaping
 
     image_url = data.get("image_url")
     is_public = data.get("is_public", True)
@@ -405,8 +406,9 @@ def get_user_posts():
     if not user_id:
         return jsonify({"error": "user_id query param required"}), 400
 
-    page = max(1, request.args.get("page", 1, type=int))
-    per_page = min(50, max(1, request.args.get("per_page", 20, type=int)))
+    page, per_page, err = parse_pagination()
+    if err:
+        return err
     offset = (page - 1) * per_page
 
     current_user = get_current_user()
@@ -519,7 +521,7 @@ def update_post(post_id):
             content = data["content"].strip()
             if len(content) > MAX_CONTENT_LENGTH:
                 return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
-            # NOTE: HTML sanitization is handled globally by before_request middleware
+            # NOTE: XSS protection handled by after_request output escaping
             updates.append("content = ?")
             params.append(content)
             updates.append("summary = ?")
@@ -528,7 +530,7 @@ def update_post(post_id):
             title = data["title"].strip()
             if len(title) > MAX_TITLE_LENGTH:
                 return jsonify({"error": f"Title must be at most {MAX_TITLE_LENGTH} characters"}), 400
-            # NOTE: HTML sanitization is handled globally by before_request middleware
+            # NOTE: XSS protection handled by after_request output escaping
             updates.append("title = ?")
             params.append(title)
         if "image_url" in data:

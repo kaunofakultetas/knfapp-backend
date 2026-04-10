@@ -5,6 +5,7 @@ from datetime import datetime
 
 from flask import Blueprint, jsonify, request
 
+from app.api import parse_pagination
 from app.auth.routes import get_current_user, require_auth, require_role
 from app.database import get_db
 
@@ -56,8 +57,9 @@ def get_feed():
       - engagement_score: log(likes + comments*2 + shares*3 + 1) * 5
       - source_boost: faculty/official = +20, knf.vu.lt = +15, vu.lt = +10, user = 0
     """
-    page = max(1, request.args.get("page", 1, type=int))
-    per_page = min(50, max(1, request.args.get("per_page", 20, type=int)))
+    page, per_page, err = parse_pagination()
+    if err:
+        return err
     source_filter = request.args.get("source")
     offset = (page - 1) * per_page
 
@@ -187,7 +189,7 @@ def create_post():
     if len(content) > MAX_CONTENT_LENGTH:
         return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
 
-    # NOTE: HTML sanitization is handled globally by before_request middleware
+    # NOTE: XSS protection handled by after_request output escaping
 
     role = request.user["role"]
     post_type = data.get("post_type")
@@ -339,8 +341,9 @@ def toggle_like(post_id):
 @news_bp.route("/<post_id>/comments", methods=["GET"])
 def get_comments(post_id):
     """Get comments for a post."""
-    page = max(1, request.args.get("page", 1, type=int))
-    per_page = min(50, max(1, request.args.get("per_page", 20, type=int)))
+    page, per_page, err = parse_pagination()
+    if err:
+        return err
     offset = (page - 1) * per_page
 
     db = get_db()
@@ -388,7 +391,7 @@ def add_comment(post_id):
     if len(comment_text) > MAX_COMMENT_LENGTH:
         return jsonify({"error": f"Comment must be at most {MAX_COMMENT_LENGTH} characters"}), 400
 
-    # NOTE: HTML sanitization is handled globally by before_request middleware
+    # NOTE: XSS protection handled by after_request output escaping
 
     db = get_db()
     try:
