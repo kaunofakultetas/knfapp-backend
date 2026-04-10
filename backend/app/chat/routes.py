@@ -764,6 +764,32 @@ def search_messages(conv_id):
         db.close()
 
 
+@chat_bp.route("/online-status", methods=["POST"])
+@require_auth
+def online_status():
+    """Check which user IDs are currently connected via Socket.IO.
+
+    Accepts JSON body: { "userIds": ["id1", "id2", ...] }
+    Returns: { "online": { "id1": true, "id2": false, ... } }
+    """
+    data = request.get_json()
+    if not data or not isinstance(data.get("userIds"), list):
+        return jsonify({"error": "userIds array required"}), 400
+
+    user_ids = data["userIds"]
+    if len(user_ids) > 200:
+        user_ids = user_ids[:200]
+
+    try:
+        from app.chat.events import _connected_users
+        online_set = set(_connected_users.values())
+    except Exception:
+        online_set = set()
+
+    result = {uid: uid in online_set for uid in user_ids}
+    return jsonify({"online": result})
+
+
 @chat_bp.route("/users/search", methods=["GET"])
 @require_auth
 def search_users():
