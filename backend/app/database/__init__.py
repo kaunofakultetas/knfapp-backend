@@ -12,7 +12,7 @@ _db_path = None
 logger = logging.getLogger(__name__)
 
 # Migration version — bump this to re-run migrations
-_CURRENT_MIGRATION_VERSION = 3
+_CURRENT_MIGRATION_VERSION = 4
 
 
 def init_db(db_path):
@@ -102,6 +102,7 @@ def _run_migrations(conn):
         1: ("XSS payload cleanup + oversized data trim", _migration_v1_xss_cleanup),
         2: ("Reverse double-escaped HTML entities (input-escaping removed)", _migration_v2_unescape_double_escapes),
         3: ("Add invited column to users for trust levels", _migration_v3_add_invited_column),
+        4: ("Add faculty_info table for scraped faculty data", _migration_v4_add_faculty_info_table),
     }
 
     for version in sorted(_MIGRATIONS.keys()):
@@ -297,6 +298,26 @@ def _migration_v3_add_invited_column(conn):
     conn.commit()
 
 
+def _migration_v4_add_faculty_info_table(conn):
+    """Migration v4: Add faculty_info table for scraped faculty data.
+
+    Stores scraped contacts, programs, and structure from knf.vu.lt
+    as JSON blobs, keyed by language and section.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS faculty_info (
+            id TEXT PRIMARY KEY,
+            lang TEXT NOT NULL DEFAULT 'lt',
+            section TEXT NOT NULL,
+            data_json TEXT NOT NULL,
+            scraped_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(lang, section)
+        )
+    """)
+    conn.commit()
+    logger.info("  Created faculty_info table")
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -469,6 +490,15 @@ CREATE TABLE IF NOT EXISTS friend_requests (
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'accepted', 'rejected')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS faculty_info (
+    id TEXT PRIMARY KEY,
+    lang TEXT NOT NULL DEFAULT 'lt',
+    section TEXT NOT NULL,
+    data_json TEXT NOT NULL,
+    scraped_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(lang, section)
 );
 
 CREATE INDEX IF NOT EXISTS idx_news_posts_published ON news_posts(published_at DESC);

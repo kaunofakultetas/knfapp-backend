@@ -6,14 +6,16 @@ from app.auth.routes import require_role
 from app.database import get_db
 from app.scraper.knf_scraper import scrape_knf_news
 from app.scraper.schedule_scraper import scrape_knf_schedule
+from app.scraper.info_scraper import scrape_faculty_info
 from app.scraper.vu_scraper import scrape_vu_news
 
 scraper_bp = Blueprint("scraper", __name__)
 
 
 @scraper_bp.route("/status", methods=["GET"])
+@require_role("admin")
 def scraper_status():
-    """Get recent scraper run history."""
+    """Get recent scraper run history (admin only)."""
     db = get_db()
     try:
         rows = db.execute(
@@ -55,4 +57,12 @@ def trigger_scrape():
 def trigger_schedule_scrape():
     """Manually trigger a schedule scrape from tvarkarasciai.vu.lt (admin only)."""
     result = scrape_knf_schedule()
+    return jsonify(result)
+
+
+@scraper_bp.route("/info", methods=["POST"])
+@require_role("admin")
+def trigger_info_scrape():
+    """Manually trigger a faculty info scrape from knf.vu.lt (admin only)."""
+    result = scrape_faculty_info()
     return jsonify(result)

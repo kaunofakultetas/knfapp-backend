@@ -1278,20 +1278,60 @@ paths:
   /scraper/status:
     get:
       tags: [scraper]
-      summary: Recent scraper runs
+      summary: Recent scraper runs (admin only)
+      security:
+        - bearerAuth: []
       responses:
         "200":
           description: Scraper run history
+        "401":
+          description: Authentication required
+        "403":
+          description: Admin role required
 
   /scraper/trigger:
     post:
       tags: [scraper]
-      summary: Manually trigger scrape (admin only)
+      summary: Manually trigger news scrape (admin only)
       security:
         - bearerAuth: []
       responses:
         "200":
           description: Scrape results
+
+  /scraper/schedule:
+    post:
+      tags: [scraper]
+      summary: Manually trigger schedule scrape (admin only)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Schedule scrape results
+
+  /scraper/info:
+    post:
+      tags: [scraper]
+      summary: Manually trigger faculty info scrape (admin only)
+      description: |
+        Scrapes knf.vu.lt for staff contacts, study programs, and
+        department structure. Results stored in DB and served via /info.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Faculty info scrape results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pages_scraped:
+                    type: integer
+                  contacts_found:
+                    type: integer
+                  programs_found:
+                    type: integer
 
   /uploads:
     post:
@@ -1358,7 +1398,10 @@ paths:
     get:
       tags: [info]
       summary: Get faculty information
-      description: Returns contacts, links, building hours, study programs, and FAQ
+      description: |
+        Returns contacts, links, building hours, study programs, and FAQ.
+        When scraped data is available from knf.vu.lt, contacts and programs
+        are served from the scraper; links, hours, and FAQ use curated data.
       parameters:
         - name: lang
           in: query

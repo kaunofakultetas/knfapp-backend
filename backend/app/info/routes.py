@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """Faculty information endpoint - contacts, links, hours, FAQ, programs.
 
-Serves static faculty data in the requested language (default: lt).
-Data is hardcoded here for now; can be moved to DB/admin editing later.
+Serves scraped faculty data from knf.vu.lt when available, with fallback
+to hardcoded bilingual data. Language default: lt.
 """
 
+import json
+
 from flask import Blueprint, request
+
+from app.database import get_db
 
 info_bp = Blueprint("info", __name__)
 
@@ -177,20 +181,67 @@ FACULTY_INFO = {
 }
 
 
+def _get_scraped_info(lang: str) -> dict | None:
+    """Fetch scraped faculty info from the database.
+
+    Returns a dict with scraped sections merged, or None if no scraped
+    data is available.
+    """
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT section, data_json FROM faculty_info WHERE lang = ?",
+            (lang,),
+        ).fetchall()
+        if not rows:
+            return None
+        scraped = {}
+        for row in rows:
+            try:
+                scraped[row["section"]] = json.loads(row["data_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return scraped if scraped else None
+    except Exception:
+        return None
+    finally:
+        db.close()
+
+
 @info_bp.route("", methods=["GET"])
 def get_faculty_info():
     """Return faculty information in the requested language.
 
+    Serves scraped data from knf.vu.lt when available, merged with
+    hardcoded fallback data. Scraped contacts and programs override
+    hardcoded values; links, hours, and FAQ always come from hardcoded
+    data (not available on the website).
+
     Query params:
         lang - 'lt' or 'en' (default: 'lt')
-        section - optional, filter to a single section (contacts/links/hours/programs/faq)
+        section - optional, filter to a single section (contacts/links/hours/programs/faq/staff)
     """
     lang = request.args.get("lang", "lt")
     if lang not in FACULTY_INFO:
         lang = "lt"
 
     section = request.args.get("section")
-    data = FACULTY_INFO[lang]
+
+    # Start with hardcoded data as the base
+    data = dict(FACULTY_INFO[lang])
+
+    # Overlay scraped data where available
+    scraped = _get_scraped_info(lang)
+    if scraped:
+        # Scraped contacts override hardcoded contacts if we got meaningful data
+        if "contacts" in scraped and scraped["contacts"]:
+            data["contacts"] = scraped["contacts"]
+        # Scraped programs override hardcoded programs if we got meaningful data
+        if "programs" in scraped and scraped["programs"]:
+            data["programs"] = scraped["programs"]
+        # Add general contact info if available
+        if "general_contact" in scraped:
+            data["general_contact"] = scraped["general_contact"]
 
     if section and section in data:
         return {section: data[section]}

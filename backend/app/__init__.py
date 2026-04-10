@@ -29,7 +29,7 @@ def create_app():
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
     # CORS — restrict origins in production via ALLOWED_ORIGINS env var (comma-separated)
-    allowed_origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:8081")
+    allowed_origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:8081,http://localhost:8083")
     if allowed_origins != "*":
         allowed_origins = [o.strip() for o in allowed_origins.split(",") if o.strip()]
     CORS(app, resources={r"/api/*": {"origins": allowed_origins}})

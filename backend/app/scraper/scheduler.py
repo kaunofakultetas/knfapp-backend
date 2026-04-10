@@ -41,10 +41,23 @@ def start_scraper_scheduler(app):
             except Exception:
                 logger.exception("Scheduled schedule scrape failed")
 
+    def run_info_scraper():
+        with app.app_context():
+            try:
+                from app.scraper.info_scraper import scrape_faculty_info
+
+                logger.info("Running scheduled faculty info scrape...")
+                result = scrape_faculty_info()
+                logger.info("Faculty info scrape done: %s", result)
+            except Exception:
+                logger.exception("Scheduled faculty info scrape failed")
+
     # Run on interval every 20 minutes
     _scheduler.add_job(run_scrapers, "interval", minutes=20, id="news_scraper", max_instances=1)
     # Schedule scraper: once every 6 hours (timetables don't change often)
     _scheduler.add_job(run_schedule_scraper, "interval", hours=6, id="schedule_scraper", max_instances=1)
+    # Faculty info scraper: once every 24 hours (rarely changes)
+    _scheduler.add_job(run_info_scraper, "interval", hours=24, id="info_scraper", max_instances=1)
     _scheduler.start()
 
     # Also run once immediately on startup
@@ -52,4 +65,6 @@ def start_scraper_scheduler(app):
     threading.Timer(2.0, run_scrapers).start()
     # Delay schedule scraper to avoid startup load spike
     threading.Timer(30.0, run_schedule_scraper).start()
-    logger.info("Scraper scheduler started (news: 20min, schedule: 6h)")
+    # Delay info scraper further
+    threading.Timer(60.0, run_info_scraper).start()
+    logger.info("Scraper scheduler started (news: 20min, schedule: 6h, info: 24h)")
