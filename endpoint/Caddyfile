@@ -23,11 +23,6 @@
         }
 
 
-        # Default: serve static or return 404
-        handle {
-            respond "KNFAPP API Server" 200
-        }
-
-
+        reverse_proxy knfapp-mobile:8081
     }
 }
