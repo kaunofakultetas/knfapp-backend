@@ -187,3 +187,44 @@ def notify_all_users(title: str, body: str, data: Optional[dict] = None, exclude
         return 0
 
     return send_push_batch(tokens, title, body, data)
+
+
+def notify_channel(channel: str, title: str, body: str, data: Optional[dict] = None, exclude_user_id: Optional[str] = None) -> int:
+    """Send push notification only to users subscribed to a specific channel.
+
+    Users who haven't set any preference default to enabled (opt-out model).
+    Returns count of successfully sent notifications.
+    """
+    db = get_db()
+    try:
+        # Get tokens for users who have the channel enabled (or no explicit preference, which defaults to enabled)
+        query = """
+            SELECT DISTINCT pt.token
+            FROM push_tokens pt
+            WHERE pt.active = 1
+              AND NOT EXISTS (
+                SELECT 1 FROM notification_channels nc
+                WHERE nc.user_id = pt.user_id
+                  AND nc.channel = ?
+                  AND nc.enabled = 0
+              )
+        """
+        params: list = [channel]
+
+        if exclude_user_id:
+            query += " AND pt.user_id != ?"
+            params.append(exclude_user_id)
+
+        rows = db.execute(query, params).fetchall()
+    finally:
+        db.close()
+
+    tokens = [r["token"] for r in rows]
+    if not tokens:
+        return 0
+
+    # Inject channel info into data so the client knows the topic
+    push_data = dict(data or {})
+    push_data["channel"] = channel
+
+    return send_push_batch(tokens, title, body, push_data)

@@ -12,7 +12,7 @@ _db_path = None
 logger = logging.getLogger(__name__)
 
 # Migration version — bump this to re-run migrations
-_CURRENT_MIGRATION_VERSION = 6
+_CURRENT_MIGRATION_VERSION = 7
 
 
 def init_db(db_path):
@@ -105,6 +105,7 @@ def _run_migrations(conn):
         4: ("Add faculty_info table for scraped faculty data", _migration_v4_add_faculty_info_table),
         5: ("Add student fields to users table", _migration_v5_add_student_fields),
         6: ("Add push_tokens table for push notifications", _migration_v6_add_push_tokens),
+        7: ("Add notification_channels table for per-topic opt-in", _migration_v7_add_notification_channels),
     }
 
     for version in sorted(_MIGRATIONS.keys()):
@@ -362,6 +363,30 @@ def _migration_v6_add_push_tokens(conn):
     logger.info("  Created push_tokens table")
 
 
+def _migration_v7_add_notification_channels(conn):
+    """Migration v7: Add notification_channels table for per-topic opt-in.
+
+    Users can subscribe/unsubscribe from notification channels:
+    - news: new articles and scraped content
+    - chat: new messages and chat activity
+    - schedule: schedule changes and reminders
+    - admin: system-wide announcements (always on for admin role)
+
+    Default: all channels enabled for existing users.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS notification_channels (
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            channel TEXT NOT NULL CHECK(channel IN ('news', 'chat', 'schedule', 'admin')),
+            enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (user_id, channel)
+        )
+    """)
+    conn.commit()
+    logger.info("  Created notification_channels table")
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -570,8 +595,17 @@ CREATE TABLE IF NOT EXISTS push_tokens (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS notification_channels (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL CHECK(channel IN ('news', 'chat', 'schedule', 'admin')),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (user_id, channel)
+);
+
 CREATE INDEX IF NOT EXISTS idx_friend_requests_to ON friend_requests(to_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_friend_requests_from ON friend_requests(from_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_push_tokens_token ON push_tokens(token);
+CREATE INDEX IF NOT EXISTS idx_notification_channels_user ON notification_channels(user_id);
 """
