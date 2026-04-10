@@ -37,12 +37,21 @@ def _get_semester_label(dt: datetime) -> str:
         return f"{dt.year - 1}-P"
 
 
+def _strip_diacritics(text: str) -> str:
+    """Strip Lithuanian diacritics: \u0105->a, \u010d->c, \u0119->e, \u0117->e, \u012f->i, \u0161->s, \u0173->u, \u016b->u, \u017e->z."""
+    _MAP = str.maketrans(
+        "\u0105\u010d\u0119\u0117\u012f\u0161\u0173\u016b\u017e\u0104\u010c\u0118\u0116\u012e\u0160\u0172\u016a\u017d",
+        "aceeisuuzACEEISUUZ",
+    )
+    return text.translate(_MAP)
+
+
 def _parse_group_display_name(slug: str, display_name: str) -> str:
     """Extract a short group name for storage.
     E.g. 'Informacijos sistemos ir kibernetin\u0117 sauga - 1 kursas 1 grup\u0117' -> 'ISKS-1'
     Falls back to slug if parsing fails.
     """
-    # Known program abbreviations
+    # Known program abbreviations (all ASCII, matched after stripping diacritics)
     _PROGRAM_ABBREVS = {
         "informacijos sistemos ir kibernetin": "ISKS",
         "ekonomika ir vadyba": "EV",
@@ -58,31 +67,45 @@ def _parse_group_display_name(slug: str, display_name: str) -> str:
         "tvariuju finansu ekonomika": "TFE",
         "viesojo diskurso lingvistika": "VDL",
         "kalba ir dirbtinio intelekto valdymas": "KDIV",
+        "bendruju universitetiniu studiju": "BUS",
+        "individualiuju studiju dalykai": "ISD",
+        "anglu ir kita uzsienio kalba": "AKUK",
+        "art management": "MV",
+        "turinio kurimas ir rinkodara": "LFR-TKR",
+        "kurybiskumo ir skaitmenines retorikos": "LFR-KSR",
+        "mediju retorika ir komunikacija": "VDL-MRK",
+        "skaitmeninio turinio prieinamumas": "AV-STP",
     }
 
-    name_lower = display_name.lower()
+    # Try to match against display_name (with diacritics stripped) and slug
+    candidates = [
+        _strip_diacritics(display_name).lower(),
+        slug.replace("-", " "),
+    ]
 
-    # Try to match known programs
-    for pattern, abbrev in _PROGRAM_ABBREVS.items():
-        if pattern in name_lower:
-            # Extract course number
-            course_match = re.search(r"(\d)\s*kursas", name_lower)
-            course = course_match.group(1) if course_match else ""
+    for name_lower in candidates:
+        for pattern, abbrev in _PROGRAM_ABBREVS.items():
+            if pattern in name_lower:
+                # Extract course number from display name or slug
+                course_match = re.search(r"(\d)\s*kursas", name_lower)
+                if not course_match:
+                    course_match = re.search(r"(\d)[kc]", slug)
+                course = course_match.group(1) if course_match else ""
 
-            # Check for English language variant
-            lang_suffix = ""
-            if "angl" in name_lower:
-                lang_suffix = "-EN"
+                # Check for English language variant
+                lang_suffix = ""
+                if "angl" in name_lower or "angl" in slug:
+                    lang_suffix = "-EN"
 
-            # Check for master's
-            level_suffix = ""
-            if "magistrant" in name_lower:
-                level_suffix = "-M"
+                # Check for master's
+                level_suffix = ""
+                if "magistrant" in name_lower:
+                    level_suffix = "-M"
 
-            group_name = f"{abbrev}{level_suffix}{lang_suffix}-{course}" if course else f"{abbrev}{level_suffix}{lang_suffix}"
-            return group_name
+                group_name = f"{abbrev}{level_suffix}{lang_suffix}-{course}" if course else f"{abbrev}{level_suffix}{lang_suffix}"
+                return group_name
 
-    # Fallback: use slug
+    # Fallback: use slug (truncated)
     return slug[:30]
 
 
@@ -141,6 +164,7 @@ def scrape_group_list() -> list[dict]:
     """Fetch the list of all groups from tvarkarasciai.vu.lt/knf/list/.
 
     Returns list of dicts: [{"slug": "...", "display_name": "..."}]
+    The display_name is reconstructed from the page context or slug.
     """
     resp = requests.get(GROUP_LIST_URL, timeout=REQUEST_TIMEOUT, headers={
         "User-Agent": USER_AGENT,
@@ -149,14 +173,55 @@ def scrape_group_list() -> list[dict]:
 
     soup = BeautifulSoup(resp.text, "html.parser")
     groups = []
+    seen_slugs = set()
 
     for link in soup.find_all("a", href=True):
         href = link["href"]
         match = re.match(r"^/knf/groups/([^/]+)/$", href)
-        if match:
-            slug = match.group(1)
-            display_name = link.get_text(strip=True)
-            groups.append({"slug": slug, "display_name": display_name})
+        if not match:
+            continue
+
+        slug = match.group(1)
+        if slug in seen_slugs:
+            continue
+        seen_slugs.add(slug)
+
+        # The link text is often just "1 Grupe" or "Tvarkarastis", not useful.
+        # Reconstruct display_name from surrounding context: walk up to find
+        # a heading or strong tag that names the program.
+        display_name = ""
+        parent = link.parent
+        # Walk up a few levels to find a heading with program name
+        for _ in range(5):
+            if parent is None:
+                break
+            # Check for preceding headings or bold text
+            for sibling in parent.previous_siblings:
+                if hasattr(sibling, 'name') and sibling.name in ('h2', 'h3', 'h4', 'strong', 'b'):
+                    display_name = sibling.get_text(strip=True)
+                    break
+            if display_name:
+                break
+            parent = parent.parent
+
+        # Also check the link's title attribute
+        if not display_name and link.get("title"):
+            display_name = link["title"]
+
+        # Append course info from link text (e.g. "1 Kursas" context)
+        link_text = link.get_text(strip=True)
+        if display_name and "kursas" not in display_name.lower():
+            # Try to find course number from nearby text or slug
+            course_match = re.search(r"(\d)k", slug)
+            if course_match:
+                display_name += f" - {course_match.group(1)} kursas"
+
+        # If we still don't have a name, use the slug as display_name
+        # The _parse_group_display_name function handles slug-based parsing too
+        if not display_name:
+            display_name = slug.replace("-", " ")
+
+        groups.append({"slug": slug, "display_name": display_name})
 
     return groups
 
