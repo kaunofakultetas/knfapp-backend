@@ -89,8 +89,11 @@ def update_profile():
         updates = []
         params = []
         if "display_name" in data and data["display_name"].strip():
+            display_name = data["display_name"].strip()
+            if len(display_name) > 100:
+                return jsonify({"error": "Display name must be at most 100 characters"}), 400
             updates.append("display_name = ?")
-            params.append(data["display_name"].strip())
+            params.append(display_name)
         if "avatar_url" in data:
             updates.append("avatar_url = ?")
             params.append(data["avatar_url"])

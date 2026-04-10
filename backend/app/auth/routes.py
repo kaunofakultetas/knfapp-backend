@@ -141,6 +141,9 @@ def register():
     if len(data["password"]) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
 
+    if len(data["display_name"].strip()) > 100:
+        return jsonify({"error": "Display name must be at most 100 characters"}), 400
+
     db = get_db()
     try:
         # Validate invitation code

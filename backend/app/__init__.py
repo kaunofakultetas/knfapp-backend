@@ -107,14 +107,36 @@ def create_app():
             return False, "avatar_url is not a valid URL"
         return True, None
 
+    def _strip_null_bytes(value):
+        """Recursively strip null bytes (\x00) from all strings in a
+        JSON-serializable structure.  Applied on INPUT to prevent null
+        bytes from reaching the database."""
+        if isinstance(value, str):
+            return value.replace("\x00", "")
+        if isinstance(value, dict):
+            return {k: _strip_null_bytes(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_strip_null_bytes(item) for item in value]
+        return value
+
     @app.before_request
     def validate_json_input():
-        """Validate avatar_url scheme in JSON request bodies.
+        """Validate and sanitize JSON request bodies:
+        1. Strip null bytes from all string fields.
+        2. Validate avatar_url scheme (whitelist).
         No html.escape here — escaping is done on OUTPUT to prevent
         double-escaping on round-trip edits."""
         if request.content_type and "json" in request.content_type.lower():
             data = request.get_json(silent=True)
             if data and isinstance(data, dict):
+                # Strip null bytes from all string values
+                cleaned = _strip_null_bytes(data)
+                if cleaned != data:
+                    # Replace Flask 3.x cached_property so downstream
+                    # get_json() returns the cleaned data.
+                    request.__dict__["json"] = cleaned
+                    data = cleaned
+
                 if "avatar_url" in data:
                     valid, err = _validate_avatar_url(data["avatar_url"])
                     if not valid:

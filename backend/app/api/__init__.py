@@ -3,7 +3,7 @@
 from flask import jsonify, request
 
 
-def parse_pagination(max_per_page=50, default_per_page=20):
+def parse_pagination(max_per_page=100, default_per_page=20):
     """Parse and validate pagination query params.
 
     Returns (page, per_page, error_response) where error_response is
