@@ -262,38 +262,85 @@ def get_messages(conv_id):
                 (conv_id, limit),
             ).fetchall()
 
+        # Batch-load all reactions for fetched messages
+        msg_ids = [row["id"] for row in rows]
+        reaction_map_all = {}
+        read_map_all = {}
+        if msg_ids:
+            placeholders = ",".join("?" * len(msg_ids))
+
+            reactions_rows = db.execute(
+                f"""
+                SELECT mr.message_id, mr.emoji, mr.user_id, u.display_name
+                FROM message_reactions mr
+                JOIN users u ON u.id = mr.user_id
+                WHERE mr.message_id IN ({placeholders})
+                """,
+                msg_ids,
+            ).fetchall()
+
+            for r in reactions_rows:
+                mid = r["message_id"]
+                if mid not in reaction_map_all:
+                    reaction_map_all[mid] = {}
+                emoji = r["emoji"]
+                if emoji not in reaction_map_all[mid]:
+                    reaction_map_all[mid][emoji] = []
+                reaction_map_all[mid][emoji].append(r["user_id"])
+
+            # Batch-load read receipts
+            reads_rows = db.execute(
+                f"""
+                SELECT mrd.message_id, mrd.user_id
+                FROM message_reads mrd
+                WHERE mrd.message_id IN ({placeholders})
+                """,
+                msg_ids,
+            ).fetchall()
+
+            for rd in reads_rows:
+                mid = rd["message_id"]
+                if mid not in read_map_all:
+                    read_map_all[mid] = []
+                read_map_all[mid].append(rd["user_id"])
+
+        # Get participant count for read receipt status
+        participant_count = db.execute(
+            "SELECT COUNT(*) FROM conversation_participants WHERE conversation_id = ?",
+            (conv_id,),
+        ).fetchone()[0]
+
         messages = []
         for row in rows:
             msg_id = row["id"]
 
-            # Get reactions for this message
-            reactions_rows = db.execute(
-                """
-                SELECT mr.emoji, mr.user_id, u.display_name
-                FROM message_reactions mr
-                JOIN users u ON u.id = mr.user_id
-                WHERE mr.message_id = ?
-                """,
-                (msg_id,),
-            ).fetchall()
-
-            # Group reactions by emoji
-            reaction_map = {}
-            for r in reactions_rows:
-                emoji = r["emoji"]
-                if emoji not in reaction_map:
-                    reaction_map[emoji] = {"emoji": emoji, "byUserIds": [], "byUserNames": []}
-                reaction_map[emoji]["byUserIds"].append(r["user_id"])
-                reaction_map[emoji]["byUserNames"].append(r["display_name"])
-
+            # Build reactions from batch data
+            msg_reactions = reaction_map_all.get(msg_id, {})
             reactions = []
-            for emoji, data in reaction_map.items():
+            for emoji, uids in msg_reactions.items():
                 reactions.append({
                     "emoji": emoji,
-                    "count": len(data["byUserIds"]),
-                    "bySelf": user_id in data["byUserIds"],
-                    "byUserIds": data["byUserIds"],
+                    "count": len(uids),
+                    "bySelf": user_id in uids,
+                    "byUserIds": uids,
                 })
+
+            # Build read receipt status
+            read_by = read_map_all.get(msg_id, [])
+            is_own = row["sender_id"] == user_id
+            if is_own:
+                # For own messages: "read" if all other participants read it,
+                # "delivered" if some read, "sent" if none
+                other_readers = [uid for uid in read_by if uid != user_id]
+                others_count = participant_count - 1  # exclude sender
+                if others_count <= 0 or len(other_readers) >= others_count:
+                    status = "read"
+                elif len(other_readers) > 0:
+                    status = "delivered"
+                else:
+                    status = "sent"
+            else:
+                status = "read"
 
             messages.append({
                 "id": msg_id,
@@ -305,7 +352,9 @@ def get_messages(conv_id):
                 "imageUrl": row["image_url"],
                 "time": _format_time(row["created_at"]),
                 "createdAt": row["created_at"],
-                "isOwn": row["sender_id"] == user_id,
+                "isOwn": is_own,
+                "status": status,
+                "readBy": read_by,
                 "reactions": reactions,
             })
 
@@ -362,6 +411,12 @@ def send_message(conv_id):
         db.execute(
             "UPDATE conversation_participants SET last_read_at = ? WHERE conversation_id = ? AND user_id = ?",
             (now, conv_id, user_id),
+        )
+
+        # Sender auto-reads their own message
+        db.execute(
+            "INSERT OR IGNORE INTO message_reads (message_id, user_id, read_at) VALUES (?, ?, ?)",
+            (msg_id, user_id, now),
         )
 
         db.commit()
@@ -485,17 +540,50 @@ def toggle_pin(conv_id):
 @chat_bp.route("/conversations/<conv_id>/read", methods=["PUT"])
 @require_auth
 def mark_read(conv_id):
-    """Mark conversation as read up to now."""
+    """Mark conversation as read up to now.
+    Also inserts per-message read receipts and broadcasts to participants."""
     user_id = request.user["id"]
     now = datetime.utcnow().isoformat()
     db = get_db()
     try:
+        # Update the conversation-level last_read_at
         db.execute(
             "UPDATE conversation_participants SET last_read_at = ? WHERE conversation_id = ? AND user_id = ?",
             (now, conv_id, user_id),
         )
+
+        # Insert per-message read receipts for all unread messages in this conversation
+        # (messages from OTHER users that this user hasn't read yet)
+        unread_msgs = db.execute(
+            """
+            SELECT m.id FROM messages m
+            WHERE m.conversation_id = ? AND m.sender_id != ?
+            AND NOT EXISTS (
+                SELECT 1 FROM message_reads mr
+                WHERE mr.message_id = m.id AND mr.user_id = ?
+            )
+            """,
+            (conv_id, user_id, user_id),
+        ).fetchall()
+
+        newly_read_ids = []
+        for msg in unread_msgs:
+            db.execute(
+                "INSERT OR IGNORE INTO message_reads (message_id, user_id, read_at) VALUES (?, ?, ?)",
+                (msg["id"], user_id, now),
+            )
+            newly_read_ids.append(msg["id"])
+
         db.commit()
-        return jsonify({"ok": True})
+
+        # Broadcast read receipt event to conversation participants
+        if newly_read_ids:
+            from app.chat.events import emit_read_receipt
+            emit_read_receipt(
+                _get_socketio(), conv_id, user_id, newly_read_ids
+            )
+
+        return jsonify({"ok": True, "readCount": len(newly_read_ids)})
     finally:
         db.close()
 
@@ -525,6 +613,34 @@ def leave_conversation(conv_id):
 
         db.commit()
         return jsonify({"ok": True})
+    finally:
+        db.close()
+
+
+@chat_bp.route("/unread-count", methods=["GET"])
+@require_auth
+def total_unread_count():
+    """Get total unread message count across all conversations.
+    Used for the Messages tab badge."""
+    user_id = request.user["id"]
+    db = get_db()
+    try:
+        total = db.execute(
+            """
+            SELECT COALESCE(SUM(unread), 0) AS total FROM (
+                SELECT COUNT(*) AS unread
+                FROM messages m
+                JOIN conversation_participants cp
+                  ON cp.conversation_id = m.conversation_id AND cp.user_id = ?
+                WHERE m.conversation_id = cp.conversation_id
+                  AND m.sender_id != ?
+                  AND m.created_at > COALESCE(cp.last_read_at, '1970-01-01T00:00:00')
+                GROUP BY m.conversation_id
+            )
+            """,
+            (user_id, user_id),
+        ).fetchone()[0]
+        return jsonify({"unreadCount": total})
     finally:
         db.close()
 

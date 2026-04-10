@@ -448,6 +448,13 @@ CREATE TABLE IF NOT EXISTS message_reactions (
     PRIMARY KEY (message_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS message_reads (
+    message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    read_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (message_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS friendships (
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     friend_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -472,6 +479,8 @@ CREATE INDEX IF NOT EXISTS idx_invitation_codes_code ON invitation_codes(code);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conversation_participants_user ON conversation_participants(user_id);
 CREATE INDEX IF NOT EXISTS idx_message_reactions_message ON message_reactions(message_id);
+CREATE INDEX IF NOT EXISTS idx_message_reads_message ON message_reads(message_id);
+CREATE INDEX IF NOT EXISTS idx_message_reads_user ON message_reads(user_id);
 CREATE INDEX IF NOT EXISTS idx_friendships_user ON friendships(user_id);
 CREATE INDEX IF NOT EXISTS idx_friendships_friend ON friendships(friend_id);
 CREATE INDEX IF NOT EXISTS idx_friend_requests_to ON friend_requests(to_user_id, status);

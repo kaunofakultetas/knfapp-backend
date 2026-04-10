@@ -155,6 +155,57 @@ def register_socket_events(socketio):
                 include_self=False,
             )
 
+    @socketio.on("mark_read")
+    def handle_mark_read(data):
+        """Mark conversation as read via Socket.IO (alternative to REST endpoint).
+        Inserts per-message read receipts and broadcasts to participants."""
+        sid = flask_request.sid
+        user_id = _connected_users.get(sid)
+        if not user_id:
+            return
+
+        conv_id = data.get("conversationId")
+        if not conv_id:
+            return
+
+        now = datetime.utcnow().isoformat()
+        db = get_db()
+        try:
+            # Update conversation-level last_read_at
+            db.execute(
+                "UPDATE conversation_participants SET last_read_at = ? WHERE conversation_id = ? AND user_id = ?",
+                (now, conv_id, user_id),
+            )
+
+            # Insert per-message read receipts
+            unread_msgs = db.execute(
+                """
+                SELECT m.id FROM messages m
+                WHERE m.conversation_id = ? AND m.sender_id != ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM message_reads mr
+                    WHERE mr.message_id = m.id AND mr.user_id = ?
+                )
+                """,
+                (conv_id, user_id, user_id),
+            ).fetchall()
+
+            newly_read_ids = []
+            for msg in unread_msgs:
+                db.execute(
+                    "INSERT OR IGNORE INTO message_reads (message_id, user_id, read_at) VALUES (?, ?, ?)",
+                    (msg["id"], user_id, now),
+                )
+                newly_read_ids.append(msg["id"])
+
+            db.commit()
+
+            # Broadcast read receipt event
+            if newly_read_ids:
+                emit_read_receipt(socketio, conv_id, user_id, newly_read_ids)
+        finally:
+            db.close()
+
 
 def emit_new_message(socketio, conv_id: str, message_data: dict):
     """Emit a new message to all participants in a conversation.
@@ -167,5 +218,19 @@ def emit_reaction_update(socketio, conv_id: str, msg_id: str, reactions: list):
     socketio.emit(
         "reaction_update",
         {"conversationId": conv_id, "messageId": msg_id, "reactions": reactions},
+        to=f"conv:{conv_id}",
+    )
+
+
+def emit_read_receipt(socketio, conv_id: str, reader_id: str, message_ids: list):
+    """Emit read receipt to conversation participants.
+    Tells other clients that reader_id has read the given messages."""
+    socketio.emit(
+        "messages_read",
+        {
+            "conversationId": conv_id,
+            "readerId": reader_id,
+            "messageIds": message_ids,
+        },
         to=f"conv:{conv_id}",
     )
