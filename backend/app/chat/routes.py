@@ -438,8 +438,9 @@ def send_message(conv_id):
         from app.chat.events import emit_new_message
         emit_new_message(_get_socketio(), conv_id, msg_data)
 
-        # REST response includes isOwn=True for the sender
-        return jsonify({"message": {**msg_data, "isOwn": True}}), 201
+        # REST response includes isOwn=True and status for the sender
+        # New message: only sender has read it, so status is "sent" (no other readers yet)
+        return jsonify({"message": {**msg_data, "isOwn": True, "status": "sent", "readBy": [user_id]}}), 201
     finally:
         db.close()
 
