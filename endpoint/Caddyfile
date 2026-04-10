@@ -1,25 +1,33 @@
 :80 {
-    # API backend
-    handle /api/* {
-        reverse_proxy knfapp-backend:8000
-    }
+    route {
 
-    # Swagger UI
-    handle /docs* {
-        reverse_proxy knfapp-swagger:8080
-    }
 
-    # DbGate (admin only — consider restricting access)
-    handle /dbgate* {
-        reverse_proxy knfapp-dbgate:3000
-    }
+        # API backend
+        handle /api/* {
+            reverse_proxy knfapp-backend:8000 {
+                header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+            }
+        }
 
-    # Default: serve static or return 404
-    handle {
-        respond "KNFAPP API Server" 200
-    }
 
-    log {
-        output stdout
+        # Swagger UI
+        handle /swagger* {
+            reverse_proxy knfapp-swagger:8080
+        }
+
+
+        # DbGate
+        redir /dbgate /dbgate/
+        handle /dbgate/* {
+            reverse_proxy knfapp-dbgate:3000
+        }
+
+
+        # Default: serve static or return 404
+        handle {
+            respond "KNFAPP API Server" 200
+        }
+
+
     }
 }
