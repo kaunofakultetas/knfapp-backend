@@ -65,4 +65,6 @@ def trigger_schedule_scrape():
 def trigger_info_scrape():
     """Manually trigger a faculty info scrape from knf.vu.lt (admin only)."""
     result = scrape_faculty_info()
+    if isinstance(result, dict) and result.get("error"):
+        return jsonify(result), 500
     return jsonify(result)
