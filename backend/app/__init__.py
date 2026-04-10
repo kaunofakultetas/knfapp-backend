@@ -55,6 +55,7 @@ def create_app():
     from app.social.routes import social_bp
     from app.uploads.routes import uploads_bp
     from app.info.routes import info_bp
+    from app.notifications.routes import notifications_bp
 
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(news_bp, url_prefix="/api/news")
@@ -65,6 +66,7 @@ def create_app():
     app.register_blueprint(social_bp, url_prefix="/api/social")
     app.register_blueprint(uploads_bp, url_prefix="/api/uploads")
     app.register_blueprint(info_bp, url_prefix="/api/info")
+    app.register_blueprint(notifications_bp, url_prefix="/api/notifications")
 
     # Register Socket.IO events for real-time chat
     from app.chat.events import register_socket_events

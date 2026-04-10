@@ -12,7 +12,7 @@ _db_path = None
 logger = logging.getLogger(__name__)
 
 # Migration version — bump this to re-run migrations
-_CURRENT_MIGRATION_VERSION = 5
+_CURRENT_MIGRATION_VERSION = 6
 
 
 def init_db(db_path):
@@ -104,6 +104,7 @@ def _run_migrations(conn):
         3: ("Add invited column to users for trust levels", _migration_v3_add_invited_column),
         4: ("Add faculty_info table for scraped faculty data", _migration_v4_add_faculty_info_table),
         5: ("Add student fields to users table", _migration_v5_add_student_fields),
+        6: ("Add push_tokens table for push notifications", _migration_v6_add_push_tokens),
     }
 
     for version in sorted(_MIGRATIONS.keys()):
@@ -338,6 +339,29 @@ def _migration_v5_add_student_fields(conn):
     conn.commit()
 
 
+def _migration_v6_add_push_tokens(conn):
+    """Migration v6: Add push_tokens table for Expo push notifications.
+
+    Stores Expo push tokens per user/device so the server can send
+    push notifications for new messages, news, and admin announcements.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS push_tokens (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            token TEXT NOT NULL,
+            platform TEXT NOT NULL DEFAULT 'unknown',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_push_tokens_token ON push_tokens(token)")
+    conn.commit()
+    logger.info("  Created push_tokens table")
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -536,6 +560,18 @@ CREATE INDEX IF NOT EXISTS idx_message_reads_message ON message_reads(message_id
 CREATE INDEX IF NOT EXISTS idx_message_reads_user ON message_reads(user_id);
 CREATE INDEX IF NOT EXISTS idx_friendships_user ON friendships(user_id);
 CREATE INDEX IF NOT EXISTS idx_friendships_friend ON friendships(friend_id);
+CREATE TABLE IF NOT EXISTS push_tokens (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token TEXT NOT NULL,
+    platform TEXT NOT NULL DEFAULT 'unknown',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_friend_requests_to ON friend_requests(to_user_id, status);
 CREATE INDEX IF NOT EXISTS idx_friend_requests_from ON friend_requests(from_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens(user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_push_tokens_token ON push_tokens(token);
 """

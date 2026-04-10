@@ -1,0 +1,107 @@
+"""Push notification routes -- token registration and management."""
+
+import uuid
+from datetime import datetime
+
+from flask import Blueprint, jsonify, request
+
+from app.auth.routes import require_auth, require_role
+from app.database import get_db
+from app.notifications.push import notify_all_users
+
+notifications_bp = Blueprint("notifications", __name__)
+
+
+@notifications_bp.route("/register", methods=["POST"])
+@require_auth
+def register_token():
+    """Register an Expo push token for the authenticated user.
+
+    Body:
+      - token: str (Expo push token, e.g. ExponentPushToken[xxx])
+      - platform: str (ios|android|web, optional, default 'unknown')
+    """
+    data = request.get_json()
+    if not data or not data.get("token"):
+        return jsonify({"error": "Push token required"}), 400
+
+    token = data["token"].strip()
+    if not token.startswith("ExponentPushToken["):
+        return jsonify({"error": "Invalid Expo push token format"}), 400
+
+    platform = data.get("platform", "unknown")
+    if platform not in ("ios", "android", "web", "unknown"):
+        platform = "unknown"
+
+    user_id = request.user["id"]
+
+    db = get_db()
+    try:
+        # Check if token already exists for this user
+        existing = db.execute(
+            "SELECT id, active FROM push_tokens WHERE user_id = ? AND token = ?",
+            (user_id, token),
+        ).fetchone()
+
+        if existing:
+            # Reactivate if it was deactivated
+            if not existing["active"]:
+                db.execute(
+                    "UPDATE push_tokens SET active = 1, updated_at = ? WHERE id = ?",
+                    (datetime.utcnow().isoformat(), existing["id"]),
+                )
+                db.commit()
+            return jsonify({"registered": True, "tokenId": existing["id"]})
+
+        # Check if this token is registered to another user (device changed hands)
+        other = db.execute(
+            "SELECT id FROM push_tokens WHERE token = ? AND user_id != ?",
+            (token, user_id),
+        ).fetchone()
+        if other:
+            # Transfer token to new user
+            db.execute("DELETE FROM push_tokens WHERE id = ?", (other["id"],))
+
+        token_id = str(uuid.uuid4())
+        now = datetime.utcnow().isoformat()
+        db.execute(
+            """INSERT INTO push_tokens (id, user_id, token, platform, created_at, updated_at, active)
+               VALUES (?, ?, ?, ?, ?, ?, 1)""",
+            (token_id, user_id, token, platform, now, now),
+        )
+        db.commit()
+
+        return jsonify({"registered": True, "tokenId": token_id}), 201
+    finally:
+        db.close()
+
+
+@notifications_bp.route("/register", methods=["DELETE"])
+@require_auth
+def unregister_token():
+    """Remove a push token for the authenticated user.
+
+    Body:
+      - token: str (Expo push token to remove)
+    """
+    data = request.get_json()
+    if not data or not data.get("token"):
+        return jsonify({"error": "Push token required"}), 400
+
+    token = data["token"].strip()
+    user_id = request.user["id"]
+
+    db = get_db()
+    try:
+        result = db.execute(
+            "DELETE FROM push_tokens WHERE user_id = ? AND token = ?",
+            (user_id, token),
+        )
+        db.commit()
+
+        if result.rowcount == 0:
+            return jsonify({"error": "Token not found"}), 404
+
+        return jsonify({"unregistered": True})
+    finally:
+        db.close()

@@ -220,3 +220,39 @@ def admin_stats():
         })
     finally:
         db.close()
+
+
+@admin_bp.route("/notifications", methods=["POST"])
+@require_role("admin")
+def send_admin_notification():
+    """Send a push notification to all registered users.
+
+    Body:
+      - title: str (notification title)
+      - body: str (notification body text)
+      - data: dict (optional extra data payload)
+    """
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+
+    title = data.get("title", "").strip()
+    body_text = data.get("body", "").strip()
+
+    if not title or not body_text:
+        return jsonify({"error": "Title and body are required"}), 400
+
+    if len(title) > 200:
+        return jsonify({"error": "Title must be at most 200 characters"}), 400
+    if len(body_text) > 1000:
+        return jsonify({"error": "Body must be at most 1000 characters"}), 400
+
+    from app.notifications.push import notify_all_users
+
+    extra_data = data.get("data") if isinstance(data.get("data"), dict) else None
+    if extra_data is None:
+        extra_data = {"type": "admin_announcement"}
+
+    sent = notify_all_users(title, body_text, data=extra_data)
+
+    return jsonify({"sent": sent, "message": f"Notification sent to {sent} devices"})

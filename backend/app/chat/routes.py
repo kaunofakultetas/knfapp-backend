@@ -441,6 +441,35 @@ def send_message(conv_id):
         from app.chat.events import emit_new_message
         emit_new_message(_get_socketio(), conv_id, msg_data)
 
+        # Push notifications for offline participants
+        try:
+            from app.chat.events import _connected_users
+            from app.notifications.push import notify_user
+
+            # Find which users are online in this conversation via Socket.IO
+            online_user_ids = set(_connected_users.values())
+
+            # Get all participants except sender
+            participants = db.execute(
+                "SELECT user_id FROM conversation_participants WHERE conversation_id = ? AND user_id != ?",
+                (conv_id, user_id),
+            ).fetchall()
+
+            sender_name = user["display_name"]
+            preview = text[:100] if text else "(image)"
+            for p in participants:
+                pid = p["user_id"]
+                if pid not in online_user_ids:
+                    notify_user(
+                        pid,
+                        sender_name,
+                        preview,
+                        data={"type": "chat_message", "conversationId": conv_id},
+                    )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Push notification failed for chat message")
+
         # REST response includes isOwn=True and status for the sender
         # New message: only sender has read it, so status is "sent" (no other readers yet)
         return jsonify({"message": {**msg_data, "isOwn": True, "status": "sent", "readBy": [user_id]}}), 201
