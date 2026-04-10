@@ -1,6 +1,5 @@
 """Social API — friend requests, friendships, user profiles, wall posts."""
 
-import html
 import uuid
 from datetime import datetime
 
@@ -357,9 +356,7 @@ def create_post():
     if len(content) > MAX_CONTENT_LENGTH:
         return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
 
-    # Sanitize HTML to prevent stored XSS
-    title = html.escape(title)
-    content = html.escape(content)
+    # NOTE: HTML sanitization is handled globally by before_request middleware
 
     image_url = data.get("image_url")
     is_public = data.get("is_public", True)
@@ -522,7 +519,7 @@ def update_post(post_id):
             content = data["content"].strip()
             if len(content) > MAX_CONTENT_LENGTH:
                 return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
-            content = html.escape(content)
+            # NOTE: HTML sanitization is handled globally by before_request middleware
             updates.append("content = ?")
             params.append(content)
             updates.append("summary = ?")
@@ -531,7 +528,7 @@ def update_post(post_id):
             title = data["title"].strip()
             if len(title) > MAX_TITLE_LENGTH:
                 return jsonify({"error": f"Title must be at most {MAX_TITLE_LENGTH} characters"}), 400
-            title = html.escape(title)
+            # NOTE: HTML sanitization is handled globally by before_request middleware
             updates.append("title = ?")
             params.append(title)
         if "image_url" in data:

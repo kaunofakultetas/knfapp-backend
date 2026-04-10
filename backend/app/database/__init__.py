@@ -1,5 +1,6 @@
 """Database initialization and helpers."""
 
+import html
 import logging
 import sqlite3
 import uuid
@@ -9,6 +10,9 @@ import bcrypt
 
 _db_path = None
 logger = logging.getLogger(__name__)
+
+# Migration version — bump this to re-run migrations
+_CURRENT_MIGRATION_VERSION = 1
 
 
 def init_db(db_path):
@@ -24,6 +28,9 @@ def init_db(db_path):
     count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     if count == 0:
         _seed_defaults(conn)
+
+    # Run one-time data migrations (XSS cleanup, oversized data, etc.)
+    _run_migrations(conn)
 
     conn.close()
 
@@ -78,6 +85,134 @@ def _seed_defaults(conn):
 
     conn.commit()
     logger.info("Seeded default admin (admin/admin123), invitation code WELCOME-KNF-2026, and schedule")
+
+
+def _run_migrations(conn):
+    """Run one-time data migrations, tracked by version number."""
+    # Ensure migrations table exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS _migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+
+    applied = conn.execute(
+        "SELECT version FROM _migrations WHERE version = ?",
+        (_CURRENT_MIGRATION_VERSION,),
+    ).fetchone()
+
+    if applied:
+        return  # Already ran this migration version
+
+    logger.info("Running data migration v%d: XSS payload cleanup + oversized data trim", _CURRENT_MIGRATION_VERSION)
+
+    _migration_v1_xss_cleanup(conn)
+
+    conn.execute(
+        "INSERT INTO _migrations (version) VALUES (?)",
+        (_CURRENT_MIGRATION_VERSION,),
+    )
+    conn.commit()
+    logger.info("Data migration v%d complete", _CURRENT_MIGRATION_VERSION)
+
+
+def _migration_v1_xss_cleanup(conn):
+    """Migration v1: HTML-escape all user-generated text columns and
+    clean up oversized records.
+
+    Targets:
+    - users.display_name
+    - news_posts.title, content, summary, author_name
+    - news_comments.text
+    - messages.text
+    - conversations.title
+    - polls.title, poll_options.text
+
+    Also truncates oversized data (e.g. post f162b474 with 100k-char title).
+    """
+    MAX_TITLE_LEN = 200
+    MAX_CONTENT_LEN = 10000
+
+    def _escape_column(table, column, id_column="id"):
+        """HTML-escape all non-NULL values in a text column."""
+        rows = conn.execute(
+            f"SELECT {id_column}, {column} FROM {table} WHERE {column} IS NOT NULL"
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            raw = row[1]
+            escaped = html.escape(raw, quote=True)
+            if escaped != raw:
+                conn.execute(
+                    f"UPDATE {table} SET {column} = ? WHERE {id_column} = ?",
+                    (escaped, row[0]),
+                )
+                updated += 1
+        if updated:
+            logger.info("  Escaped %d rows in %s.%s", updated, table, column)
+
+    # ── Users: display_name ──
+    _escape_column("users", "display_name")
+
+    # ── News posts: title, content, summary, author_name ──
+    _escape_column("news_posts", "title")
+    _escape_column("news_posts", "content")
+    _escape_column("news_posts", "summary")
+    _escape_column("news_posts", "author_name")
+
+    # Truncate oversized titles (e.g. post f162b474 with 100k chars)
+    oversized = conn.execute(
+        "SELECT id, title FROM news_posts WHERE LENGTH(title) > ?",
+        (MAX_TITLE_LEN,),
+    ).fetchall()
+    for row in oversized:
+        truncated = row[1][:MAX_TITLE_LEN]
+        conn.execute("UPDATE news_posts SET title = ? WHERE id = ?", (truncated, row[0]))
+        logger.info("  Truncated oversized title on post %s (was %d chars)", row[0], len(row[1]))
+
+    # Truncate oversized content
+    oversized_content = conn.execute(
+        "SELECT id, content FROM news_posts WHERE LENGTH(content) > ?",
+        (MAX_CONTENT_LEN,),
+    ).fetchall()
+    for row in oversized_content:
+        truncated = row[1][:MAX_CONTENT_LEN]
+        conn.execute("UPDATE news_posts SET content = ? WHERE id = ?", (truncated, row[0]))
+        logger.info("  Truncated oversized content on post %s (was %d chars)", row[0], len(row[1]))
+
+    # ── Comments: text ──
+    _escape_column("news_comments", "text")
+
+    # ── Chat messages: text ──
+    _escape_column("messages", "text")
+
+    # ── Conversations: title ──
+    _escape_column("conversations", "title")
+
+    # ── Polls: title ──
+    _escape_column("polls", "title")
+
+    # ── Poll options: text ──
+    _escape_column("poll_options", "text")
+
+    # ── Validate and clear bad avatar_url values ──
+    from urllib.parse import urlparse
+    bad_avatars = conn.execute(
+        "SELECT id, avatar_url FROM users WHERE avatar_url IS NOT NULL AND avatar_url != ''"
+    ).fetchall()
+    for row in bad_avatars:
+        try:
+            parsed = urlparse(row[1])
+            if parsed.scheme.lower() not in ("http", "https"):
+                conn.execute("UPDATE users SET avatar_url = NULL WHERE id = ?", (row[0],))
+                logger.info("  Cleared invalid avatar_url (scheme=%s) for user %s", parsed.scheme, row[0])
+        except Exception:
+            conn.execute("UPDATE users SET avatar_url = NULL WHERE id = ?", (row[0],))
+            logger.info("  Cleared unparseable avatar_url for user %s", row[0])
+
+    conn.commit()
 
 
 _SCHEMA = """

@@ -1,6 +1,5 @@
 """News feed API — unified feed with ranking, likes, comments, polls."""
 
-import html
 import uuid
 from datetime import datetime
 
@@ -188,9 +187,7 @@ def create_post():
     if len(content) > MAX_CONTENT_LENGTH:
         return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
 
-    # Sanitize HTML to prevent stored XSS
-    title = html.escape(title)
-    content = html.escape(content)
+    # NOTE: HTML sanitization is handled globally by before_request middleware
 
     role = request.user["role"]
     post_type = data.get("post_type")
@@ -391,8 +388,7 @@ def add_comment(post_id):
     if len(comment_text) > MAX_COMMENT_LENGTH:
         return jsonify({"error": f"Comment must be at most {MAX_COMMENT_LENGTH} characters"}), 400
 
-    # Sanitize HTML to prevent stored XSS
-    comment_text = html.escape(comment_text)
+    # NOTE: HTML sanitization is handled globally by before_request middleware
 
     db = get_db()
     try:

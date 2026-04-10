@@ -1,8 +1,10 @@
 """knfapp-backend Flask application factory."""
 
+import html
 import os
+from urllib.parse import urlparse
 
-from flask import Flask
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -71,6 +73,63 @@ def create_app():
     from app.scraper.scheduler import start_scraper_scheduler
     start_scraper_scheduler(app)
 
+    # ── Global XSS sanitization middleware ─────────────────────────────────
+    # Centralised html.escape() for ALL user-supplied string fields.
+    # Runs before every request so individual endpoints never need to
+    # call html.escape() themselves.  Also enforces avatar_url scheme
+    # whitelist (http/https only) and max length (2048 chars).
+
+    _AVATAR_URL_MAX_LENGTH = 2048
+    _ALLOWED_URL_SCHEMES = {"http", "https"}
+
+    def _sanitize_value(value):
+        """Recursively HTML-escape every string in a JSON structure."""
+        if isinstance(value, str):
+            return html.escape(value, quote=True)
+        if isinstance(value, dict):
+            return {k: _sanitize_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_sanitize_value(item) for item in value]
+        return value
+
+    def _validate_avatar_url(url):
+        """Return (is_valid, error_message) for avatar_url.
+        Whitelist http:// and https:// schemes only.
+        Case-insensitive to block JaVaScRiPt: etc."""
+        if url is None or url == "":
+            return True, None
+        if not isinstance(url, str):
+            return False, "avatar_url must be a string"
+        if len(url) > _AVATAR_URL_MAX_LENGTH:
+            return False, f"avatar_url must be at most {_AVATAR_URL_MAX_LENGTH} characters"
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme.lower() not in _ALLOWED_URL_SCHEMES:
+                return False, "avatar_url must use http:// or https:// scheme"
+        except Exception:
+            return False, "avatar_url is not a valid URL"
+        return True, None
+
+    @app.before_request
+    def sanitize_json_input():
+        """HTML-escape all string values in JSON request bodies and
+        validate avatar_url scheme before any endpoint sees the data."""
+        if request.content_type and "json" in request.content_type:
+            data = request.get_json(silent=True)
+            if data and isinstance(data, dict):
+                # Validate avatar_url BEFORE escaping so we check the
+                # raw scheme (javascript:, data:, etc.)
+                if "avatar_url" in data:
+                    valid, err = _validate_avatar_url(data["avatar_url"])
+                    if not valid:
+                        return jsonify({"error": err}), 400
+
+                # HTML-escape every string value in the body
+                sanitized = _sanitize_value(data)
+                # Replace the cached parsed JSON so endpoints see
+                # the escaped version via request.get_json()
+                request._cached_json = (sanitized, sanitized)
+
     # Security headers middleware
     @app.after_request
     def add_security_headers(response):
@@ -98,6 +157,10 @@ def create_app():
     @app.errorhandler(405)
     def method_not_allowed(e):
         return {"error": "Method not allowed"}, 405
+
+    @app.errorhandler(415)
+    def unsupported_media_type(e):
+        return {"error": "Unsupported media type"}, 415
 
     @app.errorhandler(500)
     def internal_error(e):
