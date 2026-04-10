@@ -1,11 +1,23 @@
-# knfapp Docker Compose — copy to docker-compose.yml and fill in secrets
-# See .env.sample for required environment variables
-
 services:
-  knfapp-backend:
-    build: ./backend
-    container_name: knfapp-backend
+
+  knfapp-caddy:
+    container_name: knfapp-caddy
+    image: caddy:2-alpine
+    read_only: true
+    user: "1000:1000"
+    ports:
+      - "80:80"
+    volumes:
+      - ./endpoint/Caddyfile:/etc/caddy/Caddyfile:ro
+    networks:
+      - isolated-knfapp
+      - external
     restart: unless-stopped
+
+
+  knfapp-backend:
+    container_name: knfapp-backend
+    build: ./backend
     read_only: true
     user: "1000:1000"
     ports:
@@ -18,45 +30,20 @@ services:
       - UPLOAD_DIR=/data/uploads
       - INVITATION_EXPIRY_HOURS=${INVITATION_EXPIRY_HOURS:-168}
     volumes:
-      - ./_DATA/knfapp-backend:/data
       - /etc/localtime:/etc/localtime:ro
+      - ./_DATA/knfapp-backend:/data
     tmpfs:
       - /tmp
     networks:
       - isolated-knfapp
       - external
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
-  knfapp-caddy:
-    image: caddy:2-alpine
-    container_name: knfapp-caddy
     restart: unless-stopped
-    read_only: true
-    user: "1000:1000"
-    ports:
-      - "8080:80"
-      - "8443:443"
-    volumes:
-      - ./endpoint/Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./_DATA/knfapp-caddy/data:/data
-      - ./_DATA/knfapp-caddy/config:/config
-      - /etc/localtime:/etc/localtime:ro
-    networks:
-      - isolated-knfapp
-      - external
-    depends_on:
-      knfapp-backend:
-        condition: service_healthy
+
+
 
   knfapp-swagger:
-    image: swaggerapi/swagger-ui:latest
     container_name: knfapp-swagger
-    restart: unless-stopped
+    image: swaggerapi/swagger-ui:latest
     environment:
       - SWAGGER_JSON=/app/swagger.yaml
     volumes:
@@ -64,32 +51,30 @@ services:
       - /etc/localtime:/etc/localtime:ro
     networks:
       - isolated-knfapp
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+    restart: unless-stopped
+  
 
   knfapp-dbgate:
-    image: dbgate/dbgate:alpine
     container_name: knfapp-dbgate
-    restart: unless-stopped
+    image: dbgate/dbgate:alpine
     environment:
       - CONNECTIONS=knfapp
       - LABEL_knfapp=KNFAPP SQLite
       - ENGINE_knfapp=sqlite@dbgate-plugin-sqlite
       - FILE_knfapp=/data/knfapp.db
     volumes:
+      - /etc/localtime:/etc/localtime:ro
       - ./_DATA/knfapp-backend:/data:ro
       - ./_DATA/knfapp-dbgate:/root/.dbgate
-      - /etc/localtime:/etc/localtime:ro
+
     networks:
       - isolated-knfapp
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+    restart: unless-stopped
+
+
+
+
+
 
 networks:
   isolated-knfapp:
