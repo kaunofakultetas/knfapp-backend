@@ -25,7 +25,12 @@ def register_token():
     if not data or not data.get("token"):
         return jsonify({"error": "Push token required"}), 400
 
+    if not isinstance(data["token"], str):
+        return jsonify({"error": "Token must be a string"}), 400
+
     token = data["token"].strip()
+    if len(token) > 200:
+        return jsonify({"error": "Token too long"}), 400
     if not token.startswith("ExponentPushToken["):
         return jsonify({"error": "Invalid Expo push token format"}), 400
 
@@ -88,7 +93,13 @@ def unregister_token():
     if not data or not data.get("token"):
         return jsonify({"error": "Push token required"}), 400
 
+    if not isinstance(data["token"], str):
+        return jsonify({"error": "Token must be a string"}), 400
+
     token = data["token"].strip()
+    if len(token) > 200:
+        return jsonify({"error": "Token too long"}), 400
+
     user_id = request.user["id"]
 
     db = get_db()
