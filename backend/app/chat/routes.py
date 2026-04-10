@@ -695,6 +695,75 @@ def total_unread_count():
         db.close()
 
 
+@chat_bp.route("/conversations/<conv_id>/messages/search", methods=["GET"])
+@require_auth
+def search_messages(conv_id):
+    """Search messages within a conversation by text content.
+
+    Query params:
+      - q (str, required): search query (min 1 char)
+      - limit (int, default 20, max 50): max results
+    """
+    user_id = request.user["id"]
+    q = request.args.get("q", "").strip()
+    if len(q) < 1:
+        return jsonify({"messages": [], "total": 0})
+
+    limit = min(int(request.args.get("limit", 20)), 50)
+
+    db = get_db()
+    try:
+        # Verify user is participant
+        participant = db.execute(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not participant:
+            return jsonify({"error": "Not a participant"}), 403
+
+        # Search messages containing the query text (case-insensitive via LIKE)
+        search_pattern = f"%{q}%"
+        rows = db.execute(
+            """
+            SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id,
+                   u.display_name AS sender_name, u.avatar_url AS sender_avatar
+            FROM messages m
+            JOIN users u ON u.id = m.sender_id
+            WHERE m.conversation_id = ? AND m.text LIKE ?
+            ORDER BY m.created_at DESC
+            LIMIT ?
+            """,
+            (conv_id, search_pattern, limit),
+        ).fetchall()
+
+        total = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND text LIKE ?",
+            (conv_id, search_pattern),
+        ).fetchone()[0]
+
+        messages = []
+        for row in rows:
+            messages.append({
+                "id": row["id"],
+                "conversationId": conv_id,
+                "senderId": row["sender_id"],
+                "senderName": row["sender_name"],
+                "senderAvatar": row["sender_avatar"],
+                "text": row["text"],
+                "imageUrl": row["image_url"],
+                "time": _format_time(row["created_at"]),
+                "createdAt": row["created_at"],
+                "isOwn": row["sender_id"] == user_id,
+            })
+
+        # Chronological order
+        messages.reverse()
+
+        return jsonify({"messages": messages, "total": total})
+    finally:
+        db.close()
+
+
 @chat_bp.route("/users/search", methods=["GET"])
 @require_auth
 def search_users():

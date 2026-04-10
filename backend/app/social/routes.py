@@ -1,4 +1,4 @@
-"""Social API — friend requests, friendships, user profiles, wall posts."""
+"""Social API — friend requests, friendships, user profiles, wall posts, social feed."""
 
 import uuid
 from datetime import datetime
@@ -14,6 +14,132 @@ MAX_TITLE_LENGTH = 200
 MAX_CONTENT_LENGTH = 10000
 
 social_bp = Blueprint("social", __name__)
+
+
+# \u2500\u2500 Social Feed \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+
+@social_bp.route("/feed", methods=["GET"])
+def social_feed():
+    """Personalized social feed showing user-generated posts.
+
+    Guest: public user posts, sorted by recency + engagement.
+    Authenticated: own posts + friends' posts (public and private) + public user posts.
+
+    Query params:
+      - page (int, default 1)
+      - per_page (int, default 20, max 50)
+    """
+    page, per_page, err = parse_pagination()
+    if err:
+        return err
+    offset = (page - 1) * per_page
+
+    current_user = get_current_user()
+
+    db = get_db()
+    try:
+        where_clauses = ["source = 'user'"]
+        params = []
+
+        if current_user:
+            # Authenticated: own posts + friends' posts (all) + other public user posts
+            friend_ids = [
+                r["friend_id"]
+                for r in db.execute(
+                    "SELECT friend_id FROM friendships WHERE user_id = ?",
+                    (current_user["id"],),
+                ).fetchall()
+            ]
+            visible_ids = [current_user["id"]] + friend_ids
+            placeholders = ",".join(["?"] * len(visible_ids))
+            # Show: posts by self/friends (all visibility) OR public posts by anyone
+            where_clauses.append(
+                f"(author_id IN ({placeholders}) OR is_public = 1)"
+            )
+            params.extend(visible_ids)
+        else:
+            # Guest: only public user posts
+            where_clauses.append("is_public = 1")
+
+        where_sql = " AND ".join(where_clauses)
+
+        # Ranked query: recency + engagement
+        query = f"""
+            SELECT *,
+                (1.0 / (1.0 + (julianday('now') - julianday(published_at)))) * 100 AS recency_score,
+                MIN(likes_count + comments_count * 2 + shares_count * 3, 100) * 0.5 AS engagement_score
+            FROM news_posts
+            WHERE {where_sql}
+            ORDER BY (
+                (1.0 / (1.0 + (julianday('now') - julianday(published_at)))) * 100
+                + MIN(likes_count + comments_count * 2 + shares_count * 3, 100) * 0.5
+            ) DESC, published_at DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([per_page, offset])
+
+        rows = db.execute(query, params).fetchall()
+
+        posts = []
+        for row in rows:
+            # Fetch author avatar
+            author_avatar = None
+            if row["author_id"]:
+                author_row = db.execute(
+                    "SELECT avatar_url FROM users WHERE id = ?",
+                    (row["author_id"],),
+                ).fetchone()
+                if author_row:
+                    author_avatar = author_row["avatar_url"]
+
+            posts.append({
+                "id": row["id"],
+                "title": row["title"],
+                "content": row["content"],
+                "summary": row["summary"],
+                "imageUrl": row["image_url"],
+                "author": row["author_name"],
+                "authorId": row["author_id"],
+                "authorAvatar": author_avatar,
+                "source": row["source"],
+                "postType": row["post_type"],
+                "likes": row["likes_count"],
+                "comments": row["comments_count"],
+                "shares": row["shares_count"],
+                "date": row["published_at"],
+                "isPublic": bool(row["is_public"]),
+                "liked": False,
+            })
+
+        # Add like status for authenticated users
+        if current_user and posts:
+            post_ids = [p["id"] for p in posts]
+            ph = ",".join(["?"] * len(post_ids))
+            liked = db.execute(
+                f"SELECT post_id FROM news_likes WHERE user_id = ? AND post_id IN ({ph})",
+                [current_user["id"]] + post_ids,
+            ).fetchall()
+            liked_set = {r["post_id"] for r in liked}
+            for p in posts:
+                p["liked"] = p["id"] in liked_set
+
+        # Total count
+        count_params = params[:-2] if len(params) > 2 else []
+        total = db.execute(
+            f"SELECT COUNT(*) as c FROM news_posts WHERE {where_sql}",
+            count_params,
+        ).fetchone()["c"]
+
+        return jsonify({
+            "posts": posts,
+            "page": page,
+            "perPage": per_page,
+            "total": total,
+            "hasMore": offset + per_page < total,
+        })
+    finally:
+        db.close()
 
 
 # ── User Profiles ────────────────────────────────────────────────────────────
