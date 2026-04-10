@@ -1,8 +1,2 @@
-__pycache__/
-*.pyc
-*.pyo
-data/
+_DATA*
 .env
-*.db
-venv/
-.venv/

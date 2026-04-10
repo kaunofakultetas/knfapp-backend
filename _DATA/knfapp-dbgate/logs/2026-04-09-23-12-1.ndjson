@@ -1,9 +1,0 @@
-{"pid":1,"caller":"apiIndex","name":"main","level":30,"msg":"Starting API process version 7.1.8","time":1775776348860,"msgcode":"DBGM-00026"}
-{"pid":1,"caller":"connections","name":"main","connections":[{"_id":"***","engine":"sqlite@dbgate-plugin-sqlite","useDatabaseUrl":false,"databaseFile":"***","defaultDatabase":"***","singleDatabase":true,"displayName":"***","databases":null,"useSeparateSchemas":false}],"level":30,"msg":"Using connections from ENV variables","time":1775776349063,"msgcode":"DBGM-00005"}
-{"pid":1,"caller":"useController","name":"main","level":30,"msg":"Calling init controller for controller /connections","time":1775776349212,"msgcode":"DBGM-00096"}
-{"pid":1,"caller":"useController","name":"main","level":30,"msg":"Calling init controller for controller /database-connections","time":1775776349215,"msgcode":"DBGM-00096"}
-{"pid":1,"caller":"useController","name":"main","level":30,"msg":"Calling init controller for controller /scheduler","time":1775776349223,"msgcode":"DBGM-00096"}
-{"pid":1,"caller":"directories","name":"main","level":30,"msg":"Creating directory /root/.dbgate/run","time":1775776349224,"msgcode":"DBGM-00171"}
-{"pid":1,"caller":"directories","name":"main","level":30,"msg":"Creating directory /root/.dbgate/files","time":1775776349225,"msgcode":"DBGM-00171"}
-{"pid":1,"caller":"main","name":"main","level":30,"msg":"DbGate API listening on port 3000 (docker build)","time":1775776349225,"msgcode":"DBGM-00028"}
-{"pid":1,"caller":"main","name":"main","level":30,"msg":"Shutting down DbGate API server","time":1775777788745,"msgcode":"DBGM-00034"}
