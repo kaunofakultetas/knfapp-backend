@@ -61,6 +61,9 @@ services:
     environment:
       WEB_ROOT: /dbgate
 
+      LOGINS: admin
+      LOGIN_PASSWORD_admin: ${DBGATE_PASSWORD}
+
       CONNECTIONS: con1
       LABEL_con1: KNFAPP SQLite
       FILE_con1: /data/knfapp.db
