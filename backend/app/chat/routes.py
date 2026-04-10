@@ -608,6 +608,7 @@ def leave_conversation(conv_id):
         ).fetchone()[0]
 
         if remaining == 0:
+            db.execute("DELETE FROM message_reads WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)", (conv_id,))
             db.execute("DELETE FROM message_reactions WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)", (conv_id,))
             db.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
             db.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))

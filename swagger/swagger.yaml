@@ -2,7 +2,7 @@ openapi: 3.0.3
 info:
   title: KNFAPP API
   description: Backend API for VU Kaunas Faculty mobile app
-  version: 1.5.0
+  version: 1.6.0
   contact:
     name: VU KNF IT
 servers:
@@ -802,6 +802,7 @@ paths:
     put:
       tags: [chat]
       summary: Mark conversation as read
+      description: Updates last_read_at and inserts per-message read receipts. Broadcasts messages_read Socket.IO event to conversation participants.
       security:
         - bearerAuth: []
       parameters:
@@ -813,6 +814,34 @@ paths:
       responses:
         "200":
           description: Marked as read
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  readCount:
+                    type: integer
+                    description: Number of newly read messages
+
+  /chat/unread-count:
+    get:
+      tags: [chat]
+      summary: Get total unread message count
+      description: Returns the sum of unread messages across all conversations the user participates in. Used for the Messages tab badge.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Unread count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unreadCount:
+                    type: integer
 
   /chat/conversations/{convId}:
     delete:
@@ -1626,6 +1655,15 @@ components:
           description: ISO datetime
         isOwn:
           type: boolean
+        status:
+          type: string
+          enum: [sent, delivered, read]
+          description: "Read receipt status. sent=no other readers, delivered=some read, read=all read."
+        readBy:
+          type: array
+          items:
+            type: string
+          description: User IDs who have read this message
         reactions:
           type: array
           items:
