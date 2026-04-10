@@ -12,7 +12,7 @@ _db_path = None
 logger = logging.getLogger(__name__)
 
 # Migration version — bump this to re-run migrations
-_CURRENT_MIGRATION_VERSION = 2
+_CURRENT_MIGRATION_VERSION = 3
 
 
 def init_db(db_path):
@@ -101,6 +101,7 @@ def _run_migrations(conn):
     _MIGRATIONS = {
         1: ("XSS payload cleanup + oversized data trim", _migration_v1_xss_cleanup),
         2: ("Reverse double-escaped HTML entities (input-escaping removed)", _migration_v2_unescape_double_escapes),
+        3: ("Add invited column to users for trust levels", _migration_v3_add_invited_column),
     }
 
     for version in sorted(_MIGRATIONS.keys()):
@@ -277,6 +278,22 @@ def _migration_v2_unescape_double_escapes(conn):
     _unescape_column("polls", "title")
     _unescape_column("poll_options", "text")
 
+    conn.commit()
+
+
+def _migration_v3_add_invited_column(conn):
+    """Migration v3: Add 'invited' column to users table.
+
+    Tracks whether user registered via invitation code (higher trust) or
+    as a guest.  Existing users (created before guest registration) are
+    marked as invited=1 since they all used invitation codes.
+    """
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN invited INTEGER NOT NULL DEFAULT 1")
+        logger.info("  Added 'invited' column to users table (existing users marked invited=1)")
+    except Exception:
+        # Column already exists (idempotent)
+        logger.info("  'invited' column already exists, skipping")
     conn.commit()
 
 

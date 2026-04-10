@@ -124,7 +124,13 @@ def validate_invitation_code():
 
 @auth_bp.route("/register", methods=["POST"])
 def register():
-    """Register a new user with an invitation code."""
+    """Register a new user.
+
+    Invitation code is OPTIONAL:
+    - With valid code: user gets the role from the code and invited=1 (higher trust).
+    - Without code: user registers as 'student' with invited=0 (guest, limited features).
+    App works without login or invite code — auth adds features, doesn't gate.
+    """
     client_ip = request.remote_addr or "unknown"
     if _check_rate_limit(f"register:{client_ip}"):
         return jsonify({"error": "Too many registration attempts. Please wait a few minutes."}), 429
@@ -133,7 +139,7 @@ def register():
     if not data:
         return jsonify({"error": "JSON body required"}), 400
 
-    required = ["invitation_code", "username", "password", "display_name", "email"]
+    required = ["username", "password", "display_name", "email"]
     missing = [f for f in required if not data.get(f)]
     if missing:
         return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
@@ -146,21 +152,29 @@ def register():
 
     db = get_db()
     try:
-        # Validate invitation code
-        invite = db.execute(
-            "SELECT * FROM invitation_codes WHERE code = ?",
-            (data["invitation_code"],),
-        ).fetchone()
+        # Determine role and invited status based on invitation code
+        invite_code = (data.get("invitation_code") or "").strip()
+        role = "student"
+        invited = 0
 
-        if not invite:
-            return jsonify({"error": "Invalid invitation code"}), 400
+        if invite_code:
+            invite = db.execute(
+                "SELECT * FROM invitation_codes WHERE code = ?",
+                (invite_code,),
+            ).fetchone()
 
-        if invite["use_count"] >= invite["max_uses"]:
-            return jsonify({"error": "Invitation code has been fully used"}), 400
+            if not invite:
+                return jsonify({"error": "Invalid invitation code"}), 400
 
-        invite_expires = datetime.fromisoformat(invite["expires_at"]).replace(tzinfo=None)
-        if invite_expires < datetime.utcnow():
-            return jsonify({"error": "Invitation code has expired"}), 400
+            if invite["use_count"] >= invite["max_uses"]:
+                return jsonify({"error": "Invitation code has been fully used"}), 400
+
+            invite_expires = datetime.fromisoformat(invite["expires_at"]).replace(tzinfo=None)
+            if invite_expires < datetime.utcnow():
+                return jsonify({"error": "Invitation code has expired"}), 400
+
+            role = invite["role"]
+            invited = 1
 
         # Check uniqueness
         existing = db.execute(
@@ -175,15 +189,16 @@ def register():
         password_hash = bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()
 
         db.execute(
-            "INSERT INTO users (id, username, email, display_name, password_hash, role) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, data["username"], data["email"], data["display_name"], password_hash, invite["role"]),
+            "INSERT INTO users (id, username, email, display_name, password_hash, role, invited) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, data["username"], data["email"], data["display_name"], password_hash, role, invited),
         )
 
-        # Increment invitation use count
-        db.execute(
-            "UPDATE invitation_codes SET use_count = use_count + 1 WHERE id = ?",
-            (invite["id"],),
-        )
+        # Increment invitation use count if code was used
+        if invite_code and invited:
+            db.execute(
+                "UPDATE invitation_codes SET use_count = use_count + 1 WHERE code = ?",
+                (invite_code,),
+            )
 
         # Create session
         token = str(uuid.uuid4())
@@ -200,7 +215,8 @@ def register():
                 "username": data["username"],
                 "email": data["email"],
                 "displayName": data["display_name"],
-                "role": invite["role"],
+                "role": role,
+                "invited": bool(invited),
             },
             "token": token,
         }), 201
@@ -256,6 +272,7 @@ def login():
                 "displayName": user["display_name"],
                 "role": user["role"],
                 "avatarUrl": user["avatar_url"],
+                "invited": bool(user.get("invited", 1)),
             },
             "token": token,
         })
@@ -276,6 +293,7 @@ def me():
         "displayName": u["display_name"],
         "role": u["role"],
         "avatarUrl": u["avatar_url"],
+        "invited": bool(u.get("invited", 1)),
     })
 
 
@@ -319,6 +337,7 @@ def update_me():
             "displayName": user["display_name"],
             "role": user["role"],
             "avatarUrl": user["avatar_url"],
+            "invited": bool(user.get("invited", 1)),
         })
     finally:
         db.close()
