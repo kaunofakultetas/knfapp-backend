@@ -2,15 +2,15 @@ services:
 
   knfapp-caddy:
     container_name: knfapp-caddy
-    image: caddy:2-alpine
+    image: caddy:2.11-alpine
+    # user: 1000:1000
     read_only: true
-    user: "1000:1000"
     ports:
       - "80:80"
     volumes:
       - ./endpoint/Caddyfile:/etc/caddy/Caddyfile:ro
     networks:
-      - isolated-knfapp
+      - isolated
       - external
     restart: unless-stopped
 
@@ -18,73 +18,93 @@ services:
   knfapp-backend:
     container_name: knfapp-backend
     build: ./backend
+    # user: 1000:1000
     read_only: true
-    user: "1000:1000"
-    ports:
-      - "127.0.0.1:8000:8000"
     environment:
-      - APP_DEBUG=${APP_DEBUG:-0}
+      # - APP_DEBUG=true                                                     # Dev
       - SECRET_KEY=${SECRET_KEY}
       - JWT_SECRET=${JWT_SECRET}
       - DB_PATH=/data/knfapp.db
       - UPLOAD_DIR=/data/uploads
       - INVITATION_EXPIRY_HOURS=${INVITATION_EXPIRY_HOURS:-168}
+    tmpfs:
+      - /tmp:uid=1000,gid=1000
     volumes:
       - /etc/localtime:/etc/localtime:ro
-      - ./_DATA/knfapp-backend:/data
-    tmpfs:
-      - /tmp
+      - ./_DATA/backend:/data
     networks:
-      - isolated-knfapp
+      - isolated
       - external
     restart: unless-stopped
-
 
 
   knfapp-swagger:
     container_name: knfapp-swagger
     image: swaggerapi/swagger-ui:latest
+    # user: 1000:1000
+    read_only: false
     environment:
-      - SWAGGER_JSON=/app/swagger.yaml
+      - SWAGGER_JSON=/swagger.yaml
+      - BASE_URL=/swagger
     volumes:
-      - ./swagger/swagger.yaml:/app/swagger.yaml:ro
-      - /etc/localtime:/etc/localtime:ro
+      - ./swagger/swagger.yaml:/swagger.yaml:ro
     networks:
-      - isolated-knfapp
+      - isolated
     restart: unless-stopped
   
 
   knfapp-dbgate:
     container_name: knfapp-dbgate
-    image: dbgate/dbgate:alpine
+    image: dbgate/dbgate:7.1.6-alpine
+    user: root
+    read_only: true
     environment:
-      - CONNECTIONS=knfapp
-      - LABEL_knfapp=KNFAPP SQLite
-      - ENGINE_knfapp=sqlite@dbgate-plugin-sqlite
-      - FILE_knfapp=/data/knfapp.db
-    volumes:
-      - /etc/localtime:/etc/localtime:ro
-      - ./_DATA/knfapp-backend:/data:ro
-      - ./_DATA/knfapp-dbgate:/root/.dbgate
+      WEB_ROOT: /dbgate
 
+      CONNECTIONS: con1
+      LABEL_con1: KNFAPP SQLite
+      FILE_con1: /data/knfapp.db
+      ENGINE_con1: sqlite@dbgate-plugin-sqlite
     networks:
-      - isolated-knfapp
+      - isolated
+    restart: unless-stopped
+
+
+  knfapp-mobile:
+    container_name: knfapp-mobile
+    image: knfapp-mobile
+    build: ./mobile
+    # user: 1000:1000
+    # read_only: true
+    tty: true                                                                                                                                                                                                                                                    
+    stdin_open: true
+    environment:
+      - EXPO_NO_TELEMETRY=1
+      - EXPO_PUBLIC_API_URL=https://knfapp.knf-hosting.lt/api                                                                                                                                                                                                    
+      - REACT_NATIVE_PACKAGER_HOSTNAME=knfapp.knf-hosting.lt                                                                                                                                                                                                     
+      - EXPO_PACKAGER_PROXY_URL=https://knfapp.knf-hosting.lt
+      - EXPO_MANIFEST_PROXY_URL=https://knfapp.knf-hosting.lt                                                                                                                                                                                              
+      - EXPO_TOKEN=${EXPO_TOKEN}  
+    volumes:
+      - ./mobile/app:/app
+    networks:
+      - isolated
+      - external
     restart: unless-stopped
 
 
 
 
-
-
 networks:
-  isolated-knfapp:
-    driver: bridge
-    internal: true
-    ipam:
-      config:
-        - subnet: 172.28.10.0/24
   external:
     driver: bridge
     ipam:
       config:
         - subnet: 172.28.11.0/24
+  isolated:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.28.10.0/24
+
