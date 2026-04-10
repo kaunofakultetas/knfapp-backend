@@ -163,12 +163,17 @@ def update_channels():
     user_id = request.user["id"]
     now = datetime.utcnow().isoformat()
 
+    # Validate all channel values are strictly boolean before writing
+    for channel, enabled in channels_input.items():
+        if channel not in VALID_CHANNELS:
+            continue
+        if not isinstance(enabled, bool):
+            return jsonify({"error": f"Channel '{channel}' value must be a boolean (true/false), got {type(enabled).__name__}"}), 400
+
     db = get_db()
     try:
         for channel, enabled in channels_input.items():
             if channel not in VALID_CHANNELS:
-                continue
-            if not isinstance(enabled, bool):
                 continue
 
             db.execute(
