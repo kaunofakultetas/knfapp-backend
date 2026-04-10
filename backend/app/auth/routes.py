@@ -264,15 +264,16 @@ def login():
         )
         db.commit()
 
+        user_dict = dict(user)
         return jsonify({
             "user": {
-                "id": user["id"],
-                "username": user["username"],
-                "email": user["email"],
-                "displayName": user["display_name"],
-                "role": user["role"],
-                "avatarUrl": user["avatar_url"],
-                "invited": bool(user.get("invited", 1)),
+                "id": user_dict["id"],
+                "username": user_dict["username"],
+                "email": user_dict["email"],
+                "displayName": user_dict["display_name"],
+                "role": user_dict["role"],
+                "avatarUrl": user_dict["avatar_url"],
+                "invited": bool(user_dict.get("invited", 1)),
             },
             "token": token,
         })
@@ -329,15 +330,16 @@ def update_me():
         db.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
         db.commit()
 
-        user = db.execute("SELECT * FROM users WHERE id = ?", (request.user["id"],)).fetchone()
+        user_row = db.execute("SELECT * FROM users WHERE id = ?", (request.user["id"],)).fetchone()
+        u = dict(user_row)
         return jsonify({
-            "id": user["id"],
-            "username": user["username"],
-            "email": user["email"],
-            "displayName": user["display_name"],
-            "role": user["role"],
-            "avatarUrl": user["avatar_url"],
-            "invited": bool(user.get("invited", 1)),
+            "id": u["id"],
+            "username": u["username"],
+            "email": u["email"],
+            "displayName": u["display_name"],
+            "role": u["role"],
+            "avatarUrl": u["avatar_url"],
+            "invited": bool(u.get("invited", 1)),
         })
     finally:
         db.close()

@@ -132,9 +132,9 @@ def create_app():
                 # Strip null bytes from all string values
                 cleaned = _strip_null_bytes(data)
                 if cleaned != data:
-                    # Replace Flask 3.x cached_property so downstream
+                    # Replace Werkzeug's internal JSON cache so downstream
                     # get_json() returns the cleaned data.
-                    request.__dict__["json"] = cleaned
+                    request._cached_json = (cleaned, cleaned)
                     data = cleaned
 
                 if "avatar_url" in data:
