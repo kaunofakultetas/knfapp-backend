@@ -46,6 +46,8 @@ services:
       - ./_DATA/knfapp-caddy/data:/data
       - ./_DATA/knfapp-caddy/config:/config
       - /etc/localtime:/etc/localtime:ro
+    tmpfs:
+      - /tmp
     networks:
       - isolated-knfapp
       - external

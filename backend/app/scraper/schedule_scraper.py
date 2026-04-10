@@ -416,7 +416,8 @@ def scrape_knf_schedule(semester_weeks: int = 16) -> dict:
 
         db.execute(
             """UPDATE scraper_runs
-               SET status = 'completed', articles_found = ?, articles_new = ?
+               SET status = 'completed', articles_found = ?, articles_new = ?,
+                   finished_at = datetime('now')
                WHERE id = ?""",
             (total_lessons, total_new, run_id),
         )
@@ -433,7 +434,7 @@ def scrape_knf_schedule(semester_weeks: int = 16) -> dict:
     except Exception:
         logger.exception("Schedule scrape failed")
         db.execute(
-            "UPDATE scraper_runs SET status = 'failed' WHERE id = ?", (run_id,),
+            "UPDATE scraper_runs SET status = 'failed', finished_at = datetime('now') WHERE id = ?", (run_id,),
         )
         db.commit()
         return {"groups_scraped": 0, "lessons_found": 0, "lessons_new": 0}
