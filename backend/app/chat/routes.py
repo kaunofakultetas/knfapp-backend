@@ -383,6 +383,9 @@ def send_message(conv_id):
     if not text and not image_url:
         return jsonify({"error": "Message must have text or image"}), 400
 
+    if text and len(text) > 5000:
+        return jsonify({"error": "Message text must not exceed 5000 characters"}), 400
+
     db = get_db()
     try:
         # Verify user is participant
@@ -547,6 +550,14 @@ def mark_read(conv_id):
     now = datetime.utcnow().isoformat()
     db = get_db()
     try:
+        # Verify user is participant
+        participant = db.execute(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not participant:
+            return jsonify({"error": "Not a participant"}), 403
+
         # Update the conversation-level last_read_at
         db.execute(
             "UPDATE conversation_participants SET last_read_at = ? WHERE conversation_id = ? AND user_id = ?",

@@ -171,6 +171,14 @@ def register_socket_events(socketio):
         now = datetime.utcnow().isoformat()
         db = get_db()
         try:
+            # Verify user is participant
+            participant = db.execute(
+                "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+                (conv_id, user_id),
+            ).fetchone()
+            if not participant:
+                return
+
             # Update conversation-level last_read_at
             db.execute(
                 "UPDATE conversation_participants SET last_read_at = ? WHERE conversation_id = ? AND user_id = ?",

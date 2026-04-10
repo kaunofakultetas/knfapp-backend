@@ -30,11 +30,26 @@ def start_scraper_scheduler(app):
             except Exception:
                 logger.exception("Scheduled scrape failed")
 
+    def run_schedule_scraper():
+        with app.app_context():
+            try:
+                from app.scraper.schedule_scraper import scrape_knf_schedule
+
+                logger.info("Running scheduled schedule scrape...")
+                result = scrape_knf_schedule()
+                logger.info("Schedule scrape done: %s", result)
+            except Exception:
+                logger.exception("Scheduled schedule scrape failed")
+
     # Run on interval every 20 minutes
     _scheduler.add_job(run_scrapers, "interval", minutes=20, id="news_scraper", max_instances=1)
+    # Schedule scraper: once every 6 hours (timetables don't change often)
+    _scheduler.add_job(run_schedule_scraper, "interval", hours=6, id="schedule_scraper", max_instances=1)
     _scheduler.start()
 
     # Also run once immediately on startup
     import threading
     threading.Timer(2.0, run_scrapers).start()
-    logger.info("Scraper scheduler started (interval: 20min)")
+    # Delay schedule scraper to avoid startup load spike
+    threading.Timer(30.0, run_schedule_scraper).start()
+    logger.info("Scraper scheduler started (news: 20min, schedule: 6h)")
