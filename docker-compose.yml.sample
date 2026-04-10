@@ -79,14 +79,14 @@ services:
     build: ./mobile
     # user: 1000:1000
     # read_only: true
-    tty: true                                                                                                                                                                                                                                                    
+    tty: true
     stdin_open: true
     environment:
       - EXPO_NO_TELEMETRY=1
-      - EXPO_PUBLIC_API_URL=https://knfapp.knf-hosting.lt/api                                                                                                                                                                                                    
-      - REACT_NATIVE_PACKAGER_HOSTNAME=knfapp.knf-hosting.lt                                                                                                                                                                                                     
+      - EXPO_PUBLIC_API_URL=https://knfapp.knf-hosting.lt/api
+      - REACT_NATIVE_PACKAGER_HOSTNAME=knfapp.knf-hosting.lt
       - EXPO_PACKAGER_PROXY_URL=https://knfapp.knf-hosting.lt
-      - EXPO_MANIFEST_PROXY_URL=https://knfapp.knf-hosting.lt                                                                                                                                                                                              
+      - EXPO_MANIFEST_PROXY_URL=https://knfapp.knf-hosting.lt
       - EXPO_TOKEN=${EXPO_TOKEN}  
     volumes:
       - ./mobile/app:/app
