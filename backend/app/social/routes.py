@@ -88,12 +88,15 @@ def update_profile():
     try:
         updates = []
         params = []
-        if "display_name" in data and data["display_name"].strip():
+        if "display_name" in data:
+            if not isinstance(data["display_name"], str):
+                return jsonify({"error": "display_name must be a string"}), 400
             display_name = data["display_name"].strip()
-            if len(display_name) > 100:
-                return jsonify({"error": "Display name must be at most 100 characters"}), 400
-            updates.append("display_name = ?")
-            params.append(display_name)
+            if display_name:
+                if len(display_name) > 100:
+                    return jsonify({"error": "Display name must be at most 100 characters"}), 400
+                updates.append("display_name = ?")
+                params.append(display_name)
         if "avatar_url" in data:
             updates.append("avatar_url = ?")
             params.append(data["avatar_url"])
@@ -368,11 +371,17 @@ def create_post():
     if not data:
         return jsonify({"error": "JSON body required"}), 400
 
-    content = (data.get("content") or "").strip()
+    raw_content = data.get("content")
+    if raw_content is not None and not isinstance(raw_content, str):
+        return jsonify({"error": "content must be a string"}), 400
+    content = (raw_content or "").strip()
     if not content:
         return jsonify({"error": "Post content required"}), 400
 
-    title = (data.get("title") or "").strip() or content[:80]
+    raw_title = data.get("title")
+    if raw_title is not None and not isinstance(raw_title, str):
+        return jsonify({"error": "title must be a string"}), 400
+    title = (raw_title or "").strip() or content[:80]
 
     # Input length validation
     if len(title) > MAX_TITLE_LENGTH:
@@ -540,16 +549,21 @@ def update_post(post_id):
 
         updates = []
         params = []
-        if "content" in data and data["content"].strip():
+        if "content" in data:
+            if not isinstance(data["content"], str):
+                return jsonify({"error": "content must be a string"}), 400
             content = data["content"].strip()
-            if len(content) > MAX_CONTENT_LENGTH:
-                return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
-            # NOTE: XSS protection handled by after_request output escaping
-            updates.append("content = ?")
-            params.append(content)
-            updates.append("summary = ?")
-            params.append(content[:200])
+            if content:
+                if len(content) > MAX_CONTENT_LENGTH:
+                    return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
+                # NOTE: XSS protection handled by after_request output escaping
+                updates.append("content = ?")
+                params.append(content)
+                updates.append("summary = ?")
+                params.append(content[:200])
         if "title" in data:
+            if not isinstance(data["title"], str):
+                return jsonify({"error": "title must be a string"}), 400
             title = data["title"].strip()
             if len(title) > MAX_TITLE_LENGTH:
                 return jsonify({"error": f"Title must be at most {MAX_TITLE_LENGTH} characters"}), 400

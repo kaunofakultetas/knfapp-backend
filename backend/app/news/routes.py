@@ -382,7 +382,7 @@ def get_comments(post_id):
 def add_comment(post_id):
     """Add a comment to a post."""
     data = request.get_json()
-    if not data or not data.get("text", "").strip():
+    if not data or not isinstance(data.get("text"), str) or not data["text"].strip():
         return jsonify({"error": "Comment text required"}), 400
 
     comment_text = data["text"].strip()

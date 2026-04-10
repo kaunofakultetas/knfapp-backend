@@ -96,6 +96,9 @@ def validate_invitation_code():
     if not data or not data.get("code"):
         return jsonify({"error": "Code required"}), 400
 
+    if not isinstance(data["code"], str):
+        return jsonify({"error": "Code must be a string"}), 400
+
     db = get_db()
     try:
         invite = db.execute(
@@ -143,6 +146,11 @@ def register():
     missing = [f for f in required if not data.get(f)]
     if missing:
         return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+
+    # Type-safety: all required fields must be strings
+    for field in required:
+        if not isinstance(data[field], str):
+            return jsonify({"error": f"{field} must be a string"}), 400
 
     if len(data["password"]) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
@@ -244,6 +252,9 @@ def login():
 
     if not identifier or not password:
         return jsonify({"error": "Username/email and password required"}), 400
+
+    if not isinstance(identifier, str) or not isinstance(password, str):
+        return jsonify({"error": "Username/email and password must be strings"}), 400
 
     db = get_db()
     try:

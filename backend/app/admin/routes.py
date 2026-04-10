@@ -236,8 +236,13 @@ def send_admin_notification():
     if not data:
         return jsonify({"error": "JSON body required"}), 400
 
-    title = data.get("title", "").strip()
-    body_text = data.get("body", "").strip()
+    raw_title = data.get("title", "")
+    raw_body = data.get("body", "")
+    if not isinstance(raw_title, str) or not isinstance(raw_body, str):
+        return jsonify({"error": "Title and body must be strings"}), 400
+
+    title = raw_title.strip()
+    body_text = raw_body.strip()
 
     if not title or not body_text:
         return jsonify({"error": "Title and body are required"}), 400

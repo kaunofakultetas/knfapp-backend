@@ -159,8 +159,8 @@ def create_conversation():
         return jsonify({"error": "JSON body required"}), 400
 
     participant_ids = data.get("participantIds", [])
-    if not participant_ids:
-        return jsonify({"error": "At least one participant required"}), 400
+    if not isinstance(participant_ids, list) or not participant_ids:
+        return jsonify({"error": "participantIds must be a non-empty array"}), 400
 
     conv_type = data.get("type", "direct")
     title = data.get("title")
@@ -377,7 +377,10 @@ def send_message(conv_id):
     if not data:
         return jsonify({"error": "JSON body required"}), 400
 
-    text = data.get("text", "").strip()
+    raw_text = data.get("text", "")
+    if not isinstance(raw_text, str):
+        return jsonify({"error": "Text must be a string"}), 400
+    text = raw_text.strip()
     image_url = data.get("imageUrl")
 
     if not text and not image_url:
@@ -486,7 +489,12 @@ def react_to_message(conv_id, msg_id):
     if not data or not data.get("emoji"):
         return jsonify({"error": "emoji required"}), 400
 
+    if not isinstance(data["emoji"], str):
+        return jsonify({"error": "emoji must be a string"}), 400
+
     emoji = data["emoji"]
+    if len(emoji) > 32:
+        return jsonify({"error": "emoji too long"}), 400
     db = get_db()
     try:
         # Verify user is participant
