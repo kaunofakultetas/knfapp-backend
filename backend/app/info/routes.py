@@ -1,9 +1,26 @@
-# -*- coding: utf-8 -*-
-"""Faculty information endpoint - contacts, links, hours, FAQ, programs.
+############################################################
+#  [*] Info — faculty handbook: contacts, links, hours, FAQ
+#
+#  The "about the faculty" payload behind the Info screen:
+#  contact groups, quick links, opening hours, study
+#  programs and FAQ, bilingual (lt first, en). FACULTY_INFO
+#  below is the hardcoded fallback; on top of it the route
+#  lays whatever scraper/info_scraper.py stored in the
+#  faculty_info table (migration v4) — scraped contacts and
+#  programs REPLACE the hardcoded lists wholesale, a scraped
+#  general_contact block is added, and links/hours/faq are
+#  always the hardcoded ones because knf.vu.lt has nothing
+#  to scrape for them. The info scraper only ever writes
+#  lang 'lt' (60 s after boot, then every 24 h), so English
+#  is the fallback data, always.
+#
+#  Public, no auth. The app caches the answer on its side
+#  (services/cache.ts, cacheKeyInfo) and refetches on a
+#  language switch.
+#
+#    GET /api/info — the handbook for ?lang, or one ?section
+############################################################
 
-Serves scraped faculty data from knf.vu.lt when available, with fallback
-to hardcoded bilingual data. Language default: lt.
-"""
 
 import json
 
@@ -13,7 +30,34 @@ from app.database import get_db
 
 info_bp = Blueprint("info", __name__)
 
-# Faculty data (bilingual)
+
+
+
+
+
+
+
+############################################################
+# FACULTY_INFO
+############################################################
+#
+# The hardcoded fallback handbook, {lang: {section: ...}},
+# in exactly the shape services/api/info.ts types as
+# FacultyInfoResponse: contacts → [{category, items:
+# [{name, phone?, email?, room?}]}], links [{title, url,
+# icon}], hours [{place, address, schedule, note}],
+# programs [{name, degree, duration}], faq [{q, a}].
+# Lithuanian diacritics are spelled as \u escapes, so the
+# literals decode to the real text but a grep for
+# "Studijų" will NOT find them. Phone numbers, rooms and
+# hours are the pre-scrape defaults — after the first
+# successful info scrape only links/hours/faq (and every
+# section for 'en') still come from this dict. The two
+# language keys double as the ?lang whitelist.
+#
+# Used by:
+#   - get_faculty_info (below) — the base of every answer
+############################################################
 
 FACULTY_INFO = {
     "lt": {
@@ -181,12 +225,33 @@ FACULTY_INFO = {
 }
 
 
-def _get_scraped_info(lang: str) -> dict | None:
-    """Fetch scraped faculty info from the database.
 
-    Returns a dict with scraped sections merged, or None if no scraped
-    data is available.
-    """
+
+
+
+
+
+############################################################
+# _get_scraped_info
+############################################################
+#
+# The faculty_info rows (migration v4, UNIQUE(lang,
+# section)) for one language as {section: decoded
+# data_json}, or None when there are no rows, none of them
+# decode, or the query itself throws — the bare
+# `except Exception` swallows EVERYTHING silently (missing
+# table, locked file), no log line, so a broken query only
+# ever shows up as "the scraped data never appears" while
+# the route keeps answering from the hardcoded dict. A row
+# whose JSON does not parse is skipped, not fatal. Rows are
+# written by scraper/info_scraper.py (_store_info): lang
+# 'lt' only, sections contacts / programs / general_contact.
+#
+# Used by:
+#   - get_faculty_info (below)
+############################################################
+
+def _get_scraped_info(lang: str) -> dict | None:
     db = get_db()
     try:
         rows = db.execute(
@@ -199,6 +264,8 @@ def _get_scraped_info(lang: str) -> dict | None:
         for row in rows:
             try:
                 scraped[row["section"]] = json.loads(row["data_json"])
+            # TypeError would be a NULL data_json — the column is NOT NULL,
+            # so only the JSONDecodeError branch ever fires
             except (json.JSONDecodeError, TypeError):
                 continue
         return scraped if scraped else None
@@ -208,41 +275,70 @@ def _get_scraped_info(lang: str) -> dict | None:
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# get_faculty_info
+############################################################
+#
+# GET /api/info
+#
+# Query: lang=lt|en (anything else silently becomes lt) and
+# an optional section=<key>. The answer is FACULTY_INFO for
+# the language with the scraped faculty_info rows laid over
+# it: scraped "contacts" and "programs" replace the
+# hardcoded lists wholesale when non-empty (no merge — an
+# empty scraped list keeps the fallback), "general_contact"
+# is added when a scrape found one, links/hours/faq stay
+# hardcoded. Returns a plain dict, so Flask jsonifies it.
+#
+# Gotchas:
+#   - info_scraper.py stores lang 'lt' only, so ?lang=en is
+#     always the hardcoded English fallback
+#   - ?section=<unknown> is not an error: the filter is
+#     skipped and the WHOLE handbook comes back. The old
+#     docstring listed "staff" as a section — it is not a
+#     key; info_scraper.py folds staff into contacts
+#   - a matching section answers {section: [...]}, a
+#     different shape from the full payload, so a caller has
+#     to know which one it asked for
+#
+# Used by:
+#   - services/api/info.ts — fetchFacultyInfo (lang only;
+#     nothing in the app sends ?section) → the Info screen
+#   - swagger/swagger.yaml documents both params
+############################################################
+
 @info_bp.route("", methods=["GET"])
 def get_faculty_info():
-    """Return faculty information in the requested language.
-
-    Serves scraped data from knf.vu.lt when available, merged with
-    hardcoded fallback data. Scraped contacts and programs override
-    hardcoded values; links, hours, and FAQ always come from hardcoded
-    data (not available on the website).
-
-    Query params:
-        lang - 'lt' or 'en' (default: 'lt')
-        section - optional, filter to a single section (contacts/links/hours/programs/faq/staff)
-    """
     lang = request.args.get("lang", "lt")
     if lang not in FACULTY_INFO:
         lang = "lt"
 
     section = request.args.get("section")
 
-    # Start with hardcoded data as the base
+    # Shallow copy on purpose: the overlay swaps whole keys, so the
+    # module-level dict is never mutated across requests
     data = dict(FACULTY_INFO[lang])
 
-    # Overlay scraped data where available
     scraped = _get_scraped_info(lang)
     if scraped:
-        # Scraped contacts override hardcoded contacts if we got meaningful data
+        # Replace, never merge — a non-empty scraped list hides the
+        # hardcoded entries completely
         if "contacts" in scraped and scraped["contacts"]:
             data["contacts"] = scraped["contacts"]
-        # Scraped programs override hardcoded programs if we got meaningful data
         if "programs" in scraped and scraped["programs"]:
             data["programs"] = scraped["programs"]
-        # Add general contact info if available
+        # No hardcoded counterpart — the key only exists after a scrape
+        # found one (FacultyInfoResponse types it optional)
         if "general_contact" in scraped:
             data["general_contact"] = scraped["general_contact"]
 
+    # An unknown section is not a 404 — the whole handbook comes back
     if section and section in data:
         return {section: data[section]}
 

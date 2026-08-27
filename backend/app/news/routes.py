@@ -1,4 +1,45 @@
-"""News feed API — unified feed with ranking, likes, comments, polls."""
+############################################################
+#  [*] News — unified feed, posts, likes, comments, polls
+#
+#  One news_posts table carries everything the feed shows:
+#  articles the scrapers pull in (source 'knf.vu.lt' /
+#  'vu.lt', author_id NULL), staff posts ('faculty') and
+#  member wall posts ('user' — the very rows social/routes.py
+#  serves under /api/social/posts and /api/social/feed).
+#  Polls hang off a post (polls / poll_options / poll_votes);
+#  likes and comments keep denormalised counters on the post
+#  row (likes_count / comments_count) next to their own
+#  tables.
+#
+#  Works without login: the reads call get_current_user()
+#  optionally (guests get public rows and liked=False), the
+#  writes sit behind require_auth. Nothing is escaped on the
+#  way IN — text is stored raw and the after_request hook in
+#  app/__init__.py html-escapes every string in the JSON on
+#  the way out (the v1/v2 migration history in
+#  database/__init__.py explains why).
+#
+#  Timestamps this file writes are datetime.utcnow()
+#  .isoformat() (naive UTC, 'T' separator, microseconds —
+#  utcnow() is deprecated since Python 3.12 and the image
+#  runs 3.13, a DeprecationWarning for now); columns left to
+#  their DEFAULT get SQLite's datetime('now') (UTC, space
+#  separator). Both are UTC, so the julianday() ranking and
+#  the poll end-date compare hold, but clients see two
+#  shapes of the same field (comment time, poll vote time).
+#
+#    GET    /api/news                      — ranked feed page
+#    POST   /api/news                      — create a post
+#    GET    /api/news/<post_id>            — one post
+#    DELETE /api/news/<post_id>            — author/admin delete
+#    POST   /api/news/<post_id>/like       — toggle a like
+#    GET    /api/news/<post_id>/comments   — comments page
+#    POST   /api/news/<post_id>/comments   — add a comment
+#    GET    /api/news/<post_id>/poll       — the post's poll
+#    POST   /api/news/<post_id>/poll       — attach a poll
+#    POST   /api/news/<post_id>/poll/vote  — cast/move a vote
+############################################################
+
 
 import uuid
 from datetime import datetime
@@ -6,10 +47,19 @@ from datetime import datetime
 from flask import Blueprint, jsonify, request
 
 from app.api import parse_pagination
+# require_role is a dead import — nothing here gates on a
+# role; create_post derives the post's source from the
+# caller's role instead
 from app.auth.routes import get_current_user, require_auth, require_role
 from app.database import get_db
 
-# Input length limits
+# Hard caps behind the 400s in create_post / add_comment.
+# social/routes.py duplicates the first two for POST
+# /api/social/posts, migration v1 truncated pre-existing rows
+# to them, and the mobile app mirrors them as input maxLength
+# (create-post/index.tsx — content even tighter at 5000 —
+# and components/news/CommentComposer.tsx). Poll titles and
+# option texts have no cap at all.
 MAX_TITLE_LENGTH = 200
 MAX_CONTENT_LENGTH = 10000
 MAX_COMMENT_LENGTH = 2000
@@ -17,8 +67,29 @@ MAX_COMMENT_LENGTH = 2000
 news_bp = Blueprint("news", __name__)
 
 
+
+
+
+
+
+
+############################################################
+# _post_to_dict
+############################################################
+#
+# The wire shape of one news_posts row (camelCase keys — the
+# mobile NewsPost type). NOT included: the viewer's `liked`
+# flag — get_feed adds it per page afterwards, get_post
+# never does, and create_post rebuilds this very dict by
+# hand with liked=False (keep the three in step). `date` is
+# published_at; likes / comments / shares are the
+# denormalised counters on the row, not live COUNT(*)s.
+#
+# Used by:
+#   - get_feed, get_post (below)
+############################################################
+
 def _post_to_dict(row):
-    """Convert a news_posts row to API response dict."""
     return {
         "id": row["id"],
         "title": row["title"],
@@ -38,25 +109,68 @@ def _post_to_dict(row):
     }
 
 
+
+
+
+
+
+
+############################################################
+# get_feed
+############################################################
+#
+# GET /api/news
+#
+# The unified feed, one page at a time: ?page / ?per_page
+# (parse_pagination — default 20, capped at 100, 400 on
+# garbage) and an optional ?source out of app / knf.vu.lt /
+# vu.lt / faculty / user. Who sees what:
+#
+#   guest   is_public = 1 AND source != 'user' — scraped
+#           articles and public faculty posts only. A guest
+#           asking ?source=user gets an empty page (the two
+#           clauses contradict), which is what the mobile
+#           "user" chip yields when logged out.
+#   member  every non-user row regardless of is_public, plus
+#           wall posts by the caller and by the caller's
+#           friendships rows — private ones included.
+#           friendships is written in both directions on
+#           accept (social/routes.py), so one direction is
+#           enough here. Public wall posts of NON-friends
+#           never appear in this feed; /api/social/feed is
+#           where those live.
+#
+# Ranking is computed in SQL — the three score columns are
+# selected for inspection and the ORDER BY repeats the
+# formula instead of referencing them:
+#
+#   recency     100 / (1 + days since published_at) — a
+#               hyperbolic decay, not the exponential one
+#               the old docstring claimed; julianday('now')
+#               is UTC like every stored timestamp
+#   engagement  MIN(likes + 2*comments + 3*shares, 100)
+#               * 0.5 — linear, capped at 50 (SQLite has no
+#               log())
+#   boost       faculty 20, knf.vu.lt 15, vu.lt 10, app 5,
+#               user 0
+#
+# Ties fall back to published_at DESC. The total behind
+# hasMore reuses where_sql with the LIMIT/OFFSET pair sliced
+# off the end of params, so the count and the page can never
+# disagree on the filter.
+#
+# Used by:
+#   - services/api/news.ts fetchNewsFeed —
+#     app/(main)/tabs/news.tsx through hooks/useFeed.ts (the
+#     source chips map straight onto ?source)
+############################################################
+
 @news_bp.route("", methods=["GET"])
 def get_feed():
-    """
-    Unified news feed.
-
-    Query params:
-      - page (int, default 1)
-      - per_page (int, default 20, max 50)
-      - source (str, optional: 'knf.vu.lt', 'vu.lt', 'faculty', 'user', 'app')
-
-    Guest users see: scraped news + public faculty posts.
-    Authenticated users see: all of the above + friend posts + personalized ranking.
-
-    Ranking algorithm:
-      score = recency_score + engagement_score + source_boost
-      - recency_score: exponential decay, halving every 24h
-      - engagement_score: log(likes + comments*2 + shares*3 + 1) * 5
-      - source_boost: faculty/official = +20, knf.vu.lt = +15, vu.lt = +10, user = 0
-    """
+    # STEP 1: pagination, the optional ?source and the optional
+    # caller — a bad ?page / ?per_page is a 400 straight from
+    # parse_pagination
+    # =========================================================
     page, per_page, err = parse_pagination()
     if err:
         return err
@@ -65,9 +179,12 @@ def get_feed():
 
     user = get_current_user()
 
+
+    # STEP 2: assemble the WHERE clause — "1=1" seeds the
+    # AND-join so every extra clause is appended the same way
+    # =======================================================
     db = get_db()
     try:
-        # Build query with ranking
         where_clauses = ["1=1"]
         params = []
 
@@ -76,15 +193,18 @@ def get_feed():
             params.append(source_filter)
 
         if not user:
-            # Guests: only public posts, no user posts from friends
+            # STEP 2.1: guests — public rows only, never wall posts
             where_clauses.append("is_public = 1")
             where_clauses.append("source != 'user'")
         else:
-            # Authenticated: see own posts + friends' posts + all public non-user posts
+            # STEP 2.2: members — own and friends' wall posts join in
             friend_ids = [r["friend_id"] for r in db.execute(
                 "SELECT friend_id FROM friendships WHERE user_id = ?", (user["id"],)
             ).fetchall()]
             visible_ids = [user["id"]] + friend_ids
+            # A ?source naming a non-user source already excludes
+            # wall posts, so the author clause is only needed for
+            # the mixed feed and for ?source=user
             if not source_filter or source_filter == "user":
                 placeholders = ",".join(["?"] * len(visible_ids))
                 where_clauses.append(
@@ -94,8 +214,10 @@ def get_feed():
 
         where_sql = " AND ".join(where_clauses)
 
-        # Ranked query using the scoring algorithm
-        # Note: SQLite lacks log(), so we use a linear engagement score
+
+        # STEP 3: the ranked page — formula in the banner; the
+        # SQL comments inside the string are SQLite's, not ours
+        # =====================================================
         query = f"""
             SELECT *,
                 -- Recency: days since published, exponential-like decay
@@ -130,7 +252,10 @@ def get_feed():
         rows = db.execute(query, params).fetchall()
         posts = [_post_to_dict(row) for row in rows]
 
-        # Add like status
+
+        # STEP 4: the caller's like flag — one IN query for the
+        # whole page; a guest is simply never "liked"
+        # =====================================================
         if user:
             post_ids = [p["id"] for p in posts]
             if post_ids:
@@ -146,7 +271,11 @@ def get_feed():
             for p in posts:
                 p["liked"] = False
 
-        # Total count for pagination
+
+        # STEP 5: total for hasMore — same WHERE, params minus the
+        # trailing LIMIT/OFFSET pair (the len() guard is redundant:
+        # params always ends with exactly those two)
+        # =========================================================
         count_row = db.execute(
             f"SELECT COUNT(*) as total FROM news_posts WHERE {where_sql}",
             params[:-2] if len(params) > 2 else [],
@@ -165,14 +294,53 @@ def get_feed():
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# create_post
+############################################################
+#
+# POST /api/news
+#
+# Creates a post from {content, title?, post_type?,
+# image_url?, is_public?}. There is no role gate — the role
+# picks the source instead: admin / curator / teacher
+# publish as source 'faculty' (post_type defaults to
+# 'announcement'), everyone else as 'user' (defaults to
+# 'social'), the same row shape POST /api/social/posts
+# writes. title falls back to content[:80], summary is
+# always content[:200], source_url stays NULL and
+# published/created/updated_at all get one utcnow() stamp.
+#
+# Validation is thinner than the social twin's: content and
+# title are not type-checked (a non-string value hits
+# .strip() → AttributeError → 500); post_type and image_url
+# are stored as sent — a post_type outside the table's CHECK
+# list ('article', 'social', 'announcement', 'poll', 'link')
+# dies as IntegrityError → 500; is_public is echoed back raw
+# while the row stores 1/0, so a truthy non-bool such as
+# "false" is saved public and echoed as "false". The 201
+# body is _post_to_dict's shape rebuilt by hand plus
+# liked=False.
+#
+# Used by:
+#   - services/api/news.ts createPost —
+#     app/(main)/create-post/index.tsx (content, title,
+#     image_url from uploadImageApi, is_public); a poll is
+#     attached by a follow-up POST .../poll (create_poll)
+############################################################
+
 @news_bp.route("", methods=["POST"])
 @require_auth
 def create_post():
-    """
-    Create a news post.
-    Faculty staff (admin, curator, teacher) can create faculty/announcement posts.
-    Students can create user/social posts (same as social/posts endpoint).
-    """
+    # STEP 1: body checks — content required, title optional,
+    # both capped (400s); no escaping here, the after_request
+    # hook escapes on output
+    # =======================================================
     data = request.get_json()
     if not data:
         return jsonify({"error": "JSON body required"}), 400
@@ -183,20 +351,20 @@ def create_post():
 
     title = (data.get("title") or "").strip() or content[:80]
 
-    # Input length validation
     if len(title) > MAX_TITLE_LENGTH:
         return jsonify({"error": f"Title must be at most {MAX_TITLE_LENGTH} characters"}), 400
     if len(content) > MAX_CONTENT_LENGTH:
         return jsonify({"error": f"Content must be at most {MAX_CONTENT_LENGTH} characters"}), 400
 
-    # NOTE: XSS protection handled by after_request output escaping
 
+    # STEP 2: the caller's role decides the source; post_type
+    # only gets a default when the client sent none
+    # =======================================================
     role = request.user["role"]
     post_type = data.get("post_type")
     image_url = data.get("image_url")
     is_public = data.get("is_public", True)
 
-    # Determine source based on role
     if role in ("admin", "curator", "teacher"):
         source = "faculty"
         if not post_type:
@@ -206,6 +374,9 @@ def create_post():
         if not post_type:
             post_type = "social"
 
+
+    # STEP 3: insert and echo the row back as a 201
+    # =============================================
     post_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
 
@@ -243,9 +414,36 @@ def create_post():
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# get_post
+############################################################
+#
+# GET /api/news/<post_id>
+#
+# One post by id. A private wall post (is_public = 0 AND
+# source = 'user') is served only to its author and the
+# author's friends; everyone else, guests included, gets the
+# same 404 as for a missing id, so existence never leaks. A
+# private NON-user post (faculty with is_public = 0) has no
+# such check and is served to anyone, although get_feed
+# hides it from guests. The body is _post_to_dict only — no
+# `liked` flag — the mobile detail screen carries like state
+# over from the feed item it was opened from.
+#
+# Used by:
+#   - services/api/news.ts fetchNewsPost —
+#     app/(main)/news-post/index.tsx (opened from the feed
+#     and from profile/index.tsx)
+############################################################
+
 @news_bp.route("/<post_id>", methods=["GET"])
 def get_post(post_id):
-    """Get a single post by ID. Non-public posts require authentication and friendship."""
     user = get_current_user()
     db = get_db()
     try:
@@ -253,7 +451,9 @@ def get_post(post_id):
         if not row:
             return jsonify({"error": "Post not found"}), 404
 
-        # Non-public posts only visible to author or friends
+        # Private wall posts: author and friends only. The 404 (not
+        # 403) is deliberate — a stranger cannot tell "private"
+        # from "missing"
         if not row["is_public"] and row["source"] == "user":
             if not user:
                 return jsonify({"error": "Post not found"}), 404
@@ -270,13 +470,40 @@ def get_post(post_id):
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# delete_post
+############################################################
+#
+# DELETE /api/news/<post_id>
+#
+# Removes a post when the caller is its author or an admin
+# (403 otherwise — scraped articles have author_id NULL, so
+# only an admin can drop those). Likes, comments, the poll
+# and its votes/options are deleted by hand before the post
+# row; the schema's ON DELETE CASCADE (get_db turns
+# foreign_keys on) would do the same, so the manual sweep is
+# belt and braces — DELETE /api/social/posts/<id> in
+# social/routes.py trusts the cascade alone.
+#
+# Used by:
+#   - nothing calls this at the moment — the mobile app
+#     deletes wall posts through services/api/social.ts
+#     deletePost → DELETE /api/social/posts/<id>; only
+#     swagger/swagger.yaml documents this one
+############################################################
+
 @news_bp.route("/<post_id>", methods=["DELETE"])
 @require_auth
 def delete_post(post_id):
-    """
-    Delete a news post. Only the post author or an admin can delete.
-    Also cleans up related likes, comments, polls, and poll votes.
-    """
+    # STEP 1: the post must exist and the caller must be its
+    # author or an admin
+    # ======================================================
     db = get_db()
     try:
         post = db.execute("SELECT id, author_id FROM news_posts WHERE id = ?", (post_id,)).fetchone()
@@ -287,17 +514,23 @@ def delete_post(post_id):
         if post["author_id"] != user["id"] and user["role"] != "admin":
             return jsonify({"error": "Only the post author or an admin can delete this post"}), 403
 
-        # Clean up related data
+
+        # STEP 2: dependants first — likes, comments, then the poll
+        # with its votes and options (the cascade would do this
+        # too, see the banner)
+        # =========================================================
         db.execute("DELETE FROM news_likes WHERE post_id = ?", (post_id,))
         db.execute("DELETE FROM news_comments WHERE post_id = ?", (post_id,))
 
-        # Clean up polls if any
         poll = db.execute("SELECT id FROM polls WHERE post_id = ?", (post_id,)).fetchone()
         if poll:
             db.execute("DELETE FROM poll_votes WHERE poll_id = ?", (poll["id"],))
             db.execute("DELETE FROM poll_options WHERE poll_id = ?", (poll["id"],))
             db.execute("DELETE FROM polls WHERE id = ?", (poll["id"],))
 
+
+        # STEP 3: the post row itself, one commit for the lot
+        # ===================================================
         db.execute("DELETE FROM news_posts WHERE id = ?", (post_id,))
         db.commit()
 
@@ -306,10 +539,36 @@ def delete_post(post_id):
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# toggle_like
+############################################################
+#
+# POST /api/news/<post_id>/like
+#
+# Flips the caller's like on a post: a news_likes row (PK
+# user_id + post_id) is inserted or deleted and
+# news_posts.likes_count moves with it, floored at 0 on the
+# way down. The count in the reply is re-read after the
+# commit, so it includes likes other users landed meanwhile.
+# Two toggles from the same user racing each other can both
+# miss the SELECT and collide on the PK at INSERT →
+# IntegrityError → 500.
+#
+# Used by:
+#   - services/api/news.ts toggleLikeApi —
+#     app/(main)/tabs/news.tsx (feed heart, optimistic) and
+#     app/(main)/news-post/index.tsx (detail heart)
+############################################################
+
 @news_bp.route("/<post_id>/like", methods=["POST"])
 @require_auth
 def toggle_like(post_id):
-    """Toggle like on a post."""
     db = get_db()
     try:
         post = db.execute("SELECT id FROM news_posts WHERE id = ?", (post_id,)).fetchone()
@@ -322,6 +581,8 @@ def toggle_like(post_id):
         ).fetchone()
 
         if existing:
+            # MAX(0, …) keeps a counter that drifted below the real
+            # number of like rows from going negative
             db.execute("DELETE FROM news_likes WHERE user_id = ? AND post_id = ?", (request.user["id"], post_id))
             db.execute("UPDATE news_posts SET likes_count = MAX(0, likes_count - 1) WHERE id = ?", (post_id,))
             liked = False
@@ -331,6 +592,8 @@ def toggle_like(post_id):
             liked = True
 
         db.commit()
+        # Re-read after the commit — the reply carries the real
+        # counter, not a likes±1 computed locally
         count = db.execute("SELECT likes_count FROM news_posts WHERE id = ?", (post_id,)).fetchone()["likes_count"]
 
         return jsonify({"liked": liked, "likes": count})
@@ -338,9 +601,36 @@ def toggle_like(post_id):
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# get_comments
+############################################################
+#
+# GET /api/news/<post_id>/comments
+#
+# One page of a post's comments, newest first, joined to
+# users for the author's name and avatar (?page / ?per_page
+# as in get_feed). The post itself is never looked up: an
+# unknown id answers an empty page with total 0, not a 404.
+# `time` is news_comments.created_at exactly as SQLite wrote
+# it via the column default (datetime('now') — "YYYY-MM-DD
+# HH:MM:SS", UTC), a different shape from the isoformat()
+# value add_comment echoes; the mobile app formats both
+# locally and never displays the raw string.
+#
+# Used by:
+#   - services/api/news.ts fetchComments —
+#     app/(main)/news-comments/index.tsx (full thread) and
+#     app/(main)/news-post/index.tsx (inline preview)
+############################################################
+
 @news_bp.route("/<post_id>/comments", methods=["GET"])
 def get_comments(post_id):
-    """Get comments for a post."""
     page, per_page, err = parse_pagination()
     if err:
         return err
@@ -377,21 +667,45 @@ def get_comments(post_id):
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# add_comment
+############################################################
+#
+# POST /api/news/<post_id>/comments
+#
+# Appends {text} to a post — a non-blank string of at most
+# MAX_COMMENT_LENGTH (400 otherwise, 404 for an unknown
+# post) — and bumps news_posts.comments_count, which nothing
+# ever decrements (there is no delete-comment route). The
+# 201 body is built from request.user, and its `time` is a
+# utcnow().isoformat() taken AFTER the insert, not the
+# created_at SQLite stored through the column default (see
+# get_comments for that shape).
+#
+# Used by:
+#   - services/api/news.ts addCommentApi —
+#     app/(main)/news-comments/index.tsx and
+#     app/(main)/news-post/index.tsx (both via
+#     components/news/CommentComposer.tsx)
+############################################################
+
 @news_bp.route("/<post_id>/comments", methods=["POST"])
 @require_auth
 def add_comment(post_id):
-    """Add a comment to a post."""
     data = request.get_json()
     if not data or not isinstance(data.get("text"), str) or not data["text"].strip():
         return jsonify({"error": "Comment text required"}), 400
 
     comment_text = data["text"].strip()
 
-    # Input length validation
     if len(comment_text) > MAX_COMMENT_LENGTH:
         return jsonify({"error": f"Comment must be at most {MAX_COMMENT_LENGTH} characters"}), 400
-
-    # NOTE: XSS protection handled by after_request output escaping
 
     db = get_db()
     try:
@@ -400,6 +714,8 @@ def add_comment(post_id):
             return jsonify({"error": "Post not found"}), 404
 
         comment_id = str(uuid.uuid4())
+        # created_at is left to the column default — the reply's
+        # `time` below is a separate clock read
         db.execute(
             "INSERT INTO news_comments (id, post_id, user_id, text) VALUES (?, ?, ?, ?)",
             (comment_id, post_id, request.user["id"], comment_text),
@@ -419,11 +735,28 @@ def add_comment(post_id):
         db.close()
 
 
-# ── Polls ────────────────────────────────────────────────────────────────────
 
+
+
+
+
+
+############################################################
+# _poll_to_dict
+############################################################
+#
+# The wire shape of a polls row plus its options (the mobile
+# PollResponse): options come back in rowid order — the
+# order the creator sent them — and userVote is the caller's
+# poll_votes.option_id, or None when no user_id was given or
+# they have not voted. Runs two more queries on the caller's
+# open connection.
+#
+# Used by:
+#   - get_poll, create_poll, vote_poll (below)
+############################################################
 
 def _poll_to_dict(db, poll_row, user_id=None):
-    """Convert a poll + its options into an API response dict."""
     poll_id = poll_row["id"]
     options = db.execute(
         "SELECT id, text, votes FROM poll_options WHERE poll_id = ? ORDER BY rowid",
@@ -454,9 +787,32 @@ def _poll_to_dict(db, poll_row, user_id=None):
     }
 
 
+
+
+
+
+
+
+############################################################
+# get_poll
+############################################################
+#
+# GET /api/news/<post_id>/poll
+#
+# The poll attached to a post, with the caller's own vote
+# when logged in. 404 when the post has no poll — the mobile
+# fetchPoll turns exactly that status into null and rethrows
+# everything else — and the same 404 for an unknown post,
+# since the post is never looked up separately.
+#
+# Used by:
+#   - services/api/news.ts fetchPoll —
+#     components/news/PollWidget.tsx (initial load, and the
+#     refetch votePollApi does after a 409)
+############################################################
+
 @news_bp.route("/<post_id>/poll", methods=["GET"])
 def get_poll(post_id):
-    """Get the poll attached to a post, if any."""
     user = get_current_user()
     db = get_db()
     try:
@@ -468,10 +824,44 @@ def get_poll(post_id):
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# create_poll
+############################################################
+#
+# POST /api/news/<post_id>/poll
+#
+# Attaches a poll {title, options[], end_date?} to an
+# existing post — author or admin only (403), one poll per
+# post (409) — and flips the post's post_type to 'poll'
+# whatever it was before. The checks are shallow: options is
+# only len()-checked (2..10) — a string passes and is then
+# iterated character by character, a dict yields its keys —
+# blank entries are dropped silently AFTER that check, so a
+# poll can end up with fewer than two options; title and
+# option text have no length cap; end_date is stored
+# verbatim (vote_poll parses it with fromisoformat and
+# treats an unparseable value as "never ends"). Nothing
+# restricts the post's source, so an admin can hang a poll
+# on a scraped article.
+#
+# Used by:
+#   - services/api/news.ts createPollApi —
+#     app/(main)/create-post/index.tsx, right after
+#     createPost (with a retry prompt when this call fails)
+############################################################
+
 @news_bp.route("/<post_id>/poll", methods=["POST"])
 @require_auth
 def create_poll(post_id):
-    """Create a poll on an existing post. Only the post author or admin can do this."""
+    # STEP 1: body checks — title required, 2..10 options; only
+    # len() is looked at, see the banner for what slips through
+    # =========================================================
     data = request.get_json()
     if not data:
         return jsonify({"error": "JSON body required"}), 400
@@ -487,22 +877,28 @@ def create_poll(post_id):
     if len(options) > 10:
         return jsonify({"error": "Maximum 10 options allowed"}), 400
 
+
+    # STEP 2: the post must exist, the caller must own it (or
+    # be admin), and it must not have a poll yet
+    # =======================================================
     db = get_db()
     try:
         post = db.execute("SELECT id, author_id FROM news_posts WHERE id = ?", (post_id,)).fetchone()
         if not post:
             return jsonify({"error": "Post not found"}), 404
 
-        # Only author or admin can create polls
         user = request.user
         if post["author_id"] != user["id"] and user["role"] != "admin":
             return jsonify({"error": "Only the post author or admin can create a poll"}), 403
 
-        # Check no poll already exists
         existing = db.execute("SELECT id FROM polls WHERE post_id = ?", (post_id,)).fetchone()
         if existing:
             return jsonify({"error": "Post already has a poll"}), 409
 
+
+        # STEP 3: the poll row, then one poll_options row per
+        # non-blank option — blank ones vanish without a 400
+        # ===================================================
         poll_id = str(uuid.uuid4())
         now = datetime.utcnow().isoformat()
 
@@ -520,7 +916,11 @@ def create_poll(post_id):
                     (opt_id, poll_id, opt_text),
                 )
 
-        # Update post type to poll
+
+        # STEP 4: the post becomes a 'poll' post whatever it was,
+        # then commit and answer with the fresh poll (userVote
+        # None, 201)
+        # =======================================================
         db.execute("UPDATE news_posts SET post_type = 'poll' WHERE id = ?", (post_id,))
         db.commit()
 
@@ -530,10 +930,46 @@ def create_poll(post_id):
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# vote_poll
+############################################################
+#
+# POST /api/news/<post_id>/poll/vote
+#
+# Casts or moves the caller's vote {option_id} on the post's
+# poll — one poll_votes row per (user_id, poll_id). A first
+# vote bumps the option's votes AND polls.total_votes; a
+# change moves one vote between options and leaves
+# total_votes alone (still one voter); re-voting the option
+# already held is a 409, which the mobile votePollApi treats
+# as a no-op and answers with a refetched poll.
+#
+# The end-date gate compares a naive end_date with utcnow():
+# an offset in the stored string is DROPPED, not converted,
+# so "…+03:00" closes three hours late; a value that
+# fromisoformat cannot parse is swallowed (ValueError →
+# pass) and that poll never closes. On a vote change
+# created_at is rewritten as isoformat() ('T' shape) while
+# the insert path keeps the column default (space shape) —
+# two formats in one column.
+#
+# Used by:
+#   - services/api/news.ts votePollApi —
+#     components/news/PollWidget.tsx (option tap)
+############################################################
+
 @news_bp.route("/<post_id>/poll/vote", methods=["POST"])
 @require_auth
 def vote_poll(post_id):
-    """Vote on a poll. One vote per user per poll."""
+    # STEP 1: body — option_id is the only field, and it must be
+    # truthy
+    # ==========================================================
     data = request.get_json()
     if not data or not data.get("option_id"):
         return jsonify({"error": "option_id required"}), 400
@@ -541,6 +977,10 @@ def vote_poll(post_id):
     option_id = data["option_id"]
     user_id = request.user["id"]
 
+
+    # STEP 2: the poll, then its end-date gate (banner: naive
+    # compare, unparseable = open forever)
+    # =======================================================
     db = get_db()
     try:
         poll = db.execute("SELECT * FROM polls WHERE post_id = ?", (post_id,)).fetchone()
@@ -549,7 +989,6 @@ def vote_poll(post_id):
 
         poll_id = poll["id"]
 
-        # Check end date
         if poll["end_date"]:
             try:
                 end = datetime.fromisoformat(poll["end_date"]).replace(tzinfo=None)
@@ -558,7 +997,10 @@ def vote_poll(post_id):
             except ValueError:
                 pass
 
-        # Validate option belongs to this poll
+
+        # STEP 3: the option must belong to THIS poll — a foreign
+        # option id is a plain 400
+        # =======================================================
         option = db.execute(
             "SELECT id FROM poll_options WHERE id = ? AND poll_id = ?",
             (option_id, poll_id),
@@ -566,7 +1008,9 @@ def vote_poll(post_id):
         if not option:
             return jsonify({"error": "Invalid option"}), 400
 
-        # Check for existing vote
+
+        # STEP 4: cast or move — the same option twice is a 409
+        # =====================================================
         existing = db.execute(
             "SELECT option_id FROM poll_votes WHERE user_id = ? AND poll_id = ?",
             (user_id, poll_id),
@@ -575,7 +1019,7 @@ def vote_poll(post_id):
         if existing:
             if existing["option_id"] == option_id:
                 return jsonify({"error": "Already voted for this option"}), 409
-            # Change vote: decrement old, increment new
+            # STEP 4.1: move — old option down (floored at 0), new one up, total untouched
             db.execute(
                 "UPDATE poll_options SET votes = MAX(0, votes - 1) WHERE id = ?",
                 (existing["option_id"],),
@@ -589,7 +1033,7 @@ def vote_poll(post_id):
                 (option_id, datetime.utcnow().isoformat(), user_id, poll_id),
             )
         else:
-            # New vote
+            # STEP 4.2: first vote — the option and total_votes both go up
             db.execute(
                 "INSERT INTO poll_votes (user_id, poll_id, option_id) VALUES (?, ?, ?)",
                 (user_id, poll_id, option_id),
@@ -603,6 +1047,9 @@ def vote_poll(post_id):
                 (poll_id,),
             )
 
+
+        # STEP 5: commit and answer with the fresh poll state
+        # ===================================================
         db.commit()
 
         poll = db.execute("SELECT * FROM polls WHERE id = ?", (poll_id,)).fetchone()

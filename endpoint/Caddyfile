@@ -10,6 +10,15 @@
         }
 
 
+        # Socket.IO realtime chat (same Flask backend; Caddy
+        # passes WebSocket upgrades through automatically)
+        handle /socket.io/* {
+            reverse_proxy knfapp-backend:8000 {
+                header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+            }
+        }
+
+
         # Swagger UI
         handle /swagger* {
             reverse_proxy knfapp-swagger:8080

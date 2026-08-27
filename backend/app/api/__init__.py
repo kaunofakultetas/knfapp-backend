@@ -1,24 +1,56 @@
-"""Shared API utilities."""
+############################################################
+#  [*] API — helpers shared by the JSON route modules
+#
+#  One helper so far: parse_pagination, the page/per_page
+#  query-string parser the feed-style GET routes share. It
+#  answers a ready-made (response, 400) tuple instead of
+#  raising, so a route does
+#
+#    page, per_page, err = parse_pagination()
+#    if err:
+#        return err
+#
+#  and Flask accepts the tuple as the return value as-is.
+############################################################
+
 
 from flask import jsonify, request
 
 
+
+
+
+
+
+
+############################################################
+# parse_pagination
+############################################################
+#
+# Reads ?page= and ?per_page= from request.args and returns
+# (page, per_page, None) or (None, None, (response, 400)).
+# page must be an int >= 1 and is capped at 10 000 so the
+# OFFSET the callers build from it stays sane; per_page must
+# be an int >= 1 and is silently CLAMPED to max_per_page
+# rather than rejected. Absent params fall back to page 1
+# and default_per_page. int() accepts "+3" and " 3 " but not
+# "3.0"; the TypeError branches are unreachable, args values
+# are always str. Every caller today runs with the defaults
+# (max 100, default 20).
+#
+# Used by:
+#   - news/routes.py — get_feed, get_comments
+#   - social/routes.py — social_feed, get_user_posts
+############################################################
+
 def parse_pagination(max_per_page=100, default_per_page=20):
-    """Parse and validate pagination query params.
-
-    Returns (page, per_page, error_response) where error_response is
-    a (response, status_code) tuple if validation failed, or None on success.
-
-    Usage::
-
-        page, per_page, err = parse_pagination()
-        if err:
-            return err
-    """
     raw_page = request.args.get("page")
     raw_per_page = request.args.get("per_page")
 
-    # Validate page (cap at 10000 to prevent absurd OFFSET values)
+
+    # STEP 1: page — positive int, capped so OFFSET stays sane
+    # ========================================================
+    # Re-bound on every call; a module constant would do the same job
     _MAX_PAGE = 10_000
     if raw_page is not None:
         try:
@@ -32,7 +64,10 @@ def parse_pagination(max_per_page=100, default_per_page=20):
     else:
         page = 1
 
-    # Validate per_page
+
+    # STEP 2: per_page — positive int, clamped (not rejected) above
+    # max_per_page
+    # =============================================================
     if raw_per_page is not None:
         try:
             per_page = int(raw_per_page)

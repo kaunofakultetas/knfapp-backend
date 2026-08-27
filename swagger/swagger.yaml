@@ -119,6 +119,8 @@ paths:
                 $ref: "#/components/schemas/AuthResponse"
         "401":
           description: Invalid credentials
+        "403":
+          description: Account deactivated by an administrator (checked after the password, so only the account holder learns it)
 
   /auth/validate-code:
     post:
@@ -688,6 +690,24 @@ paths:
                       $ref: "#/components/schemas/Message"
                   hasMore:
                     type: boolean
+                  participants:
+                    type: array
+                    description: Every member of the conversation (portraits for the room header)
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                        displayName: {type: string}
+                        avatarUrl: {type: string, nullable: true}
+                  conversation:
+                    type: object
+                    nullable: true
+                    description: The conversation row (type/title for rooms opened without route params)
+                    properties:
+                      id: {type: string}
+                      type: {type: string, enum: [direct, group]}
+                      title: {type: string, nullable: true}
+                      avatarEmoji: {type: string, nullable: true}
         "403":
           description: Not a participant
     post:
@@ -712,6 +732,9 @@ paths:
                   type: string
                 imageUrl:
                   type: string
+                replyToId:
+                  type: string
+                  description: Id of a message in the same conversation to quote (400 if it is not)
       responses:
         "201":
           description: Message sent
@@ -773,6 +796,32 @@ paths:
         "403":
           description: Not a participant
 
+  /chat/conversations/{convId}/messages/{msgId}:
+    delete:
+      tags: [chat]
+      summary: Unsend (soft-delete) your own message
+      description: Clears the text/image, drops reactions and sets deletedAt; the row stays so replies keep their target. Broadcasts the message_deleted socket event.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: msgId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Unsent (also 200 when it already was)
+        "403":
+          description: Not the sender
+        "404":
+          description: Message not found in this conversation
+
   /chat/conversations/{convId}/messages/{msgId}/react:
     post:
       tags: [chat]
@@ -802,7 +851,29 @@ paths:
                   type: string
       responses:
         "200":
-          description: Reaction set
+          description: Reaction set. `reactions` is the authoritative list after the change (also broadcast as the reaction_update socket event)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  emoji:
+                    type: string
+                  reactions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        emoji:
+                          type: string
+                        count:
+                          type: integer
+                        byUserIds:
+                          type: array
+                          items:
+                            type: string
     delete:
       tags: [chat]
       summary: Remove reaction from a message
@@ -1326,7 +1397,7 @@ paths:
         - bearerAuth: []
       responses:
         "200":
-          description: User list
+          description: User list. Each user carries `active` (false = deactivated; such users cannot log in and their sessions are rejected)
 
   /admin/users/{userId}:
     patch:
@@ -1353,7 +1424,7 @@ paths:
                   type: boolean
       responses:
         "200":
-          description: Updated user
+          description: Updated user, including the resulting `active` flag
         "400":
           description: Invalid role or nothing to update
         "404":

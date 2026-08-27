@@ -1,6 +1,6 @@
 #!/bin/bash
 
-mkdir -p ./_DATA/backend
+mkdir -p ./_DATA/backend ./_DATA/backups
 
 
 sudo docker-compose down

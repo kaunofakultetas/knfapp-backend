@@ -1,4 +1,32 @@
-"""Schedule/timetable API."""
+############################################################
+#  [*] Schedule — the lecture timetable API
+#
+#  Read side of schedule_lessons: the filtered lesson list
+#  and the distinct group/semester values behind the mobile
+#  filter sheet. No login on the reads — the timetable is
+#  the app's "works without an account" screen; only the
+#  demo seed is admin-gated.
+#
+#  Who writes the table: scraper/schedule_scraper.py
+#  (scrape_knf_schedule — 30 s after boot and every 6 h via
+#  scraper/scheduler.py, or POST /api/scraper/schedule),
+#  database/__init__.py _seed_defaults (11 first-boot rows
+#  for ISKS-1 under the odd label "2025-pavasaris"), and
+#  seed_schedule below. Nothing ever deletes rows: stale
+#  semesters accumulate, and the /seed fixtures stack up
+#  again on every call.
+#
+#  Times are "HH:MM" wall-clock strings, day_of_week is
+#  0 = Monday … 6 = Sunday (a CHECK on the table), and
+#  semester labels follow the scraper's "YYYY-P" (spring)
+#  / "YYYY-R" (autumn) shape. The JSON is camelCased:
+#  group_name → group, time_start → timeStart.
+#
+#    GET  /api/schedule         — lessons, optionally filtered
+#    GET  /api/schedule/filters — distinct groups + semesters
+#    POST /api/schedule/seed    — 31 demo lessons (admin)
+############################################################
+
 
 from flask import Blueprint, jsonify, request
 
@@ -8,21 +36,48 @@ from app.database import get_db
 schedule_bp = Blueprint("schedule", __name__)
 
 
+
+
+
+
+
+
+############################################################
+# get_schedule
+############################################################
+#
+# GET /api/schedule
+#
+# Query ?day=0..6&group=ISKS-1&semester=2025-P — every one
+# optional, so no params returns the WHOLE table (all days,
+# all groups). day must parse as an int in 0..6 or it is a
+# 400; group/semester are exact string matches, and an
+# empty value counts as "no filter". The WHERE clause is
+# assembled with an f-string, but only from fixed
+# "column = ?" fragments — every user value is bound, and
+# "1=1" stands in when nothing is filtered.
+#
+# Rows come ORDER BY time_start alone: the "HH:MM" strings
+# are zero-padded, so the text sort is chronological, but
+# an unfiltered call has no day ordering — the client
+# groups by dayOfWeek itself.
+#
+# Used by:
+#   - services/api/schedule.ts — fetchSchedule, called from
+#     app/(main)/tabs/schedule.tsx with the selected day and
+#     the group/semester picks
+#   - swagger/swagger.yaml documents it
+############################################################
+
 @schedule_bp.route("", methods=["GET"])
 def get_schedule():
-    """
-    Get schedule for a given day.
-
-    Query params:
-      - day (int, 0=Monday..6=Sunday)
-      - group (str, optional filter by group)
-      - semester (str, optional filter by semester)
-    """
+    # STEP 1: read the filters — only day needs parsing, and
+    # a bad one is refused before any DB work
+    # ======================================================
     day_raw = request.args.get("day")
     group = request.args.get("group")
     semester = request.args.get("semester")
 
-    # Validate day param if provided
     day = None
     if day_raw is not None:
         try:
@@ -32,6 +87,10 @@ def get_schedule():
         if day < 0 or day > 6:
             return jsonify({"error": "Parameter 'day' must be between 0 (Monday) and 6 (Sunday)"}), 400
 
+
+    # STEP 2: assemble the WHERE from fixed fragments — the
+    # values themselves are always bound parameters
+    # =====================================================
     db = get_db()
     try:
         where = []
@@ -49,6 +108,11 @@ def get_schedule():
 
         where_sql = " AND ".join(where) if where else "1=1"
 
+
+        # STEP 3: fetch and camelCase — time_start sorts as
+        # text, chronological only because every writer
+        # zero-pads the hour
+        # =================================================
         rows = db.execute(
             f"""SELECT * FROM schedule_lessons
                 WHERE {where_sql}
@@ -76,14 +140,35 @@ def get_schedule():
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# get_schedule_filters
+############################################################
+#
+# GET /api/schedule/filters
+#
+# {"groups": [...], "semesters": [...]} — DISTINCT non-NULL
+# values straight off schedule_lessons, groups ascending
+# and semesters descending. Both are plain text sorts under
+# SQLite's BINARY collation, so newest-first holds inside
+# the "YYYY-P"/"YYYY-R" family, but the first-boot label
+# "2025-pavasaris" (lowercase p outranks every capital)
+# sorts ABOVE "2025-R" and "2025-P" for as long as those
+# seed rows exist.
+#
+# Used by:
+#   - services/api/schedule.ts — fetchScheduleFilters, the
+#     group/semester pickers in app/(main)/tabs/schedule.tsx
+#   - swagger/swagger.yaml documents it
+############################################################
+
 @schedule_bp.route("/filters", methods=["GET"])
 def get_schedule_filters():
-    """
-    Get available groups and semesters for the schedule filter UI.
-
-    Returns:
-      { "groups": ["ISKS-1", ...], "semesters": ["2025-P", ...] }
-    """
     db = get_db()
     try:
         groups = [
@@ -103,10 +188,50 @@ def get_schedule_filters():
         db.close()
 
 
+
+
+
+
+
+
+############################################################
+# seed_schedule
+############################################################
+#
+# POST /api/schedule/seed
+#
+# Admin-only development fixture: 31 hard-coded lessons —
+# ISKS-1 (11), ISKS-2 (8) and VVB-1 (7) for spring "2025-P"
+# plus 5 ISKS-1 rows for autumn "2025-R" — each inserted
+# under a fresh uuid4. Answers {"message": "Seeded 31
+# lessons"}.
+#
+# Gotchas:
+#   - INSERT OR IGNORE only guards the primary key, and the
+#     key is minted per call, so nothing is ever ignored:
+#     every POST appends all 31 rows again, duplicates and
+#     all, and no route deletes them.
+#   - the labels DO match the scraper's "YYYY-P"/"YYYY-R"
+#     format, so these rows blend into the real filter
+#     values; the first-boot _seed_defaults set (semester
+#     "2025-pavasaris") is a separate, unrelated fixture.
+#   - the scraper's own dedupe compares all eight columns,
+#     so it neither collides with nor cleans up these rows.
+#
+# Used by:
+#   - nothing calls this at the moment — not the mobile app,
+#     not swagger, no main.py flag; it is a manual curl with
+#     an admin bearer token
+############################################################
+
 @schedule_bp.route("/seed", methods=["POST"])
 @require_role("admin")
 def seed_schedule():
-    """Seed the schedule with demo data (for development)."""
+    # STEP 1: the fixture — tuple order is (title, teacher,
+    # room, time_start, time_end, day_of_week, group,
+    # semester); uuid is a local import, nothing else in the
+    # module needs it
+    # ======================================================
     import uuid
 
     demo_lessons = [
@@ -147,6 +272,10 @@ def seed_schedule():
         ("Matematinė analizė (Prat.)", "Prof. V. Matulis", "105", "10:15", "11:45", 3, "ISKS-1", "2025-R"),
     ]
 
+
+    # STEP 2: insert under per-row uuid4 ids and one commit —
+    # see the banner on why OR IGNORE never ignores anything
+    # =======================================================
     db = get_db()
     try:
         for lesson in demo_lessons:
