@@ -1,0 +1,31 @@
+# -----------------------------------------------------------
+#  [*] Coverage configuration
+#
+#  `--cov=app` would otherwise measure app/tests/ as well —
+#  the suite grading itself, which buries the number that
+#  matters (how much of the SHIPPED code runs) under tens of
+#  thousands of test statements.
+#
+#  parallel/concurrency are set for pytest-xdist: each worker
+#  writes its own data file and `combine` merges them, without
+#  which a parallel run reports only the last worker's slice.
+# -----------------------------------------------------------
+
+[run]
+source = app
+branch = True
+parallel = True
+concurrency = thread
+omit =
+    app/tests/*
+    */__pycache__/*
+
+[report]
+# A line the suite cannot reach is either dead code or needs a
+# pragma with a stated reason — see TESTPLAN.md
+show_missing = True
+skip_covered = True
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+    raise NotImplementedError

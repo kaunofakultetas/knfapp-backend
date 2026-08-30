@@ -1,11 +1,44 @@
+############################################################
+#  [*] Caddyfile — the knfapp public ingress (knfapp-caddy)
+#
+#  One :80 site behind the hosting proxy that terminates TLS.
+#  Everything the outside world reaches goes through here:
+#
+#    /api/*       → knfapp-backend:8000   (Flask REST)
+#    /socket.io/* → knfapp-backend:8000   (polling chat)
+#    /swagger*    → knfapp-swagger:8080   (published contract)
+#    /dbgate/*    → knfapp-dbgate:3000    (admin DB console)
+#    everything   → knfapp-mobile:8081    (Expo web app)
+#
+#  Trust model — X-Forwarded-For is NOT echoed from the client
+#  any more. Caddy appends the real peer address itself, so the
+#  last hop Flask's ProxyFix(x_for=1) reads is trustworthy and
+#  the auth rate-limit buckets cannot be poisoned with a
+#  spoofed header. X-Forwarded-Prefix is stripped on both
+#  backend hops: nothing here sets it and ProxyFix must not
+#  trust a client-supplied one.
+############################################################
+
 :80 {
+    # Every upstream benefits: JSON list payloads, socket.io
+    # polling frames and the swagger bundle all cross the wire
+    # compressed
+    encode zstd gzip
+
     route {
 
 
         # API backend
         handle /api/* {
+            # Oversized bodies die here instead of filling the
+            # backend's /tmp tmpfs; matches Flask's own
+            # MAX_CONTENT_LENGTH (6 MB = 5 MB image + multipart
+            # envelope)
+            request_body {
+                max_size 6MB
+            }
             reverse_proxy knfapp-backend:8000 {
-                header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+                header_up -X-Forwarded-Prefix
             }
         }
 
@@ -14,24 +47,52 @@
         # passes WebSocket upgrades through automatically)
         handle /socket.io/* {
             reverse_proxy knfapp-backend:8000 {
-                header_up X-Forwarded-For {http.request.header.X-Forwarded-For}
+                header_up -X-Forwarded-Prefix
             }
         }
 
 
         # Swagger UI
         handle /swagger* {
+            header {
+                X-Frame-Options "DENY"
+                X-Content-Type-Options "nosniff"
+                Referrer-Policy "strict-origin-when-cross-origin"
+            }
             reverse_proxy knfapp-swagger:8080
         }
 
 
-        # DbGate
+        # DbGate — an admin DB console on the public origin, so
+        # the ingress asks for credentials before DbGate's own
+        # single shared login is even reachable. The hash comes
+        # from the environment (compose passes
+        # DBGATE_BASIC_AUTH_HASH to knfapp-caddy, generated with
+        # `caddy hash-password`); the baked-in default is the
+        # bcrypt of a random password nobody holds, so an
+        # unconfigured deploy fails CLOSED rather than open.
         redir /dbgate /dbgate/
         handle /dbgate/* {
+            basic_auth {
+                dbgate {$DBGATE_BASIC_AUTH_HASH:$2b$12$VXRCKp5Z4FWsJSAmbpjcXejgiRZoPoDT8GB3zqQdWaSsJeAinxJ5y}
+            }
             reverse_proxy knfapp-dbgate:3000
         }
 
 
-        reverse_proxy knfapp-mobile:8081
+        # Expo web app — CSP is per-handle rather than site-wide
+        # so /api/* keeps the headers Flask sets itself
+        # (add_security_headers) with no duplication. Metro's
+        # bundle needs inline+eval script and a same-origin
+        # websocket for HMR
+        handle {
+            header {
+                X-Frame-Options "DENY"
+                X-Content-Type-Options "nosniff"
+                Referrer-Policy "strict-origin-when-cross-origin"
+                Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+            }
+            reverse_proxy knfapp-mobile:8081
+        }
     }
 }

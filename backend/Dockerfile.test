@@ -1,0 +1,52 @@
+############################################################
+#  [*] backend/Dockerfile.test — the knfapp-backend-tests image
+#
+#  The production image (Dockerfile) runs the app; this one
+#  runs the suite against the SAME interpreter, the SAME
+#  pinned runtime wheels and the SAME Alpine libs, so a test
+#  that passes here cannot fail in production for a
+#  dependency reason.
+#
+#  Differences from the runtime image, all deliberate:
+#
+#    - requirements-test.txt is installed on top of the
+#      runtime pins (pytest, coverage, clock and HTTP fakes)
+#    - it runs as root, because the suite writes coverage
+#      output and temp databases into the mounted workspace
+#    - no HEALTHCHECK and no EXPOSE: nothing listens
+#
+#  Entry point is pytest; runTests.sh passes the arguments.
+############################################################
+
+FROM python:3.13.7-alpine AS builder
+
+RUN apk add --no-cache gcc musl-dev libffi-dev libxml2-dev libxslt-dev
+
+WORKDIR /app
+
+COPY requirements.txt requirements-test.txt ./
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt -r requirements-test.txt
+
+
+FROM python:3.13.7-alpine
+
+RUN apk add --no-cache libxml2 libxslt
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+
+COPY . .
+
+# Unbuffered so pytest output streams line by line through
+# docker logs instead of arriving in one block at the end
+ENV PYTHONUNBUFFERED=1
+
+# Never let a test reach the real scrapers' targets or the
+# production database: the suite sets its own DB_PATH per
+# test, and these make an accidental default loud
+ENV SCRAPER_ENABLED=0
+ENV DB_PATH=/tmp/knfapp-test-default.db
+ENV UPLOAD_DIR=/tmp/knfapp-test-uploads
+
+ENTRYPOINT ["python", "-m", "pytest"]

@@ -7,8 +7,25 @@ services:
     read_only: true
     ports:
       - "80:80"
+    environment:
+      # The ingress basic_auth in front of /dbgate/* reads this.
+      # ":?" so a deploy that forgot it fails loudly at `up` —
+      # the Caddyfile's own fallback hash locks DbGate rather
+      # than opening it, and a locked console is hard to debug
+      # without this message
+      - DBGATE_BASIC_AUTH_HASH=${DBGATE_BASIC_AUTH_HASH:?must be set (caddy hash-password)}
     volumes:
       - ./endpoint/Caddyfile:/etc/caddy/Caddyfile:ro
+    healthcheck:
+      # Proves the whole ingress path, not just the process
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      knfapp-backend:
+        condition: service_healthy
     networks:
       - isolated
       - external
@@ -27,11 +44,23 @@ services:
       - DB_PATH=/data/knfapp.db
       - UPLOAD_DIR=/data/uploads
       - INVITATION_EXPIRY_HOURS=${INVITATION_EXPIRY_HOURS:-168}
+      # Not optional: Flask-SocketIO checks Origin on the polling
+      # handshake, so an unset list leaves realtime chat dead on
+      # arrival while REST keeps working
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://knfapp.knf-hosting.lt}
     tmpfs:
       - /tmp:uid=1000,gid=1000
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - ./_DATA/backend:/data
+    healthcheck:
+      # Mirrors the HEALTHCHECK baked into backend/Dockerfile; the
+      # copy here is what knfapp-caddy's depends_on waits on
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     networks:
       - isolated
       - external
@@ -40,7 +69,9 @@ services:
 
   knfapp-swagger:
     container_name: knfapp-swagger
-    image: swaggerapi/swagger-ui:latest
+    # Pinned: :latest silently swapped the UI (and its JS) under
+    # the published contract on every pull
+    image: swaggerapi/swagger-ui:v5.17.14
     # user: 1000:1000
     read_only: false
     environment:
@@ -62,12 +93,22 @@ services:
       WEB_ROOT: /dbgate
 
       LOGINS: admin
-      LOGIN_PASSWORD_admin: ${DBGATE_PASSWORD}
+      # ":?" — an unset variable used to fail OPEN here, publishing
+      # the admin console on the public origin with a blank password
+      LOGIN_PASSWORD_admin: ${DBGATE_PASSWORD:?must be set}
 
       CONNECTIONS: con1
       LABEL_con1: KNFAPP SQLite
       FILE_con1: /data/knfapp.db
       ENGINE_con1: sqlite@dbgate-plugin-sqlite
+    volumes:
+      # Read-only: DbGate is a console for LOOKING at production
+      # data. WAL caveat — SQLite needs the -wal/-shm siblings
+      # present and readable to open a WAL database, and cannot
+      # create them on a :ro mount; if DbGate refuses to connect,
+      # checkpoint the database first rather than flipping this
+      # back to read-write
+      - ./_DATA/backend:/data:ro
     networks:
       - isolated
     restart: unless-stopped
@@ -87,15 +128,13 @@ services:
       - REACT_NATIVE_PACKAGER_HOSTNAME=knfapp.knf-hosting.lt
       - EXPO_PACKAGER_PROXY_URL=https://knfapp.knf-hosting.lt
       - EXPO_MANIFEST_PROXY_URL=https://knfapp.knf-hosting.lt
-      - EXPO_TOKEN=${EXPO_TOKEN}  
+      - EXPO_TOKEN=${EXPO_TOKEN:?must be set}
     volumes:
       - ./mobile/app:/app
     networks:
       - isolated
       - external
     restart: unless-stopped
-
-
 
 
 networks:

@@ -1,7 +1,34 @@
 openapi: 3.0.3
 info:
   title: KNFAPP API
-  description: Backend API for VU Kaunas Faculty mobile app
+  description: |
+    Backend API for VU Kaunas Faculty mobile app.
+
+    **Every string in every JSON response is HTML-escaped.** The backend stores
+    raw text and escapes on output only: `html.escape(quote=True)` runs over
+    every string value of every JSON body — success and error alike — so `&`,
+    `<`, `>`, `"` and `'` arrive as `&amp;`, `&lt;`, `&gt;`, `&quot;` and
+    `&#x27;`. Dict keys are untouched. This applies to URLs and timestamps too,
+    not just display text: a `nextUrl` containing `?a=1&b=2` arrives as
+    `?a=1&amp;b=2`. Clients must entity-decode whole responses before use — the
+    mobile app does this centrally in `services/api/client.ts`.
+
+    Socket.IO payloads (namespace `/socket.io/`, chat events) are NOT escaped:
+    they never pass through the HTTP response cycle, so the same message text
+    arrives escaped over REST and raw over the socket.
+
+    Responses under `/api/` also carry `Cache-Control: no-store`; uploaded
+    images keep their own `public, max-age=86400`.
+
+    **Errors** all use one envelope, the `Error` schema:
+    `{"error": "...", "code": "..."}`. `code` is the stable slug to branch on;
+    `error` is prose and may be reworded at any time. The app factory answers
+    400/404/405/413/415/500 in that shape for anything the routes do not
+    handle themselves, so an undocumented failure still parses.
+
+    **Realtime**: the Socket.IO contract — transport, handshake, and every
+    event and payload in both directions — is the `x-socketio` section of this
+    document, just above `paths`. It is not expressible as OpenAPI paths.
   version: 1.7.0
   contact:
     name: VU KNF IT
@@ -32,12 +59,118 @@ tags:
     description: File uploads (images)
   - name: info
     description: Faculty information (contacts, links, hours, FAQ)
+  - name: notifications
+    description: Expo push tokens & per-channel switches
+
+# ── Socket.IO ─────────────────────────────────────────────────────────────
+# The realtime half of chat. OpenAPI cannot express it, so it lives here as a
+# vendor extension: Swagger UI ignores the block, humans and generators do not.
+x-socketio:
+  path: /socket.io/
+  transport: >
+    POLLING ONLY. The server runs flask-socketio in async_mode="threading"
+    with no simple-websocket installed, so the WebSocket transport is never
+    available and every client long-polls. Caddy proxies /socket.io/* to the
+    same Flask process that serves /api/*.
+  origin: >
+    Flask-SocketIO checks the Origin header against ALLOWED_ORIGINS on the
+    polling handshake — even for same-origin pages. An unset ALLOWED_ORIGINS
+    in the deployment therefore breaks chat while REST keeps working.
+  handshake: >
+    The session token from POST /auth/login — the same value REST sends as a
+    Bearer token — resolved by the same lookup (sha256 hash, expiry, and the
+    users.active gate). Preferred form is the Socket.IO auth payload,
+    io(url, { auth: { token } }); the legacy query string ?token=... is still
+    accepted as a fallback for older builds. A socket authenticates ONCE, at
+    connect: logout, logout-all, a password change and an admin
+    deactivation all disconnect the sockets already handed out. Connections
+    are capped per user and per process; over the cap the connection is
+    refused.
+  rooms: >
+    One room per conversation, named conv:<conversationId>. A socket
+    auto-joins every conversation of its user at connect; conversations
+    created later are joined server-side by POST /chat/conversations or by
+    the client's own join_conversation.
+  errors: >
+    Every EXPECTED failure inside a handler is a SILENT DROP — no ack, no
+    error event, and clients must not wait for one. Only an unexpected
+    exception emits "error" {message}.
+  clientToServer:
+    connect:
+      payload: "auth: { token } (or ?token=... on the URL)"
+      description: Authenticates, records presence and joins every room of the user.
+    disconnect:
+      payload: none
+      description: Drops the socket from the presence table.
+    join_conversation:
+      payload: "{ conversationId: string }"
+      description: Joins conv:<id> after a membership check; a non-member is dropped silently.
+    leave_conversation:
+      payload: "{ conversationId: string }"
+      description: Leaves the room. No membership check — leaving is harmless.
+    typing:
+      payload: "{ conversationId: string }"
+      description: Fans out user_typing to the rest of the room.
+    stop_typing:
+      payload: "{ conversationId: string }"
+      description: Fans out user_stop_typing to the rest of the room.
+    mark_read:
+      payload: "{ conversationId: string }"
+      description: >
+        The socket twin of PUT /chat/conversations/{convId}/read — writes the
+        same two read stores and emits messages_read.
+  serverToClient:
+    connected:
+      payload: "{ userId: string }"
+      description: Handshake ack. Nothing in the mobile app listens for it.
+    user_typing:
+      payload: "{ conversationId, userId, displayName }"
+      description: Sent to the room except the typist.
+    user_stop_typing:
+      payload: "{ conversationId, userId }"
+      description: Sent to the room except the typist.
+    new_message:
+      payload: >
+        The SentMessage schema MINUS isOwn, status and readBy — i.e. id,
+        conversationId, senderId, senderName, senderAvatar, text, imageUrl,
+        time, createdAt, clientMsgId, reactions (always []), replyTo, deleted.
+        Compared with the REST Message shape of GET .../messages, the socket
+        drops isOwn, status and readBy: a client that needs them re-reads over
+        REST.
+      description: >
+        Sent to conv:<id> after POST .../messages commits, the sender's own
+        sockets included — clients dedupe the echo against their optimistic
+        bubble by id (or by clientMsgId, which rides along for exactly that).
+    reaction_update:
+      payload: "{ conversationId, messageId, reactions: [{emoji, count, bySelf, byUserIds}] }"
+      description: >
+        The whole reaction list for one message after a react/unreact. Note
+        bySelf is computed for the ACTOR, not per recipient — every receiving
+        client must recompute it from byUserIds.
+    message_deleted:
+      payload: "{ conversationId, messageId }"
+      description: >
+        An unsend. The row survives with its text blanked and deleted=true on
+        the REST shape; clients swap the body for their placeholder.
+    messages_read:
+      payload: "{ conversationId, readerId, messageIds: [string] }"
+      description: >
+        Read receipts, addressed to the individual sockets a receipt concerns
+        (the senders of those messages) rather than to the whole room.
+    error:
+      payload: "{ message: 'Internal error' }"
+      description: Unexpected handler exception. Nothing in the mobile app listens for it.
 
 paths:
   /health:
     get:
       tags: [health]
       summary: Health check
+      description: >
+        Readiness, not a literal: the probe runs SELECT 1 against the database
+        and checks that UPLOAD_DIR is writable. Either failing answers 503 with
+        a `reason`, so a backend whose data volume has gone read-only stops
+        reporting itself healthy.
       responses:
         "200":
           description: OK
@@ -47,6 +180,37 @@ paths:
                 type: object
                 properties:
                   status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: knfapp-backend
+                  database:
+                    type: string
+                    example: ok
+                  uploads:
+                    type: string
+                    example: ok
+        "503":
+          description: Database unreachable or UPLOAD_DIR not writable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: error
+                  service:
+                    type: string
+                    example: knfapp-backend
+                  reason:
+                    type: string
+                    example: "database: unable to open database file"
+                  database:
+                    type: string
+                    example: error
+                  uploads:
                     type: string
                     example: ok
 
@@ -73,15 +237,20 @@ paths:
                   description: Optional invitation code for higher-trust registration
                 username:
                   type: string
+                  minLength: 3
+                  maxLength: 32
+                  pattern: "^[A-Za-z0-9._-]+$"
                 password:
                   type: string
                   minLength: 6
+                  maxLength: 72
                 display_name:
                   type: string
                   maxLength: 100
                 email:
                   type: string
                   format: email
+                  maxLength: 254
       responses:
         "201":
           description: User created
@@ -90,9 +259,19 @@ paths:
               schema:
                 $ref: "#/components/schemas/AuthResponse"
         "400":
-          description: Invalid input or invitation code
+          description: >
+            Invalid input or invitation code (codes: weak_password,
+            invalid_username, invalid_email, invite_invalid, invite_exhausted,
+            invite_expired)
         "409":
           description: Username or email already exists
+        "429":
+          description: Too many registration attempts from this IP (code rate_limited)
+          headers:
+            Retry-After:
+              description: Seconds until one attempt frees up in the window
+              schema:
+                type: integer
 
   /auth/login:
     post:
@@ -117,10 +296,21 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthResponse"
+        "400":
+          description: Missing or non-string username/email or password
         "401":
-          description: Invalid credentials
+          description: Invalid credentials (an unknown identifier costs the same bcrypt time as a wrong password)
         "403":
           description: Account deactivated by an administrator (checked after the password, so only the account holder learns it)
+        "429":
+          description: >
+            Too many FAILED logins — successes never count — from this IP or
+            for this identifier (code rate_limited)
+          headers:
+            Retry-After:
+              description: Seconds until one attempt frees up in the window
+              schema:
+                type: integer
 
   /auth/validate-code:
     post:
@@ -154,6 +344,13 @@ paths:
                     enum: [student, teacher, admin, curator]
                   remainingUses:
                     type: integer
+        "429":
+          description: Too many validation attempts from this IP (code rate_limited; 30 per 5 minutes — the register screen re-validates while typing)
+          headers:
+            Retry-After:
+              description: Seconds until one attempt frees up in the window
+              schema:
+                type: integer
 
   /auth/me:
     get:
@@ -170,9 +367,46 @@ paths:
                 $ref: "#/components/schemas/User"
         "401":
           description: Not authenticated
+    delete:
+      tags: [auth]
+      summary: Erase the caller's account (GDPR Art. 17)
+      description: >
+        Password-confirmed self-service erasure. The users row survives anonymised
+        (unique placeholder identity, cleared student fields and avatar, active=0),
+        authored posts are tombstoned to the deleted-user marker, everything
+        personal — sessions, push tokens, notification preferences, read receipts,
+        reactions, likes, poll votes (denormalised counters decremented),
+        friendships, requests, blocks, room memberships, uploaded files — is
+        hard-deleted. Wrong passwords burn the change-password attempt budget.
+        The last active admin cannot erase themselves.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password: { type: string }
+      responses:
+        "200":
+          description: Account erased; every session is gone
+        "400":
+          description: Wrong password, missing body, or last-active-admin
+        "429":
+          description: Too many attempts (shared with change-password)
     put:
       tags: [auth]
-      summary: Update current user profile (display name, avatar)
+      summary: Update current user profile (display name, avatar, student-card fields)
+      description: >
+        Partial update — every field is optional and each accepts its
+        camelCase alias (displayName, avatarUrl, studentNumber, studyGroup,
+        studyProgram) as well as the snake_case name; the camelCase key wins
+        when both are sent. avatar_url must be a relative /api/uploads/ path
+        (null or "" clears it). Student-card fields store NULL for null or a
+        blank string. A present-but-blank display_name is rejected.
       security:
         - bearerAuth: []
       requestBody:
@@ -185,8 +419,26 @@ paths:
                 display_name:
                   type: string
                   maxLength: 100
+                  description: Non-empty after trimming; alias displayName
                 avatar_url:
                   type: string
+                  nullable: true
+                  description: Relative /api/uploads/ path, or null/"" to clear; alias avatarUrl
+                student_number:
+                  type: string
+                  nullable: true
+                  maxLength: 50
+                  description: Alias studentNumber; null or blank stores NULL
+                study_group:
+                  type: string
+                  nullable: true
+                  maxLength: 50
+                  description: Alias studyGroup; null or blank stores NULL
+                study_program:
+                  type: string
+                  nullable: true
+                  maxLength: 50
+                  description: Alias studyProgram; null or blank stores NULL
       responses:
         "200":
           description: Profile updated
@@ -195,19 +447,108 @@ paths:
               schema:
                 $ref: "#/components/schemas/User"
         "400":
-          description: No fields to update
+          description: No fields to update, a non-string value, a blank display name, or an avatar_url outside /api/uploads/
         "401":
           description: Not authenticated
 
   /auth/logout:
     post:
       tags: [auth]
-      summary: Logout (invalidate session)
+      summary: Logout (invalidate the presented session only)
+      description: >
+        Deletes the session behind the presented token; the caller's other
+        devices stay logged in and keep their push tokens. The optional body
+        may carry this device's Expo push token to delete that one
+        push_tokens row server-side.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                pushToken:
+                  type: string
+                  description: This device's Expo push token — its row alone is deleted
+      responses:
+        "200":
+          description: Logged out
+
+  /auth/me/export:
+    get:
+      tags: [auth]
+      summary: Export the caller's data as JSON (GDPR Art. 15)
+      description: >
+        One document with the profile row, authored posts and comments, sent
+        messages, conversation memberships, likes, poll votes, friendships and
+        requests, blocks, reports filed, notification preferences and the upload
+        inventory. Tightly rate limited (5 per 5 minutes).
       security:
         - bearerAuth: []
       responses:
         "200":
-          description: Logged out
+          description: The export document
+        "429":
+          description: Too many exports for this user
+
+  /auth/change-password:
+    post:
+      tags: [auth]
+      summary: Change own password (revokes the caller's other sessions)
+      description: >
+        Verifies the current password with bcrypt, stores a bcrypt hash of the
+        new one (same policy as register) and deletes the caller's OTHER
+        sessions so previously issued tokens stop working — the token used for
+        this request stays valid. camelCase aliases (oldPassword/newPassword)
+        are accepted like on PUT /auth/me. Failures count against a per-user
+        rate limit.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_password, new_password]
+              properties:
+                old_password:
+                  type: string
+                new_password:
+                  type: string
+                  minLength: 6
+      responses:
+        "200":
+          description: Password changed; other sessions revoked
+        "400":
+          description: >
+            Missing fields, a new password failing the policy (code
+            weak_password), or a wrong old password (code invalid_credentials —
+            a 400 on purpose, so the client does not tear the session down over
+            a typo)
+        "401":
+          description: Not authenticated
+        "429":
+          description: Too many failed attempts (code rate_limited)
+
+  /auth/logout-all:
+    post:
+      tags: [auth]
+      summary: Logout everywhere (invalidate every session of the caller)
+      description: >
+        Deletes EVERY session of the caller — the presented one included, so
+        the client must tear its local auth state down after the 200 — and
+        every push_tokens row (devices re-register on their next login). The
+        revoke-everywhere switch for a compromised credential.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Logged out everywhere
+        "401":
+          description: Not authenticated
 
   # ── News ──────────────────────────────────────────────────────────────────
 
@@ -218,25 +559,61 @@ paths:
       description: >
         Returns a paginated, ranked feed mixing scraped news (knf.vu.lt, vu.lt),
         faculty posts, and user/friend posts. Guest users see only public posts.
-        Authenticated users also see friend posts.
+        Authenticated users also see friend posts, including their friends'
+        private wall posts; a private faculty post reaches only its author and
+        staff.
+
+
+        Answers carry a weak `ETag` over the data watermark plus the caller,
+        their friend set and the query, and a matching `If-None-Match` gets a
+        304. `Cache-Control` is `private, max-age=60` for an authenticated
+        caller — the page carries their friends' private posts and their own
+        liked flags, so a shared cache must never store it — and
+        `public, max-age=60` for a guest.
       parameters:
         - name: page
           in: query
+          description: 1-based; above 10000 the answer is a 400 (the OFFSET ceiling)
           schema:
             type: integer
             default: 1
+            minimum: 1
+            maximum: 10000
         - name: per_page
           in: query
+          description: Above 50 the answer is a 400 — the value is rejected, not clamped
           schema:
             type: integer
             default: 20
+            minimum: 1
             maximum: 50
         - name: source
           in: query
           schema:
             type: string
             enum: [knf.vu.lt, vu.lt, faculty, user, app]
+        - name: before
+          in: query
+          description: >
+            Optional paging anchor: send page 1's request time and repeat it on
+            every later page. The recency term is measured against this instant
+            and rows published after it are excluded, so posts arriving
+            mid-paging cannot make pages duplicate or drop items. Omit it and
+            the feed ranks against a live 'now', exactly as before. Percent-
+            encode the '+' of the UTC offset (%2B), or send it as a space.
+          schema:
+            type: string
+            format: date-time
       responses:
+        "400":
+          description: >
+            page or per_page is not a positive integer, page is above 10000,
+            per_page is above 50, ?source is outside the enum, or ?before is
+            not an ISO-8601 timestamp
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "200":
           description: Feed page
           content:
@@ -256,6 +633,8 @@ paths:
                     type: integer
                   hasMore:
                     type: boolean
+        "304":
+          description: If-None-Match matched the current ETag — nothing new to send
     post:
       tags: [news]
       summary: Create a new post
@@ -274,17 +653,28 @@ paths:
               properties:
                 title:
                   type: string
+                  maxLength: 200
+                  description: Defaults to the first 80 characters of content
                 content:
                   type: string
+                  minLength: 1
+                  maxLength: 10000
                 image_url:
                   type: string
+                  description: Own uploads only — a relative /api/uploads/ path
                 is_public:
                   type: boolean
                   default: true
                 post_type:
                   type: string
-                  enum: [social, announcement, poll]
+                  enum: [article, social, announcement, link]
                   default: social
+                  description: >
+                    NOT the full stored enum: 'poll' is missing on purpose —
+                    a post becomes a poll post by attaching a poll through
+                    POST /news/{postId}/poll, never by asking for the type.
+                    Absent or blank takes the role default (announcement for
+                    staff, social for students).
       responses:
         "201":
           description: Post created
@@ -292,8 +682,23 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NewsPost"
+        "400":
+          description: >
+            Blank or over-long content, a non-string field, a post_type
+            outside the enum, a non-boolean is_public, or an image_url that
+            is not a relative /api/uploads/ path
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           description: Not authenticated
+        "429":
+          description: Too many posts from this user (code rate_limited)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /news/{postId}:
     get:
@@ -365,6 +770,22 @@ paths:
                     type: boolean
                   likes:
                     type: integer
+        "401":
+          description: Not authenticated
+        "404":
+          description: >
+            No such post, or the post is private and not visible to the caller —
+            the same answer either way, so existence never leaks
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Too many likes from this user (code rate_limited)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /news/{postId}/comments:
     get:
@@ -378,17 +799,36 @@ paths:
             type: string
         - name: page
           in: query
+          description: 1-based; above 10000 the answer is a 400 (the OFFSET ceiling)
           schema:
             type: integer
             default: 1
+            minimum: 1
+            maximum: 10000
         - name: per_page
           in: query
+          description: Above 50 the answer is a 400 — the value is rejected, not clamped
           schema:
             type: integer
             default: 20
+            minimum: 1
+            maximum: 100
       responses:
+        "400":
+          description: >
+            page or per_page is not a positive integer, or page is above 10000.
+            An over-large per_page is CLAMPED to 100, never rejected — the same
+            parse_pagination the feed uses.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "200":
-          description: Comments list
+          description: >
+            Comments list, newest first. The users join is a LEFT JOIN, so a
+            comment whose author is gone still appears (as 'Deleted user') and
+            `total` matches what the pages actually return. `time` is
+            ISO-8601 UTC with an explicit offset.
           content:
             application/json:
               schema:
@@ -404,6 +844,16 @@ paths:
                     type: integer
                   perPage:
                     type: integer
+        "404":
+          description: >
+            No such post, or the post is private and not visible to the caller.
+            A hidden post and a missing one answer identically on purpose — an
+            empty page for one and a 404 for the other would tell a stranger
+            which is which.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     post:
       tags: [news]
       summary: Add a comment
@@ -425,6 +875,8 @@ paths:
               properties:
                 text:
                   type: string
+                  minLength: 1
+                  maxLength: 2000
       responses:
         "201":
           description: Comment created
@@ -432,6 +884,83 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Comment"
+        "400":
+          description: Body is not a JSON object, or text is missing, blank, not a string, or over 2000 characters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Not authenticated
+        "404":
+          description: >
+            No such post, or the post is private and not visible to the caller —
+            the same answer either way, so existence never leaks
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Too many comments from this user (code rate_limited)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /news/{postId}/comments/{commentId}:
+    delete:
+      tags: [news]
+      summary: Delete a comment (comment author, post author or admin)
+      description: >
+        Removes one comment and recomputes the post's comments counter from the
+        remaining rows. The comment must belong to the post named in the path.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: commentId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Comment deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: deleted
+                  comments:
+                    type: integer
+                    description: The post's comment count after the delete
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not the comment author, the post author or an admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: No such post (or not visible), or no such comment on this post
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Too many deletions from this user (code rate_limited)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   # ── Polls ─────────────────────────────────────────────────────────────────
 
@@ -475,15 +1004,26 @@ paths:
               properties:
                 title:
                   type: string
+                  minLength: 1
+                  maxLength: 200
                 options:
                   type: array
+                  description: >
+                    Strings only — a non-string element is a 400, never a 500.
+                    Blank entries are dropped BEFORE the 2..10 count is
+                    checked, so ["a", "  ", ""] is one option and refused.
                   minItems: 2
                   maxItems: 10
                   items:
                     type: string
+                    minLength: 1
+                    maxLength: 100
                 end_date:
                   type: string
                   format: date-time
+                  description: >
+                    Must parse as ISO-8601; stored normalised to explicit UTC,
+                    so the close time cannot later be read as local time.
       responses:
         "201":
           description: Poll created
@@ -491,8 +1031,97 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Poll"
+        "400":
+          description: >
+            Body is not a JSON object, title missing/over-long, options not an
+            array of strings, fewer than 2 or more than 10 after blanks are
+            stripped, an option over 100 characters, an unparseable end_date,
+            or the post is a scraped article (those keep their own post type)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Not authenticated
         "403":
           description: Not the post author or admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: >
+            No such post, or the post is private and not visible to the caller —
+            the same answer either way, so existence never leaks
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >
+            The post already has a poll — one poll per post, enforced by a
+            UNIQUE index, so a concurrent second call gets this answer too
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Too many poll operations from this user (code rate_limited)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      tags: [polls]
+      summary: Detach a post's poll (author or admin only)
+      description: >
+        Deletes the poll with its options and votes, then restores the parent
+        post's type — social for a wall post, announcement for a faculty post,
+        article for a legacy scraped row — undoing the flip to 'poll' that
+        attaching a poll performs.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: postId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Poll deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: deleted
+                  postType:
+                    type: string
+                    enum: [article, social, announcement]
+                    description: The post type restored on the parent post
+        "401":
+          description: Not authenticated
+        "403":
+          description: Not the post author or admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: No such post (or not visible to the caller), or the post has no poll
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Too many poll operations from this user (code rate_limited)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /news/{postId}/poll/vote:
     post:
@@ -516,15 +1145,50 @@ paths:
               properties:
                 option_id:
                   type: string
+                  minLength: 1
+                  description: >
+                    A string; anything else (object, array, number) is a 400.
+                    Sending the option already voted for is the 409 below.
       responses:
         "200":
-          description: Vote recorded (returns updated poll)
+          description: Vote recorded or moved (returns the updated poll)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Poll"
+        "400":
+          description: >
+            Body is not a JSON object, option_id missing or not a non-blank
+            string, the option does not belong to this poll, or the poll's
+            end_date has passed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           description: Not authenticated
+        "404":
+          description: >
+            The post has no poll, does not exist, or is private and not visible
+            to the caller — one answer for all three
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >
+            Already voted for THIS option. The mobile client treats it as a
+            no-op and refetches the poll — do not surface it as an error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Too many votes from this user (code rate_limited)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   # ── Schedule ──────────────────────────────────────────────────────────────
 
@@ -532,6 +1196,15 @@ paths:
     get:
       tags: [schedule]
       summary: Get schedule/timetable
+      description: |
+        One page of lessons, ordered by dayOfWeek, timeStart, group, id — at most
+        500 rows per call (an unfiltered call used to return the whole table).
+
+        With no `semester` the newest semester carrying at least 5 lessons is used,
+        so years never interleave; pass `semester=all` for every semester at once.
+
+        Answers carry `Cache-Control: public, max-age=21600` (the 6 h scrape
+        interval) and a weak `ETag`; a matching `If-None-Match` gets a 304.
       parameters:
         - name: day
           in: query
@@ -547,6 +1220,23 @@ paths:
           in: query
           schema:
             type: string
+          description: Exact semester label, or "all" for every semester (default - the newest one)
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 500
+          description: Page size, clamped into 1..500; a non-numeric value is a 400
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100000
+            default: 0
+          description: Rows to skip, clamped into 0..100000; a non-numeric value is a 400
       responses:
         "200":
           description: Lessons for the day
@@ -559,11 +1249,29 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Lesson"
+        "304":
+          description: Not modified - If-None-Match matched the ETag
+        "400":
+          description: Invalid day, limit or offset
 
   /schedule/filters:
     get:
       tags: [schedule]
-      summary: Get available groups and semesters for filtering
+      summary: Get available groups, semesters and days for filtering
+      description: |
+        Filter-sheet values. `groups` and `days` are scoped to `semester` when one
+        is given; `semesters` and `semesterGroups` always describe the whole table.
+        A semester label is only listed once it carries at least 5 lessons, so a
+        single mislabelled lesson never becomes a picker option.
+
+        Same caching as /schedule: `Cache-Control: public, max-age=21600` plus a
+        weak `ETag`, and a 304 on a matching `If-None-Match`.
+      parameters:
+        - name: semester
+          in: query
+          schema:
+            type: string
+          description: Scope groups and days to this semester label
       responses:
         "200":
           description: Available filter values
@@ -582,6 +1290,28 @@ paths:
                     items:
                       type: string
                     example: ["2025-P", "2025-R"]
+                  days:
+                    type: array
+                    description: Day numbers that actually carry lessons (0=Monday..6=Sunday)
+                    items:
+                      type: integer
+                      minimum: 0
+                      maximum: 6
+                    example: [0, 1, 2, 3, 4, 5]
+                  semesterGroups:
+                    type: array
+                    description: Which groups exist in which semester - the two flat lists are not interchangeable
+                    items:
+                      type: object
+                      properties:
+                        semester:
+                          type: string
+                        groups:
+                          type: array
+                          items:
+                            type: string
+        "304":
+          description: Not modified - If-None-Match matched the ETag
 
   # ── Chat ──────────────────────────────────────────────────────────────────
 
@@ -675,6 +1405,7 @@ paths:
           schema:
             type: integer
             default: 50
+            minimum: 1
             maximum: 100
       responses:
         "200":
@@ -730,11 +1461,19 @@ paths:
               properties:
                 text:
                   type: string
+                  description: Stripped server-side, at most 5000 characters; at least one of text/imageUrl is required
                 imageUrl:
                   type: string
+                  description: Must be the relative /api/uploads/... path the upload route returned (or its same-origin absolute form)
                 replyToId:
                   type: string
-                  description: Id of a message in the same conversation to quote (400 if it is not)
+                  description: Id of a message in the same conversation to quote (400 if it is not, blank string included)
+                client_msg_id:
+                  type: string
+                  description: >
+                    The client's optimistic-send nonce, at most 128 characters.
+                    Repeating one already committed answers 200 with the EXISTING
+                    message instead of inserting a duplicate.
       responses:
         "201":
           description: Message sent
@@ -744,9 +1483,26 @@ paths:
                 type: object
                 properties:
                   message:
-                    $ref: "#/components/schemas/Message"
+                    $ref: "#/components/schemas/SentMessage"
+        "200":
+          description: Idempotent replay — this client_msg_id was already committed, so the existing message comes back
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    $ref: "#/components/schemas/SentMessage"
+        "400":
+          description: >
+            Empty message (neither text nor imageUrl), text over 5000 characters or
+            not a string, an imageUrl outside /api/uploads/, a blank/non-string
+            replyToId, a quoted message from another conversation, an over-long
+            client_msg_id, or a body that is not a JSON object
         "403":
           description: Not a participant
+        "429":
+          description: Send rate limit exceeded (150 per 5 minutes per user)
 
   /chat/conversations/{convId}/messages/search:
     get:
@@ -762,11 +1518,11 @@ paths:
         - name: q
           in: query
           required: true
-          schema: { type: string }
-          description: Search query (min 1 char)
+          schema: { type: string, minLength: 1, maxLength: 200 }
+          description: Search query (1–200 chars after trimming)
         - name: limit
           in: query
-          schema: { type: integer, default: 20, maximum: 50 }
+          schema: { type: integer, default: 20, minimum: 1, maximum: 50 }
       responses:
         "200":
           description: Search results
@@ -787,14 +1543,20 @@ paths:
                         senderAvatar: { type: string, nullable: true }
                         text: { type: string }
                         imageUrl: { type: string, nullable: true }
-                        time: { type: string }
-                        createdAt: { type: string }
+                        time: { type: string, description: "UTC HH:MM, DEPRECATED — format createdAt instead" }
+                        createdAt: { type: string, description: "ISO datetime, naive UTC" }
                         isOwn: { type: boolean }
-                  total: { type: integer }
+                  total:
+                    type: integer
+                    description: >
+                      Hit count, SATURATED at 500 — a total of exactly 500 means
+                      "500 or more", so one search never counts a whole archive.
         "400":
-          description: Empty or missing q parameter
+          description: Missing, empty or over-long (>200 characters) q parameter, or a non-integer limit
         "403":
           description: Not a participant
+        "429":
+          description: Search rate limit exceeded (100 per 5 minutes per user)
 
   /chat/conversations/{convId}/messages/{msgId}:
     delete:
@@ -916,6 +1678,8 @@ paths:
                 properties:
                   pinned:
                     type: boolean
+        "403":
+          description: Not a participant
 
   /chat/conversations/{convId}/read:
     put:
@@ -943,6 +1707,10 @@ paths:
                   readCount:
                     type: integer
                     description: Number of newly read messages
+        "403":
+          description: Not a participant
+        "429":
+          description: Too many mark-read calls — one budget shared with the mark_read socket event
 
   /chat/unread-count:
     get:
@@ -978,6 +1746,51 @@ paths:
       responses:
         "200":
           description: Left conversation
+        "403":
+          description: Not a participant
+        "404":
+          description: Conversation not found
+
+  /chat/online-status:
+    post:
+      tags: [chat]
+      summary: Presence lookup for conversation counterparts
+      description: >
+        Answers whether each requested user currently holds a Socket.IO connection
+        on this server. Presence is revealed ONLY for users who share at least one
+        conversation with the caller — everybody else reads false, exactly like a
+        genuinely offline user, so the route is no source of presence about
+        strangers. The list is silently truncated to the first 200 ids (no error)
+        and non-string elements are dropped from both the lookup and the answer.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userIds]
+              properties:
+                userIds:
+                  type: array
+                  description: Only the first 200 string ids are considered
+                  items:
+                    type: string
+      responses:
+        "200":
+          description: Presence map keyed by the requested user ids
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  online:
+                    type: object
+                    additionalProperties:
+                      type: boolean
+        "400":
+          description: Body is not a JSON object, or userIds is missing/not an array
 
   /chat/users/search:
     get:
@@ -991,7 +1804,8 @@ paths:
           required: true
           schema:
             type: string
-            minLength: 1
+            minLength: 2
+          description: Under 2 characters the route answers an empty list
       responses:
         "200":
           description: User search results
@@ -1014,14 +1828,33 @@ paths:
       description: |
         Guest: public user posts, ranked by recency + engagement.
         Authenticated: own posts + friends' posts (public and private) + other public user posts.
+        Posts by deactivated authors are excluded, and only the last 180 days are ranked.
+        `content` is trimmed to 200 characters in this list view — `truncated` says whether it was,
+        and GET /news/{postId} serves the full body.
       parameters:
         - name: page
           in: query
-          schema: { type: integer, default: 1 }
+          schema: { type: integer, default: 1, maximum: 200 }
         - name: per_page
           in: query
-          schema: { type: integer, default: 20, maximum: 50 }
+          description: Above 50 the answer is a 400 — the value is rejected, not clamped
+          schema: { type: integer, default: 20, minimum: 1, maximum: 50 }
+        - name: before
+          in: query
+          description: >
+            Optional ISO-8601 timestamp (the client's page-1 request time). Pins the ranking's
+            "now" and adds published_at <= before, so posts published while the reader pages
+            cannot shift rows across page boundaries. Omit for the live window.
+          schema: { type: string, format: date-time }
       responses:
+        "400":
+          description: >
+            page or per_page is not a positive integer, page is above 200, or
+            per_page is above 50
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "200":
           description: Social feed posts
           content:
@@ -1043,6 +1876,7 @@ paths:
                         authorId: { type: string }
                         authorAvatar: { type: string, nullable: true }
                         source: { type: string }
+                        sourceUrl: { type: string, nullable: true }
                         postType: { type: string }
                         likes: { type: integer }
                         comments: { type: integer }
@@ -1050,6 +1884,9 @@ paths:
                         date: { type: string }
                         isPublic: { type: boolean }
                         liked: { type: boolean }
+                        truncated:
+                          type: boolean
+                          description: content was trimmed to 200 characters for this list
                   page: { type: integer }
                   perPage: { type: integer }
                   total: { type: integer }
@@ -1059,6 +1896,7 @@ paths:
     get:
       tags: [social]
       summary: Get a user's public profile
+      description: A deactivated account answers 404 to everyone except an admin.
       parameters:
         - name: userId
           in: path
@@ -1076,9 +1914,39 @@ paths:
           description: User not found
 
   /social/profile:
+    get:
+      tags: [social]
+      summary: Get own profile (with post and friend counts)
+      description: >
+        The private twin of GET /social/profile/{userId} — adds email and the student-card
+        fields, has no friendshipStatus. The mobile app reads its identity through
+        GET /auth/me instead.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Own profile
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ProfileUpdateResponse"
+                  - type: object
+                    properties:
+                      createdAt: { type: string, nullable: true }
+                      postCount: { type: integer }
+                      friendCount: { type: integer }
+        "401":
+          description: Authentication required
     put:
       tags: [social]
       summary: Update own profile
+      description: >
+        Every key is accepted in camelCase (as returned) or snake_case (as the app sends it),
+        camelCase winning when both are present. A present-but-blank displayName is a 400;
+        a blank student-card field stores NULL. avatar_url must be a relative /api/uploads/
+        path, or null / "" to clear it. The response is a narrower object than the User
+        schema — no createdAt, no active.
       security:
         - bearerAuth: []
       requestBody:
@@ -1092,13 +1960,27 @@ paths:
                   type: string
                 avatar_url:
                   type: string
+                  nullable: true
+                student_number:
+                  type: string
+                  nullable: true
+                study_group:
+                  type: string
+                  nullable: true
+                study_program:
+                  type: string
+                  nullable: true
       responses:
         "200":
           description: Profile updated
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/User"
+                $ref: "#/components/schemas/ProfileUpdateResponse"
+        "400":
+          description: Validation error (blank display name, non-string field, over length)
+        "429":
+          description: Too many profile updates (code rate_limited)
 
   /social/friends/request:
     post:
@@ -1106,7 +1988,9 @@ paths:
       summary: Send a friend request
       description: >
         If the target user already sent a friend request to you,
-        this auto-accepts the friendship (bidirectional).
+        this auto-accepts the friendship (bidirectional) and removes their request row.
+        Deactivated targets answer 404. Sends are rate limited (20 per 5 minutes) and,
+        after a rejection, the same sender waits 7 days before asking that person again.
       security:
         - bearerAuth: []
       requestBody:
@@ -1134,13 +2018,22 @@ paths:
                     enum: [pending]
         "200":
           description: Auto-accepted (mutual request)
+        "404":
+          description: User not found or deactivated
         "409":
           description: Already friends or request already pending
+        "429":
+          description: >
+            Rate limited (code rate_limited) or still inside the post-rejection cooldown
+            (code friend_request_cooldown)
 
   /social/friends/requests:
     get:
       tags: [social]
       summary: List pending friend requests
+      description: >
+        Requests involving deactivated accounts are left out. Paging is optional — the
+        default page size is the cap (200), so an un-paged call returns everything.
       security:
         - bearerAuth: []
       parameters:
@@ -1150,6 +2043,12 @@ paths:
             type: string
             enum: [received, sent]
             default: received
+        - name: page
+          in: query
+          schema: { type: integer, default: 1, maximum: 200 }
+        - name: per_page
+          in: query
+          schema: { type: integer, default: 200, maximum: 200 }
       responses:
         "200":
           description: Friend request list
@@ -1162,6 +2061,10 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/FriendRequest"
+                  total: { type: integer }
+                  hasMore: { type: boolean }
+        "400":
+          description: direction must be 'sent' or 'received' (code invalid_direction)
 
   /social/friends/requests/{requestId}/accept:
     post:
@@ -1203,8 +2106,19 @@ paths:
     get:
       tags: [social]
       summary: List current user's friends
+      description: >
+        Sorted by display name (case-insensitive; the client re-sorts with a Lithuanian
+        collator). Deactivated accounts are left out. Paging is optional — the default page
+        size is the cap (200), so an un-paged call returns everything.
       security:
         - bearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1, maximum: 200 }
+        - name: per_page
+          in: query
+          schema: { type: integer, default: 200, maximum: 200 }
       responses:
         "200":
           description: Friends list
@@ -1217,6 +2131,8 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Friend"
+                  total: { type: integer }
+                  hasMore: { type: boolean }
 
   /social/friends/{userId}:
     delete:
@@ -1240,6 +2156,10 @@ paths:
     get:
       tags: [social]
       summary: Get posts by a specific user
+      description: >
+        Wall posts (source 'user') and the author's own faculty announcements. A deactivated
+        user answers 404 to everyone except an admin. `content` is trimmed to 200 characters
+        here, with an additive `truncated` flag; GET /news/{postId} serves the full body.
       parameters:
         - name: user_id
           in: query
@@ -1248,15 +2168,29 @@ paths:
             type: string
         - name: page
           in: query
+          description: 1-based; above 200 the answer is a 400 (the OFFSET ceiling for lists)
           schema:
             type: integer
             default: 1
+            minimum: 1
+            maximum: 200
         - name: per_page
           in: query
+          description: Above 50 the answer is a 400 — the value is rejected, not clamped
           schema:
             type: integer
             default: 20
+            minimum: 1
+            maximum: 50
       responses:
+        "400":
+          description: >
+            page or per_page is not a positive integer, page is above 200, or
+            per_page is above 50
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "200":
           description: User's posts
           content:
@@ -1279,6 +2213,10 @@ paths:
     post:
       tags: [social]
       summary: Create a wall post
+      description: >
+        is_public must be a real JSON boolean; the 201 echoes the stored value. The body is
+        the freshly re-read row, so it carries sourceUrl (null) and authorAvatar like every
+        other post-serving route.
       security:
         - bearerAuth: []
       requestBody:
@@ -1310,6 +2248,10 @@ paths:
     put:
       tags: [social]
       summary: Edit own wall post
+      description: >
+        Covers the caller's 'user' and 'faculty' posts. A present content that strips to empty
+        is a 400; a present title that strips to empty falls back to the first 80 characters
+        of the body.
       security:
         - bearerAuth: []
       parameters:
@@ -1353,12 +2295,121 @@ paths:
         "404":
           description: Post not found or not yours
 
+  /social/blocks:
+    post:
+      tags: [social]
+      summary: Block a user
+      description: >
+        One-directional in storage, bidirectional in effect: a blocked pair cannot
+        friend-request, cannot be pulled into a new conversation together, cannot
+        message each other's direct chat, drops out of each other's chat user search
+        and gets no pushes from each other in groups. Blocking also severs an existing
+        friendship and clears pending requests. Idempotent — a repeat block is the
+        same 200.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id: { type: string }
+      responses:
+        "200":
+          description: Blocked
+        "400":
+          description: Missing/invalid user_id, or a self-block
+        "404":
+          description: User not found (or deactivated)
+    get:
+      tags: [social]
+      summary: List the caller's blocked users
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Blocked users, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  blocked:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        username: { type: string }
+                        displayName: { type: string }
+                        avatarUrl: { type: string, nullable: true }
+                        role: { type: string }
+                        blockedAt: { type: string }
+
+  /social/blocks/{userId}:
+    delete:
+      tags: [social]
+      summary: Unblock a user
+      description: >
+        Removes the caller's own block row. Idempotent — an id that was never
+        blocked answers the same 200. Restores nothing the block severed.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Unblocked
+
+  /social/reports:
+    post:
+      tags: [social]
+      summary: Report a user, post or message
+      description: >
+        Files one row into the admin-reviewed ledger. The target must exist in the
+        table its type names. The reporter is identified to the admins, never to
+        the reported.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target_type, target_id, reason]
+              properties:
+                target_type:
+                  type: string
+                  enum: [user, post, message]
+                target_id: { type: string }
+                reason: { type: string, maxLength: 1000 }
+      responses:
+        "201":
+          description: Report submitted
+        "400":
+          description: Unknown type, blank id or blank/oversized reason
+        "404":
+          description: Report target not found
+
   # ── Admin ─────────────────────────────────────────────────────────────────
 
   /admin/invitations:
     post:
       tags: [admin]
-      summary: Create invitation code
+      summary: Create invitation code (admin or curator; rate limited per actor)
+      description: >
+        Admin/curator codes are credentials, not flyers: only admins may mint
+        them, they must be single-use (max_uses other than 1 is a 400) and an
+        explicit expires_hours above 72 is a 400 — an omitted expiry is clamped
+        under that cap.
       security:
         - bearerAuth: []
       requestBody:
@@ -1373,36 +2424,199 @@ paths:
                   default: student
                 max_uses:
                   type: integer
+                  minimum: 1
+                  maximum: 1000
                   default: 1
                 expires_hours:
                   type: integer
-                  default: 168
+                  minimum: 1
+                  maximum: 8760
+                  description: Defaults to the deployment's INVITATION_EXPIRY_HOURS (168 unless configured otherwise)
       responses:
         "201":
-          description: Invitation created
+          description: Invitation created (carries the additive `createdBy`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminInvitation"
+        "400":
+          description: Body is not a JSON object, unknown role, or max_uses / expires_hours out of range
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+        "403":
+          description: >
+            Not an admin or curator — or a curator asking for an admin or
+            curator code (ROLES: admin mints any role, curator only
+            student/teacher)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: Too many codes minted by this actor (code rate_limited)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     get:
       tags: [admin]
       summary: List invitation codes
+      description: >
+        ROLES: admin and curator, with DIFFERENT scopes. An admin sees every
+        code; a curator sees only the student/teacher codes they created
+        themselves — an admin-role code string must never reach a curator's
+        screen. Newest first; revoked codes are hard-deleted and never
+        appear.
       security:
         - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Optional page size 1..500; omit both params to get every row
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
       responses:
         "200":
-          description: Invitation list
+          description: Invitation list. Each entry carries the additive `createdBy`
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invitations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AdminInvitation"
+        "400":
+          description: Invalid limit or offset
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+        "403":
+          description: Not an admin or curator
+
+  /admin/invitations/{codeId}:
+    delete:
+      tags: [admin]
+      summary: Revoke an invitation code (admin, or the curator who minted it)
+      description: >
+        ROLES: admin and curator. A curator may revoke only their OWN
+        student/teacher codes; aiming at somebody else's — or at an
+        admin-role code — answers the same 404 as a nonexistent id, so
+        nothing leaks. The path takes the row id, NOT the code string.
+        Revocation cannot race registration: register() burns a code with a
+        conditional UPDATE and reads "row gone" as a refusal.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: codeId
+          in: path
+          required: true
+          description: The row id, NOT the code string
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Invitation deleted
+        "401":
+          description: Authentication required
+        "403":
+          description: Not an admin or curator
+        "404":
+          description: No such code, or outside a curator's own student/teacher codes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /admin/users:
     get:
       tags: [admin]
       summary: List all users
+      description: >
+        ROLES: admin ONLY — a curator gets 403 here, unlike on the invitation
+        paths. The body carries every e-mail address the faculty holds and is
+        served no-store.
       security:
         - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Optional page size 1..500; omit both params to get every row
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
       responses:
         "200":
           description: User list. Each user carries `active` (false = deactivated; such users cannot log in and their sessions are rejected)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AdminUser"
+        "400":
+          description: Invalid limit or offset
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+        "403":
+          description: Admin role required
 
   /admin/users/{userId}:
+    delete:
+      tags: [admin]
+      summary: Erase a user's account (admin only; audited; GDPR Art. 17)
+      description: >
+        The admin-side twin of DELETE /auth/me — same erasure routine, no password
+        confirm. An admin deletes their OWN account through /auth/me instead (400
+        here), and the last active admin cannot be erased.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Account erased
+        "400":
+          description: Self-deletion here, or the last active admin
+        "404":
+          description: User not found
     patch:
       tags: [admin]
       summary: Update user role or active status
+      description: >
+        ROLES: admin ONLY. Both fields are optional but at least one must be
+        present. `active` must be a real JSON boolean — 0 or "false" is a
+        400, not a deactivation.
       security:
         - bearerAuth: []
       parameters:
@@ -1424,21 +2638,175 @@ paths:
                   type: boolean
       responses:
         "200":
-          description: Updated user, including the resulting `active` flag
+          description: Updated user, including the resulting `active` flag. Deactivation also drops the user's sessions, push tokens and live sockets
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminUser"
         "400":
-          description: Invalid role or nothing to update
+          description: Body is not a JSON object, invalid role, nothing to update, self-deactivation, self-demotion out of admin, or the change would leave no active admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+        "403":
+          description: Admin role required
         "404":
-          description: User not found
+          description: User not found (checked before the body is validated)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /admin/stats:
     get:
       tags: [admin]
-      summary: Admin dashboard stats
+      summary: Admin dashboard stats (cached in-process for up to 45 s)
+      description: >
+        ROLES: admin ONLY. Five counters for the dashboard tiles;
+        scrapedArticles counts only the two scraper sources (knf.vu.lt,
+        vu.lt), never faculty/user/app posts.
       security:
         - bearerAuth: []
       responses:
         "200":
           description: Stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminStats"
+        "401":
+          description: Authentication required
+        "403":
+          description: Admin role required
+
+  /admin/notifications:
+    post:
+      tags: [admin]
+      summary: Broadcast a push notification on the admin channel
+      description: >
+        ROLES: admin ONLY. Targets every active device whose owner has not
+        opted out of the "admin" channel (the opt-out model), so counts are
+        DEVICES, not users.
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, body]
+              properties:
+                title:
+                  type: string
+                  maxLength: 200
+                body:
+                  type: string
+                  maxLength: 1000
+                data:
+                  type: object
+                  description: Extra push payload; `type` is always forced to admin_announcement and the whole object must serialise to at most 3072 bytes
+      responses:
+        "202":
+          description: Accepted — the fan-out runs in the background; `jobId` resolves through GET /admin/notifications/{jobId}, and `sent` counts tickets Expo accepted, not delivered devices
+        "400":
+          description: Body is not a JSON object, title/body missing or too long, or the data payload is not an object / too large
+
+  /admin/notifications/{jobId}:
+    get:
+      tags: [admin]
+      summary: Result of one broadcast job
+      description: "ROLES: admin ONLY."
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Job record — status (queued/running/done/failed), sent (accepted tickets = device tokens), failed, distinctUsers, timestamps
+        "404":
+          description: Unknown job — the registry is in-process, so a restart forgets it
+
+  /admin/reports:
+    get:
+      tags: [admin]
+      summary: List user-filed reports (admin or curator)
+      description: >
+        The complaint ledger POST /social/reports fills. No filter means the open
+        queue; the archive is opt-in. Newest first, capped at 200 rows. For 'user'
+        targets the target's display name rides along.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [open, resolved]
+            default: open
+      responses:
+        "200":
+          description: Reports
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reports:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        reporterId: { type: string }
+                        reporterName: { type: string }
+                        targetType: { type: string, enum: [user, post, message] }
+                        targetId: { type: string }
+                        targetUserName: { type: string, nullable: true }
+                        reason: { type: string }
+                        status: { type: string, enum: [open, resolved] }
+                        createdAt: { type: string }
+        "400":
+          description: Unknown status filter
+        "403":
+          description: Not an admin or curator
+
+  /admin/reports/{reportId}:
+    put:
+      tags: [admin]
+      summary: Resolve or reopen a report (admin or curator; audited)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [open, resolved]
+      responses:
+        "200":
+          description: New status
+        "400":
+          description: Unknown status
+        "404":
+          description: Report not found
 
   # ── Scraper ───────────────────────────────────────────────────────────────
 
@@ -1446,11 +2814,48 @@ paths:
     get:
       tags: [scraper]
       summary: Recent scraper runs (admin only)
+      description: |
+        `runs` holds the 20 newest runs, newest first, all sources mixed.
+        Every run carries two counts under both the historical
+        `articlesFound`/`articlesNew` keys and the source-neutral
+        `itemsFound`/`itemsNew` aliases (same numbers).
+        What they mean depends on the source:
+
+          * `knf.vu.lt`, `vu.lt` — articles considered / rows inserted
+          * `tvarkarasciai.vu.lt` — lessons scraped / lessons not already stored
+          * `knf.vu.lt/info` — contacts + programs found / sections whose stored
+            blob actually changed
+
+        `sources` is the per-source summary: one entry per source with its
+        `latest`, `lastSuccess` and `lastFailure` run (each in the same run
+        shape, or null). Twenty mixed rows are only a few hours of news runs,
+        so a source that has been failing for weeks is invisible in `runs`
+        alone.
+
+        A run that completed with one section broken is `completed` and names
+        the broken section in `error`. A run a killed process left `running` is
+        reconciled to `failed` with `interrupted` when the scheduler next
+        starts. Runs older than 30 days are pruned, except each source's newest,
+        which is kept whatever its age.
+      parameters:
+        - name: source
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Only this source's runs and summary (e.g. `knf.vu.lt`)
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [running, completed, failed]
+          description: Only runs in this status; an unknown value is ignored
       security:
         - bearerAuth: []
       responses:
         "200":
-          description: Scraper run history
+          description: Scraper run history plus the per-source summary
         "401":
           description: Authentication required
         "403":
@@ -1460,29 +2865,92 @@ paths:
     post:
       tags: [scraper]
       summary: Manually trigger news scrape (admin only)
+      description: >
+        ROLES: admin ONLY. Runs scrape_knf_news(pages=2) then
+        scrape_vu_news(pages=1) in the request thread — the same page counts
+        the 20-minute timer uses — and with notifications off, so a hand-fired
+        scrape never pushes to every device. Each scraper's object carries its
+        counts plus "runId"; a failure carries "error": "scrape_failed" (the
+        exception text stays in the log and in scraper_runs.error_message).
+        POST /scraper/run is the same handler under a second URL.
       security:
         - bearerAuth: []
       responses:
         "200":
           description: Scrape results
+        "401":
+          description: Authentication required
+        "403":
+          description: Admin role required
+        "409":
+          description: A run of one of these scrapers was already in progress
+        "502":
+          description: One of the scrapers failed — see "error" and "runId"
+
+  /scraper/run:
+    post:
+      tags: [scraper]
+      summary: Manually trigger news scrape — alias of /scraper/trigger (admin only)
+      description: >
+        ROLES: admin ONLY. The SAME handler as POST /scraper/trigger, bound
+        to a second URL; both run scrape_knf_news(pages=2) then
+        scrape_vu_news(pages=1) in the request thread and answer
+        {"knf": {...}, "vu": {...}} — 200 when both ran, 409 when one was
+        already running, 502 when one failed. A failed scraper reports
+        {"found": 0, "new": 0, "error": "scrape_failed", "runId": "..."} under
+        its own key; look the run up through GET /scraper/status. Both run with
+        notifications off, so a manual run never pushes to users.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Scrape results, one object per scraper
+        "401":
+          description: Authentication required
+        "403":
+          description: Admin role required
+        "409":
+          description: A run of one of these scrapers was already in progress
+        "502":
+          description: One of the scrapers failed — see "error" and "runId"
 
   /scraper/schedule:
     post:
       tags: [scraper]
       summary: Manually trigger schedule scrape (admin only)
+      description: >
+        ROLES: admin ONLY. Walks every group tvarkarasciai.vu.lt lists over the
+        rolling window and reconciles the anchor semester — by far the slowest
+        of the four scrapers, and it runs with notifications off. Answers
+        {"groups_scraped", "lessons_found", "lessons_new", "dropped", "runId"}:
+        200 when it ran, 409 when the 6 h job was still going, 502 when it
+        failed ("error": "scrape_failed"). An empty group list or a run in which
+        no group yielded a single lesson counts as a FAILURE, not an empty
+        semester.
       security:
         - bearerAuth: []
       responses:
         "200":
           description: Schedule scrape results
+        "401":
+          description: Authentication required
+        "403":
+          description: Admin role required
+        "409":
+          description: A schedule scrape was already in progress
+        "502":
+          description: The scrape failed — see "error" and "runId"
 
   /scraper/info:
     post:
       tags: [scraper]
       summary: Manually trigger faculty info scrape (admin only)
       description: |
-        Scrapes knf.vu.lt for staff contacts, study programs, and
-        department structure. Results stored in DB and served via /info.
+        ROLES: admin ONLY. Scrapes knf.vu.lt for staff contacts, study programs,
+        and department structure. Results stored in DB and served via /info.
+        200 when it ran, 409 when the 24 h job was still going, 502 when it
+        failed ("error": "scrape_failed" plus "runId" — the exception text stays
+        in the log and in scraper_runs.error_message).
       security:
         - bearerAuth: []
       responses:
@@ -1499,14 +2967,31 @@ paths:
                     type: integer
                   programs_found:
                     type: integer
+                  runId:
+                    type: string
+        "401":
+          description: Authentication required
+        "403":
+          description: Admin role required
+        "409":
+          description: An info scrape was already in progress
+        "502":
+          description: The scrape failed — see "error" and "runId"
 
   /uploads:
     post:
       tags: [uploads]
       summary: Upload an image file
       description: |
-        Upload an image (jpg, jpeg, png, gif, webp). Max 5 MB.
+        Upload an image (jpg, jpeg, png, gif, webp, bmp, tiff). Max 5 MB
+        and 30 megapixels. The file is re-encoded server-side: EXIF/GPS
+        metadata is stripped, oversized images are downscaled and the
+        stored format (and therefore the returned extension) is chosen
+        from the bytes, not from the uploaded filename.
         Returns a URL path to access the uploaded file.
+        Limited to 20 uploads per user per 5 minutes, and to 100 MB of
+        stored files per account. Every error body carries a
+        machine-readable `code` beside the human `error`.
       security:
         - bearerAuth: []
       requestBody:
@@ -1535,21 +3020,33 @@ paths:
                     type: string
                     example: abc123.png
         "400":
-          description: Bad request (no file, invalid type, too large)
+          description: |
+            Bad request; code is one of no_file, empty_file, file_too_large,
+            bad_file_type, bad_file_content, image_too_large
         "401":
           description: Authentication required
+        "413":
+          description: Storage quota reached (code quota_exceeded), or the body exceeded the 6 MB request limit
+        "429":
+          description: Too many uploads (code rate_limited); Retry-After tells the client when to try again
+        "507":
+          description: The file could not be written to storage (code storage_unavailable)
 
   /uploads/{filename}:
     get:
       tags: [uploads]
       summary: Serve an uploaded file
-      description: No authentication required. Images are publicly accessible.
+      description: |
+        No authentication required. Images are publicly accessible.
+        Cached for 24 h, but as `Cache-Control: private` — chat photos
+        are served from here too, so shared caches must not keep them.
       parameters:
         - in: path
           name: filename
           required: true
           schema:
             type: string
+            pattern: '^[0-9a-f]{32}\.(jpg|jpeg|png|gif|webp)$'
       responses:
         "200":
           description: The image file
@@ -1558,6 +3055,42 @@ paths:
               schema:
                 type: string
                 format: binary
+        "400":
+          description: The name is not a stored upload name (code bad_filename)
+        "404":
+          description: File not found
+    delete:
+      tags: [uploads]
+      summary: Delete an uploaded file (owner or admin)
+      description: |
+        Removes the file and its ownership row. Files uploaded before the
+        ownership table existed have no owner and are admin-only.
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: filename
+          required: true
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{32}\.(jpg|jpeg|png|gif|webp)$'
+      responses:
+        "200":
+          description: File deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        "400":
+          description: The name is not a stored upload name (code bad_filename)
+        "401":
+          description: Authentication required
+        "403":
+          description: Only the owner (or an admin) may delete the file
         "404":
           description: File not found
 
@@ -1569,6 +3102,15 @@ paths:
         Returns contacts, links, building hours, study programs, and FAQ.
         When scraped data is available from knf.vu.lt, contacts and programs
         are served from the scraper; links, hours, and FAQ use curated data.
+
+        A scraped block is only used when it has the right shape, clears a small
+        size floor and is no older than 30 days - otherwise the curated data
+        stands. `updatedAt` dates whatever scraped data was actually served (it is
+        absent when none was), and `lang` echoes the language served after the
+        value is normalised ("EN-GB" -> "en", anything unknown -> "lt").
+
+        Answers carry `Cache-Control: public, max-age=86400` (the 24 h scrape
+        interval) and a weak `ETag`; a matching `If-None-Match` gets a 304.
       parameters:
         - name: lang
           in: query
@@ -1576,13 +3118,16 @@ paths:
             type: string
             enum: [lt, en]
             default: lt
-          description: Language (lt or en)
+          description: Language; normalised and silently defaulted to lt when unknown
         - name: section
           in: query
           schema:
             type: string
-            enum: [contacts, links, hours, programs, faq]
-          description: Filter to a single section
+            enum: [contacts, links, hours, programs, faq, general_contact]
+          description: |
+            Filter to a single section; the answer is {section, lang, updatedAt}.
+            A name that is not a key of the payload is a 400 (general_contact only
+            exists once a scrape has provided one).
       responses:
         "200":
           description: Faculty information
@@ -1611,6 +3156,9 @@ paths:
                                 type: string
                               room:
                                 type: string
+                              position:
+                                type: string
+                                description: Job title; scraped staff entries only
                   links:
                     type: array
                     items:
@@ -1655,6 +3203,247 @@ paths:
                           type: string
                         a:
                           type: string
+                  general_contact:
+                    type: object
+                    description: Faculty-wide contact block; present only after a scrape found one
+                    properties:
+                      address:
+                        type: string
+                      phone:
+                        type: string
+                      email:
+                        type: string
+                  lang:
+                    type: string
+                    enum: [lt, en]
+                    description: The language actually served
+                  updatedAt:
+                    type: string
+                    description: Newest scrape timestamp behind the served data; absent when none was used
+        "304":
+          description: Not modified - If-None-Match matched the ETag
+        "400":
+          description: Unknown section (code unknown_section)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  # ── Notifications ─────────────────────────────────────────────────────────
+
+  /notifications/register:
+    post:
+      tags: [notifications]
+      summary: Register (or re-register) this device's Expo push token
+      description: >
+        Stores the token against the caller. An existing row of the caller's own
+        is reactivated and refreshed (200); a brand-new token, or one that
+        belonged to another user because the device changed hands, yields 201.
+        The token must match the full Expo grammar
+        ExponentPushToken[A-Za-z0-9_-]{10,64}. The caller keeps at most 10
+        tokens — registering an eleventh drops the one that went longest without
+        re-registering.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  maxLength: 200
+                  pattern: "^ExponentPushToken\\[[A-Za-z0-9_-]{10,64}\\]$"
+                platform:
+                  type: string
+                  enum: [ios, android, web, unknown]
+                  default: unknown
+                  description: Anything else is stored as "unknown"
+                language:
+                  type: string
+                  enum: [lt, en]
+                  default: lt
+                  description: Picks the language of the push copy for this device
+      responses:
+        "200":
+          description: The caller already held this token — reactivated and refreshed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushTokenRegistration"
+        "201":
+          description: New token stored (or moved to the caller from a previous owner)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PushTokenRegistration"
+        "400":
+          description: Missing token, non-string token, over 200 characters, or not a valid Expo token
+        "401":
+          description: Not authenticated
+        "429":
+          description: Too many registrations for this user (code rate_limited; 20 per 5 minutes)
+          headers:
+            Retry-After:
+              description: Seconds until one attempt frees up in the window
+              schema:
+                type: integer
+    delete:
+      tags: [notifications]
+      summary: Remove this device's push token
+      description: >
+        Deletes the caller's OWN row for that token, so a token that has since
+        moved to another user answers 404. The token grammar is NOT enforced
+        here, so an owner can still remove a legacy row.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  maxLength: 200
+      responses:
+        "200":
+          description: Token removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  unregistered:
+                    type: boolean
+                    example: true
+        "400":
+          description: Missing token, non-string token, or over 200 characters
+        "401":
+          description: Not authenticated
+        "404":
+          description: The caller holds no row for that token
+        "429":
+          description: Too many calls for this user (code rate_limited; 20 per 5 minutes)
+          headers:
+            Retry-After:
+              description: Seconds until one attempt frees up in the window
+              schema:
+                type: integer
+
+  /notifications/channels:
+    get:
+      tags: [notifications]
+      summary: The caller's four per-topic push switches
+      description: >
+        Always all four keys. Opt-out model — a channel with no stored row
+        reads as true, so a fresh user hears everything.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current switches
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationChannels"
+        "401":
+          description: Not authenticated
+    put:
+      tags: [notifications]
+      summary: Flip some of the switches
+      description: >
+        Partial update — only the channels present are written, an empty dict is
+        a no-op. Validation runs over the whole map before the first write, so a
+        bad entry never leaves a half-applied batch. The response is the full
+        resulting state, in GET's shape.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channels]
+              properties:
+                channels:
+                  type: object
+                  additionalProperties:
+                    type: boolean
+                  description: Any subset of news / chat / schedule / admin
+                  example:
+                    chat: true
+                    news: false
+      responses:
+        "200":
+          description: Switches saved — the full resulting state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationChannels"
+        "400":
+          description: >
+            Missing channels dict, an unknown channel name, or a value that is
+            not a JSON boolean (1/0 included)
+        "401":
+          description: Not authenticated
+        "429":
+          description: Too many updates for this user (code rate_limited; 60 per 5 minutes)
+          headers:
+            Retry-After:
+              description: Seconds until one attempt frees up in the window
+              schema:
+                type: integer
+
+  /notifications/chat-preview:
+    get:
+      tags: [notifications]
+      summary: Read the "message text in notifications" switch
+      description: >
+        Enabled (the default) ships a chat message's first 100 characters to the
+        push service as the notification body; disabled sends the content-free
+        "Nauja žinutė" instead, so private text never leaves the backend for
+        offline delivery.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+        "401":
+          description: Not authenticated
+    put:
+      tags: [notifications]
+      summary: Flip the "message text in notifications" switch
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean }
+      responses:
+        "200":
+          description: New state
+        "400":
+          description: enabled missing or not a boolean
+        "429":
+          description: Too many updates for this user (code rate_limited; 30 per 5 minutes)
 
 components:
   securitySchemes:
@@ -1663,6 +3452,106 @@ components:
       scheme: bearer
 
   schemas:
+    Error:
+      type: object
+      description: >
+        Every error body the API sends. `error` is human-readable and its
+        wording is NOT contract — never match on it. `code` is the stable
+        machine slug and is present only where a route sets one
+        (rate_limited, weak_password, invalid_username, invalid_email,
+        invite_invalid, invite_exhausted, invite_expired, unknown_section,
+        bad_filename, invalid_credentials, friend_request_cooldown,
+        file_too_large, database_busy); older error paths still answer with
+        `error` alone. Error bodies are HTML-entity escaped exactly like every
+        other JSON body (see the API description) — they used to be the one
+        unescaped path, and the mobile client decoded them anyway.
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: Too many attempts
+        code:
+          type: string
+          description: Stable slug for the client to branch on; absent on routes that set none
+          example: rate_limited
+
+    AdminInvitation:
+      type: object
+      description: >
+        One invitation code as the admin screens see it. A curator's listing
+        is filtered to their own student/teacher rows — the shape is the
+        same, the set is not.
+      properties:
+        id:
+          type: string
+          description: The row id; this, not `code`, is what DELETE takes
+        code:
+          type: string
+          description: 12 uppercase hex characters
+        role:
+          type: string
+          enum: [student, teacher, admin, curator]
+        maxUses:
+          type: integer
+        useCount:
+          type: integer
+        expiresAt:
+          type: string
+          description: ISO-8601 with a +00:00 offset (aware), unlike the naive UTC stamps elsewhere
+        createdAt:
+          type: string
+        createdBy:
+          type: string
+          description: The minting admin's user id; null on rows older than the audit trail
+          nullable: true
+        expired:
+          type: boolean
+          description: Derived. An unparsable or NULL expiresAt reads as expired — the same verdict registration reaches
+        fullyUsed:
+          type: boolean
+          description: Derived, useCount >= maxUses
+
+    AdminUser:
+      type: object
+      description: >
+        The user shape both GET /admin/users and PATCH /admin/users/{userId}
+        answer with. No password hash, and no avatar or student-card fields —
+        this is not the User schema.
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        email:
+          type: string
+        displayName:
+          type: string
+        role:
+          type: string
+          enum: [student, teacher, admin, curator]
+        active:
+          type: boolean
+          description: false = deactivated; login answers 403 and every session of theirs is rejected
+        createdAt:
+          type: string
+
+    AdminStats:
+      type: object
+      description: The five dashboard counters, from a snapshot at most 45 s old.
+      properties:
+        users:
+          type: integer
+        posts:
+          type: integer
+        scrapedArticles:
+          type: integer
+          description: news_posts whose source is knf.vu.lt or vu.lt only
+        comments:
+          type: integer
+        activeInvitations:
+          type: integer
+          description: Codes with uses left that have not expired
+
     User:
       type: object
       properties:
@@ -1683,6 +3572,50 @@ components:
         invited:
           type: boolean
           description: Whether user registered via invitation code (true = higher trust)
+        studentNumber:
+          type: string
+          nullable: true
+          description: Student-card field, set via PUT /auth/me or PUT /social/profile
+        studyGroup:
+          type: string
+          nullable: true
+          description: Student-card field, set via PUT /auth/me or PUT /social/profile
+        studyProgram:
+          type: string
+          nullable: true
+          description: Student-card field, set via PUT /auth/me or PUT /social/profile
+
+    ProfileUpdateResponse:
+      type: object
+      description: >
+        What PUT /social/profile answers — a hand-picked subset of User (no createdAt, no
+        active). Merge it into the cached user rather than replacing the object.
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        email:
+          type: string
+        displayName:
+          type: string
+        avatarUrl:
+          type: string
+          nullable: true
+        role:
+          type: string
+          enum: [student, teacher, admin, curator]
+        invited:
+          type: boolean
+        studentNumber:
+          type: string
+          nullable: true
+        studyGroup:
+          type: string
+          nullable: true
+        studyProgram:
+          type: string
+          nullable: true
 
     UserSummary:
       type: object
@@ -1709,6 +3642,10 @@ components:
 
     NewsPost:
       type: object
+      description: >
+        Every string field here — title, content, summary, imageUrl, sourceUrl —
+        arrives HTML-entity escaped (see the API description); decode before
+        rendering or before using a URL.
       properties:
         id:
           type: string
@@ -1748,6 +3685,14 @@ components:
         liked:
           type: boolean
           description: Whether the current user has liked this post
+        poll:
+          allOf:
+            - $ref: "#/components/schemas/Poll"
+          description: >
+            Present only on feed and single-post items whose postType is
+            'poll' — the poll travels with the post so a poll card needs no
+            second round trip. Additive: GET /news/{postId}/poll still works
+            and clients that ignore this field are unaffected.
 
     Comment:
       type: object
@@ -1758,6 +3703,9 @@ components:
           type: string
         time:
           type: string
+          description: >
+            ISO-8601 UTC with an explicit +00:00 offset. Legacy space-form
+            rows are normalised on the way out, so one shape reaches clients.
         userName:
           type: string
         userAvatar:
@@ -1798,6 +3746,8 @@ components:
           enum: [direct, group]
         title:
           type: string
+          nullable: true
+          description: Null for a direct chat whose counterpart left (clients render their localized fallback)
         avatarEmoji:
           type: string
           nullable: true
@@ -1833,13 +3783,21 @@ components:
               nullable: true
             time:
               type: string
+              description: UTC HH:MM, DEPRECATED — format createdAt/lastUpdatedMs in the client instead
             senderId:
               type: string
             senderName:
               type: string
+            deleted:
+              type: boolean
+              description: True when the message was unsent — text and imageUrl are blanked and clients render their placeholder
 
     Message:
       type: object
+      description: >
+        Message text arrives HTML-entity escaped over REST (see the API
+        description). The SAME message pushed over Socket.IO is NOT escaped, so
+        a client that decodes both paths must decode only the REST one.
       properties:
         id:
           type: string
@@ -1859,10 +3817,31 @@ components:
           nullable: true
         time:
           type: string
-          description: "HH:MM format"
+          description: >
+            HH:MM of the UTC stamp — NOT the reader's local time and NOT
+            Lithuanian time. DEPRECATED: format createdAt in the client instead;
+            the field stays on the wire for older builds.
         createdAt:
           type: string
-          description: ISO datetime
+          description: ISO datetime, naive UTC (no zone suffix)
+        clientMsgId:
+          type: string
+          nullable: true
+          description: The sender's idempotency nonce — null on rows sent without one
+        replyTo:
+          type: object
+          nullable: true
+          description: The quoted message, null when this is not a reply. An unsent or vanished quote comes back with deleted=true and blank content.
+          properties:
+            id: {type: string}
+            senderId: {type: string, nullable: true}
+            senderName: {type: string, nullable: true}
+            text: {type: string}
+            imageUrl: {type: string, nullable: true}
+            deleted: {type: boolean}
+        deleted:
+          type: boolean
+          description: True when the message was unsent — text and imageUrl come back blank
         isOwn:
           type: boolean
         status:
@@ -1889,6 +3868,75 @@ components:
                 type: array
                 items:
                   type: string
+
+    SentMessage:
+      type: object
+      description: >
+        The narrower shape POST /chat/conversations/{convId}/messages answers with:
+        the row as its sender sees it the moment it is written. It is the
+        'new_message' socket payload plus isOwn/status/readBy — reactions is
+        ALWAYS empty, status is always "sent" and readBy holds the sender alone
+        (use GET .../messages for the full Message shape).
+      properties:
+        id:
+          type: string
+        conversationId:
+          type: string
+        senderId:
+          type: string
+        senderName:
+          type: string
+        senderAvatar:
+          type: string
+          nullable: true
+        text:
+          type: string
+        imageUrl:
+          type: string
+          nullable: true
+        time:
+          type: string
+          description: >
+            HH:MM of the UTC stamp — NOT the reader's local time. DEPRECATED:
+            format createdAt in the client instead.
+        createdAt:
+          type: string
+          description: ISO datetime, naive UTC (no zone suffix)
+        clientMsgId:
+          type: string
+          nullable: true
+          description: Echo of the request's client_msg_id — clients match it to their optimistic bubble
+        replyTo:
+          type: object
+          nullable: true
+          description: The quoted message, null when this is not a reply
+          properties:
+            id: {type: string}
+            senderId: {type: string, nullable: true}
+            senderName: {type: string, nullable: true}
+            text: {type: string}
+            imageUrl: {type: string, nullable: true}
+            deleted: {type: boolean}
+        deleted:
+          type: boolean
+          description: Always false on a fresh send; true on a replay whose message was since unsent
+        isOwn:
+          type: boolean
+          description: Always true
+        status:
+          type: string
+          enum: [sent]
+          description: Always "sent" — only the sender's own receipt exists yet
+        readBy:
+          type: array
+          items:
+            type: string
+          description: The sender's own id alone
+        reactions:
+          type: array
+          description: Always empty — a brand-new message carries no reactions
+          items:
+            type: object
 
     Poll:
       type: object
@@ -1981,3 +4029,29 @@ components:
           type: string
         friendsSince:
           type: string
+
+    PushTokenRegistration:
+      type: object
+      properties:
+        registered:
+          type: boolean
+          example: true
+        tokenId:
+          type: string
+          description: The push_tokens row id — stable across re-registrations of the same token
+
+    NotificationChannels:
+      type: object
+      properties:
+        channels:
+          type: object
+          description: Always all four names; a channel with no stored row reads as true
+          properties:
+            news:
+              type: boolean
+            chat:
+              type: boolean
+            schedule:
+              type: boolean
+            admin:
+              type: boolean

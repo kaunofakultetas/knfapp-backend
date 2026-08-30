@@ -1,20 +1,18 @@
 ############################################################
 #  [*] Schedule — the lecture timetable API
 #
-#  Read side of schedule_lessons: the filtered lesson list
-#  and the distinct group/semester values behind the mobile
-#  filter sheet. No login on the reads — the timetable is
-#  the app's "works without an account" screen; only the
-#  demo seed is admin-gated.
+#  Read side of schedule_lessons: one capped page of lessons
+#  and the group/semester/day values behind the mobile filter
+#  sheet. No login on either read — the timetable is the
+#  app's "works without an account" screen.
 #
 #  Who writes the table: scraper/schedule_scraper.py
 #  (scrape_knf_schedule — 30 s after boot and every 6 h via
-#  scraper/scheduler.py, or POST /api/scraper/schedule),
-#  database/__init__.py _seed_defaults (11 first-boot rows
-#  for ISKS-1 under the odd label "2025-pavasaris"), and
-#  seed_schedule below. Nothing ever deletes rows: stale
-#  semesters accumulate, and the /seed fixtures stack up
-#  again on every call.
+#  scraper/scheduler.py, or POST /api/scraper/schedule), and
+#  nothing else any more. The admin demo-seed route is gone:
+#  nothing ever called it and every call appended its 31
+#  fixtures again; database/__init__.py dropped its own 11
+#  first-boot "2025-pavasaris" rows in the same wave.
 #
 #  Times are "HH:MM" wall-clock strings, day_of_week is
 #  0 = Monday … 6 = Sunday (a CHECK on the table), and
@@ -22,18 +20,179 @@
 #  / "YYYY-R" (autumn) shape. The JSON is camelCased:
 #  group_name → group, time_start → timeStart.
 #
-#    GET  /api/schedule         — lessons, optionally filtered
-#    GET  /api/schedule/filters — distinct groups + semesters
-#    POST /api/schedule/seed    — 31 demo lessons (admin)
+#  Two habits both reads share: a semester label only counts
+#  once it carries MIN_SEMESTER_LESSONS rows (the scraper
+#  labels per event, so a single stray row used to mint a
+#  whole picker option), and every answer carries a weak
+#  ETag over the table's own version plus Cache-Control — a
+#  relaunch costs a 304 and no body.
+#
+#    GET /api/schedule         — one capped page of lessons
+#    GET /api/schedule/filters — groups + semesters + days
 ############################################################
 
 
-from flask import Blueprint, jsonify, request
+import hashlib
+import re
 
-from app.auth.routes import require_role
+from flask import Blueprint, jsonify, make_response, request
+
 from app.database import get_db
 
+# One page of lessons. An unfiltered call used to stream the
+# whole growing table to anonymous callers; ?limit and ?offset
+# page through it and MAX_LESSONS is the hard ceiling.
+MAX_LESSONS = 500
+MAX_OFFSET = 100000
+
+# How many rows a semester label needs before it is offered as
+# a filter value or picked as the default semester.
+MIN_SEMESTER_LESSONS = 5
+
+# The timetable scraper ticks every 6 h (scraper/scheduler.py),
+# so a client copy may live exactly that long — the mobile app
+# keeps its own week-long copy on top (services/cache.ts).
+CACHE_MAX_AGE = 6 * 3600
+
+# ASCII digits only: int() also accepts Unicode digits ("٣"),
+# underscores ("3_0") and surrounding whitespace.
+_DIGITS_RE = re.compile(r"[0-9]{1,9}")
+
 schedule_bp = Blueprint("schedule", __name__)
+
+
+
+
+
+
+
+
+############################################################
+# _parse_count
+############################################################
+#
+# One non-negative integer query param → (value, None) or
+# (None, (response, 400)), the same "return the error as a
+# ready tuple" shape api.parse_pagination uses. An absent
+# param takes `default`; anything that is not a run of ASCII
+# digits is a 400 (bare int() would swallow "3_0", " 3" and
+# Unicode digits); a number outside [minimum, maximum] is
+# CLAMPED rather than rejected, so a client asking for
+# 10 000 lessons simply gets the cap.
+#
+# Used by:
+#   - get_schedule (below) — ?limit and ?offset
+############################################################
+
+def _parse_count(raw, name, default, minimum, maximum):
+    if raw is None:
+        return default, None
+    if not _DIGITS_RE.fullmatch(raw):
+        return None, (jsonify({"error": f"Parameter '{name}' must be a non-negative integer"}), 400)
+    return min(max(int(raw), minimum), maximum), None
+
+
+
+
+
+
+
+
+############################################################
+# _semester_options
+############################################################
+#
+# The semester labels worth showing, newest first: only the
+# ones carrying at least MIN_SEMESTER_LESSONS rows, so a
+# single mislabelled lesson never becomes a picker entry.
+# COLLATE NOCASE on the ORDER BY, because the plain BINARY
+# sort put any lowercase label (the retired "2025-pavasaris"
+# seed) above every "2025-R"/"2025-P". Inside the
+# "YYYY-P"/"YYYY-R" family the text sort IS chronological —
+# R (autumn) follows P (spring) in the same year.
+#
+# Used by:
+#   - get_schedule (below) — [0] is the default semester
+#   - get_schedule_filters (below) — the picker values
+############################################################
+
+def _semester_options(db):
+    rows = db.execute(
+        """SELECT semester FROM schedule_lessons
+           WHERE semester IS NOT NULL AND semester != ''
+           GROUP BY semester
+           HAVING COUNT(*) >= ?
+           ORDER BY semester COLLATE NOCASE DESC""",
+        (MIN_SEMESTER_LESSONS,),
+    ).fetchall()
+
+    return [r["semester"] for r in rows]
+
+
+
+
+
+
+
+
+############################################################
+# _table_version
+############################################################
+#
+# A cheap "has anything changed" fingerprint of
+# schedule_lessons — row count plus the newest created_at —
+# for the ETag seeds. Derived from the DATA, never from the
+# response body: app/__init__.py's escape_json_output hook
+# rewrites the body after the view returns, so a body hash
+# would describe bytes this function never sees.
+#
+# Used by:
+#   - get_schedule, get_schedule_filters (below)
+############################################################
+
+def _table_version(db):
+    row = db.execute(
+        "SELECT COUNT(*) AS rows_total, MAX(created_at) AS newest FROM schedule_lessons"
+    ).fetchone()
+
+    return f"{row['rows_total']}:{row['newest'] or '-'}"
+
+
+
+
+
+
+
+
+############################################################
+# _conditional_json
+############################################################
+#
+# Wraps a payload in a cacheable response: a weak ETag over
+# `seed` (the data version plus the query that shaped the
+# answer) and Cache-Control: public, max-age=CACHE_MAX_AGE.
+# A matching If-None-Match answers 304 with no body — the
+# timetable is identical bytes between two 6 h scrapes.
+# Weak on purpose: escape_json_output re-serialises the body
+# afterwards, so the tag identifies the DATA, not an
+# octet-exact entity.
+#
+# Used by:
+#   - get_schedule, get_schedule_filters (below)
+############################################################
+
+def _conditional_json(payload, seed):
+    tag = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+    if request.if_none_match.contains_weak(tag):
+        response = make_response("", 304)
+    else:
+        response = make_response(jsonify(payload))
+
+    response.set_etag(tag, weak=True)
+    response.headers["Cache-Control"] = f"public, max-age={CACHE_MAX_AGE}"
+
+    return response
 
 
 
@@ -48,31 +207,39 @@ schedule_bp = Blueprint("schedule", __name__)
 #
 # GET /api/schedule
 #
-# Query ?day=0..6&group=ISKS-1&semester=2025-P — every one
-# optional, so no params returns the WHOLE table (all days,
-# all groups). day must parse as an int in 0..6 or it is a
-# 400; group/semester are exact string matches, and an
-# empty value counts as "no filter". The WHERE clause is
-# assembled with an f-string, but only from fixed
+# Query ?day=0..6&group=ISKS-1&semester=2025-P&limit=&offset=
+# — every one optional. day must be ASCII digits inside
+# 0..6 or it is a 400; group/semester are exact string
+# matches, and an empty value counts as "no filter"; limit
+# and offset must be ASCII digits too (400 otherwise) and
+# are clamped into 1..MAX_LESSONS / 0..MAX_OFFSET. The WHERE
+# clause is assembled with an f-string, but only from fixed
 # "column = ?" fragments — every user value is bound, and
 # "1=1" stands in when nothing is filtered.
 #
-# Rows come ORDER BY time_start alone: the "HH:MM" strings
-# are zero-padded, so the text sort is chronological, but
-# an unfiltered call has no day ordering — the client
-# groups by dayOfWeek itself.
+# Two behaviours worth knowing:
+#   - no ?semester means the NEWEST semester carrying
+#     MIN_SEMESTER_LESSONS rows, not "everything ever
+#     scraped"; an unfiltered call used to interleave years.
+#     ?semester=all is the explicit opt-out for a client that
+#     really does want every semester at once
+#   - the answer is ONE page of at most MAX_LESSONS rows
+#     ordered day_of_week, time_start, group_name, id, so
+#     days no longer interleave while the client keeps
+#     grouping by dayOfWeek itself
 #
 # Used by:
 #   - services/api/schedule.ts — fetchSchedule, called from
 #     app/(main)/tabs/schedule.tsx with the selected day and
-#     the group/semester picks
+#     the group/semester picks (it sends neither limit nor
+#     offset, so only the cap applies)
 #   - swagger/swagger.yaml documents it
 ############################################################
 
 @schedule_bp.route("", methods=["GET"])
 def get_schedule():
-    # STEP 1: read the filters — only day needs parsing, and
-    # a bad one is refused before any DB work
+    # STEP 1: read and validate the filters — every bad one
+    # is refused before any DB work
     # ======================================================
     day_raw = request.args.get("day")
     group = request.args.get("group")
@@ -80,19 +247,37 @@ def get_schedule():
 
     day = None
     if day_raw is not None:
-        try:
-            day = int(day_raw)
-        except (ValueError, TypeError):
+        if not _DIGITS_RE.fullmatch(day_raw):
             return jsonify({"error": "Parameter 'day' must be an integer (0=Monday..6=Sunday)"}), 400
+        day = int(day_raw)
         if day < 0 or day > 6:
             return jsonify({"error": "Parameter 'day' must be between 0 (Monday) and 6 (Sunday)"}), 400
 
+    limit, err = _parse_count(request.args.get("limit"), "limit", MAX_LESSONS, 1, MAX_LESSONS)
+    if err:
+        return err
 
-    # STEP 2: assemble the WHERE from fixed fragments — the
-    # values themselves are always bound parameters
-    # =====================================================
+    offset, err = _parse_count(request.args.get("offset"), "offset", 0, 0, MAX_OFFSET)
+    if err:
+        return err
+
+
+    # STEP 2: default the semester to the newest real one —
+    # the app sends none and used to get every year at once;
+    # "all" is the way back to the old every-semester answer
+    # ======================================================
     db = get_db()
     try:
+        if semester and semester.strip().lower() == "all":
+            semester = None
+        elif not semester:
+            options = _semester_options(db)
+            semester = options[0] if options else None
+
+
+        # STEP 3: assemble the WHERE from fixed fragments —
+        # the values themselves are always bound parameters
+        # =================================================
         where = []
         params = []
 
@@ -109,15 +294,20 @@ def get_schedule():
         where_sql = " AND ".join(where) if where else "1=1"
 
 
-        # STEP 3: fetch and camelCase — time_start sorts as
-        # text, chronological only because every writer
-        # zero-pads the hour
-        # =================================================
+        # STEP 4: fetch one capped page and camelCase it —
+        # the nine columns the wire shape actually uses, and
+        # a total order so days never interleave (time_start
+        # sorts as text, chronological only because every
+        # writer zero-pads the hour)
+        # ==================================================
         rows = db.execute(
-            f"""SELECT * FROM schedule_lessons
+            f"""SELECT id, title, teacher, room, time_start, time_end,
+                       day_of_week, group_name, semester
+                FROM schedule_lessons
                 WHERE {where_sql}
-                ORDER BY time_start""",
-            params,
+                ORDER BY day_of_week, time_start, group_name, id
+                LIMIT ? OFFSET ?""",
+            (*params, limit, offset),
         ).fetchall()
 
         lessons = [
@@ -135,7 +325,18 @@ def get_schedule():
             for r in rows
         ]
 
-        return jsonify({"lessons": lessons})
+
+        # STEP 5: answer through the ETag — the same query
+        # against an unchanged table costs a 304. The filters
+        # go in as a repr'd tuple, not pipe-joined text: a
+        # "|" inside a group name used to let
+        # ?group=a|b&semester=c and ?group=a&semester=b|c
+        # hash the same seed, so one of them answered 304 to
+        # the other one's cached copy
+        # ====================================================
+        seed = f"schedule|{_table_version(db)}|{(day, group, semester, limit, offset)!r}"
+
+        return _conditional_json({"lessons": lessons}, seed)
     finally:
         db.close()
 
@@ -152,140 +353,99 @@ def get_schedule():
 #
 # GET /api/schedule/filters
 #
-# {"groups": [...], "semesters": [...]} — DISTINCT non-NULL
-# values straight off schedule_lessons, groups ascending
-# and semesters descending. Both are plain text sorts under
-# SQLite's BINARY collation, so newest-first holds inside
-# the "YYYY-P"/"YYYY-R" family, but the first-boot label
-# "2025-pavasaris" (lowercase p outranks every capital)
-# sorts ABOVE "2025-R" and "2025-P" for as long as those
-# seed rows exist.
+# {"groups": [...], "semesters": [...], "days": [...],
+# "semesterGroups": [{semester, groups}]} — the filter sheet
+# in one call. groups and semesters keep their old meaning
+# (the mobile contract), days is the DISTINCT day_of_week
+# list the client needs to know Saturday lectures exist at
+# all, and semesterGroups correlates the two lists that used
+# to be independent global DISTINCTs — most hand-made
+# group×semester pairs match nothing.
+#
+# An optional ?semester= scopes groups and days to that one
+# label; semesters and semesterGroups always describe the
+# whole table. Only semesters that clear
+# MIN_SEMESTER_LESSONS are listed (and only those appear in
+# semesterGroups), so a stray mislabelled lesson no longer
+# invents a semester.
 #
 # Used by:
 #   - services/api/schedule.ts — fetchScheduleFilters, the
 #     group/semester pickers in app/(main)/tabs/schedule.tsx
+#     (it sends no ?semester; days/semesterGroups are the
+#     additive half a mobile-side change can pick up)
 #   - swagger/swagger.yaml documents it
 ############################################################
 
 @schedule_bp.route("/filters", methods=["GET"])
 def get_schedule_filters():
+    semester = request.args.get("semester") or None
+
     db = get_db()
     try:
+        # STEP 1: the semester options, newest first and past
+        # the stray-label threshold
+        # ===================================================
+        semesters = _semester_options(db)
+
+
+        # STEP 2: groups and days — scoped to ?semester when
+        # one is given; the fragment is fixed text, the label
+        # itself is bound
+        # ==================================================
+        scope_sql = " AND semester = ?" if semester else ""
+        scope_params = (semester,) if semester else ()
+
         groups = [
             r["group_name"]
             for r in db.execute(
-                "SELECT DISTINCT group_name FROM schedule_lessons WHERE group_name IS NOT NULL ORDER BY group_name"
+                "SELECT DISTINCT group_name FROM schedule_lessons "
+                "WHERE group_name IS NOT NULL" + scope_sql + " ORDER BY group_name",
+                scope_params,
             ).fetchall()
         ]
-        semesters = [
-            r["semester"]
+        days = [
+            r["day_of_week"]
             for r in db.execute(
-                "SELECT DISTINCT semester FROM schedule_lessons WHERE semester IS NOT NULL ORDER BY semester DESC"
+                "SELECT DISTINCT day_of_week FROM schedule_lessons "
+                "WHERE day_of_week IS NOT NULL" + scope_sql + " ORDER BY day_of_week",
+                scope_params,
             ).fetchall()
         ]
-        return jsonify({"groups": groups, "semesters": semesters})
-    finally:
-        db.close()
 
 
+        # STEP 3: which groups really exist in which semester;
+        # labels below the threshold are dropped here too
+        # ====================================================
+        known = set(semesters)
+        by_semester = {}
+
+        for r in db.execute(
+            """SELECT semester, group_name FROM schedule_lessons
+               WHERE semester IS NOT NULL AND group_name IS NOT NULL
+               GROUP BY semester, group_name
+               ORDER BY group_name"""
+        ).fetchall():
+            if r["semester"] in known:
+                by_semester.setdefault(r["semester"], []).append(r["group_name"])
+
+        semester_groups = [
+            {"semester": s, "groups": by_semester.get(s, [])}
+            for s in semesters
+        ]
 
 
+        # STEP 4: answer through the ETag — these values only
+        # move when the scraper writes
+        # ===================================================
+        payload = {
+            "groups": groups,
+            "semesters": semesters,
+            "days": days,
+            "semesterGroups": semester_groups,
+        }
+        seed = f"filters|{_table_version(db)}|{semester}"
 
-
-
-
-############################################################
-# seed_schedule
-############################################################
-#
-# POST /api/schedule/seed
-#
-# Admin-only development fixture: 31 hard-coded lessons —
-# ISKS-1 (11), ISKS-2 (8) and VVB-1 (7) for spring "2025-P"
-# plus 5 ISKS-1 rows for autumn "2025-R" — each inserted
-# under a fresh uuid4. Answers {"message": "Seeded 31
-# lessons"}.
-#
-# Gotchas:
-#   - INSERT OR IGNORE only guards the primary key, and the
-#     key is minted per call, so nothing is ever ignored:
-#     every POST appends all 31 rows again, duplicates and
-#     all, and no route deletes them.
-#   - the labels DO match the scraper's "YYYY-P"/"YYYY-R"
-#     format, so these rows blend into the real filter
-#     values; the first-boot _seed_defaults set (semester
-#     "2025-pavasaris") is a separate, unrelated fixture.
-#   - the scraper's own dedupe compares all eight columns,
-#     so it neither collides with nor cleans up these rows.
-#
-# Used by:
-#   - nothing calls this at the moment — not the mobile app,
-#     not swagger, no main.py flag; it is a manual curl with
-#     an admin bearer token
-############################################################
-
-@schedule_bp.route("/seed", methods=["POST"])
-@require_role("admin")
-def seed_schedule():
-    # STEP 1: the fixture — tuple order is (title, teacher,
-    # room, time_start, time_end, day_of_week, group,
-    # semester); uuid is a local import, nothing else in the
-    # module needs it
-    # ======================================================
-    import uuid
-
-    demo_lessons = [
-        # ISKS-1, 2025-P (Spring)
-        ("Programavimo pagrindai", "Doc. J. Kazlauskas", "207", "08:30", "10:00", 0, "ISKS-1", "2025-P"),
-        ("Duomenų bazės", "Lekt. I. Petrauskaitė", "105", "10:15", "11:45", 0, "ISKS-1", "2025-P"),
-        ("Tinklų pagrindai", "Asist. K. Jonaitis", "Lab-3", "12:00", "13:30", 0, "ISKS-1", "2025-P"),
-        ("Diskrečioji matematika", "Prof. V. Matulis", "Aula", "14:00", "15:30", 0, "ISKS-1", "2025-P"),
-        ("Objektinis programavimas", "Doc. J. Kazlauskas", "207", "08:30", "10:00", 1, "ISKS-1", "2025-P"),
-        ("Kompiuterių architektūra", "Doc. A. Rimkus", "Lab-2", "10:15", "11:45", 1, "ISKS-1", "2025-P"),
-        ("Anglų kalba", "Lekt. S. Brown", "301", "12:00", "13:30", 2, "ISKS-1", "2025-P"),
-        ("Statistika", "Prof. V. Matulis", "Aula", "08:30", "10:00", 2, "ISKS-1", "2025-P"),
-        ("Programavimo pagrindai (Lab)", "Doc. J. Kazlauskas", "Lab-1", "10:15", "11:45", 3, "ISKS-1", "2025-P"),
-        ("Web technologijos", "Asist. K. Jonaitis", "Lab-3", "12:00", "13:30", 3, "ISKS-1", "2025-P"),
-        ("Duomenų bazės (Lab)", "Lekt. I. Petrauskaitė", "Lab-2", "14:00", "15:30", 4, "ISKS-1", "2025-P"),
-        # ISKS-2, 2025-P (Spring)
-        ("Operacinės sistemos", "Doc. A. Rimkus", "207", "08:30", "10:00", 0, "ISKS-2", "2025-P"),
-        ("Algoritmų analizė", "Prof. V. Matulis", "Aula", "10:15", "11:45", 0, "ISKS-2", "2025-P"),
-        ("Programų inžinerija", "Doc. J. Kazlauskas", "105", "12:00", "13:30", 1, "ISKS-2", "2025-P"),
-        ("Duomenų struktūros", "Lekt. I. Petrauskaitė", "Lab-2", "08:30", "10:00", 1, "ISKS-2", "2025-P"),
-        ("Tinklų saugumas", "Asist. K. Jonaitis", "Lab-3", "10:15", "11:45", 2, "ISKS-2", "2025-P"),
-        ("Anglų kalba B2", "Lekt. S. Brown", "301", "12:00", "13:30", 2, "ISKS-2", "2025-P"),
-        ("Programų inžinerija (Lab)", "Doc. J. Kazlauskas", "Lab-1", "08:30", "10:00", 3, "ISKS-2", "2025-P"),
-        ("Operacinės sistemos (Lab)", "Doc. A. Rimkus", "Lab-2", "10:15", "11:45", 4, "ISKS-2", "2025-P"),
-        # VVB-1, 2025-P (Spring) — Business management group
-        ("Mikroekonomika", "Prof. R. Jankauskienė", "Aula", "08:30", "10:00", 0, "VVB-1", "2025-P"),
-        ("Verslo teisė", "Lekt. D. Stankevičius", "105", "10:15", "11:45", 0, "VVB-1", "2025-P"),
-        ("Apskaita ir finansai", "Doc. L. Navickienė", "207", "08:30", "10:00", 1, "VVB-1", "2025-P"),
-        ("Rinkodaros pagrindai", "Lekt. M. Žukauskaitė", "301", "10:15", "11:45", 2, "VVB-1", "2025-P"),
-        ("Vadyba", "Prof. R. Jankauskienė", "Aula", "12:00", "13:30", 2, "VVB-1", "2025-P"),
-        ("Verslo teisė (Sem.)", "Lekt. D. Stankevičius", "105", "08:30", "10:00", 3, "VVB-1", "2025-P"),
-        ("Statistika versle", "Prof. V. Matulis", "207", "10:15", "11:45", 4, "VVB-1", "2025-P"),
-        # ISKS-1, 2025-R (Autumn — previous semester for testing)
-        ("Informacinės technologijos", "Asist. K. Jonaitis", "Lab-3", "08:30", "10:00", 0, "ISKS-1", "2025-R"),
-        ("Matematinė analizė", "Prof. V. Matulis", "Aula", "10:15", "11:45", 0, "ISKS-1", "2025-R"),
-        ("Fizika", "Doc. P. Lapinskienė", "207", "12:00", "13:30", 1, "ISKS-1", "2025-R"),
-        ("Informacinės technologijos (Lab)", "Asist. K. Jonaitis", "Lab-1", "08:30", "10:00", 2, "ISKS-1", "2025-R"),
-        ("Matematinė analizė (Prat.)", "Prof. V. Matulis", "105", "10:15", "11:45", 3, "ISKS-1", "2025-R"),
-    ]
-
-
-    # STEP 2: insert under per-row uuid4 ids and one commit —
-    # see the banner on why OR IGNORE never ignores anything
-    # =======================================================
-    db = get_db()
-    try:
-        for lesson in demo_lessons:
-            db.execute(
-                """INSERT OR IGNORE INTO schedule_lessons
-                   (id, title, teacher, room, time_start, time_end, day_of_week, group_name, semester)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (str(uuid.uuid4()), *lesson),
-            )
-        db.commit()
-        return jsonify({"message": f"Seeded {len(demo_lessons)} lessons"})
+        return _conditional_json(payload, seed)
     finally:
         db.close()

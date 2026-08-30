@@ -1,11 +1,32 @@
+# Runtime dependencies, pinned exactly. The image is built from
+# this file alone, so anything left unpinned is a way for two
+# builds of the same tag to behave differently — which is why
+# werkzeug, python-socketio and python-engineio are listed here
+# even though flask and flask-socketio already pull them in.
+#
+# Dropped on purpose — do not re-add without a caller:
+#   gunicorn — nothing runs a WSGI server; main.py boots
+#              socketio.run() (see its banner)
+#   pyjwt    — sessions are opaque bearer tokens, never JWTs
+#   flasgger — swagger/swagger.yaml is served by the separate
+#              swagger-ui container, never from Flask
+
 flask==3.1.1
+# Flask's own dependency, pinned: app/__init__.py's before_request
+# writes Werkzeug's private request._cached_json
+werkzeug==3.1.8
 flask-cors==5.0.1
 flask-socketio==5.5.1
-gunicorn==23.0.0
+# Pinned explicitly: chat/events.py handle_disconnect depends on
+# the reason-argument signature these releases pass
+python-socketio==5.16.1
+python-engineio==4.13.1
+# uploads/routes.py re-encodes every accepted image — EXIF/GPS
+# stripped, pixels capped, canonical format chosen (musllinux
+# wheels install on Alpine, no compiler needed)
+pillow==12.3.0
 requests==2.32.3
 beautifulsoup4==4.13.4
 lxml==5.4.0
-pyjwt==2.10.1
 bcrypt==4.3.0
 apscheduler==3.11.0
-flasgger==0.9.7.1

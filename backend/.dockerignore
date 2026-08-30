@@ -1,0 +1,22 @@
+############################################################
+#  [*] backend/.dockerignore — what COPY . . must never bake
+#
+#  The build context is ./backend, and the image is built on
+#  the deploy host straight from a working copy: without this
+#  file the dev SQLite database, a stray .env and every
+#  __pycache__ went into the image (and into any registry it
+#  was pushed to). Keep it in step with backend/.gitignore.
+############################################################
+
+__pycache__/
+*.py[co]
+
+data/
+*.db
+*.db-wal
+*.db-shm
+
+.env
+venv/
+.venv/
+.git/

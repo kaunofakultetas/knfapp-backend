@@ -1,0 +1,19 @@
+# Test-only dependencies. Kept OUT of requirements.txt so the
+# runtime image ships no test framework: the test container
+# (Dockerfile.test) installs both files, the production image
+# installs only requirements.txt.
+#
+# Pinned exactly, same rule as the runtime pins — an unpinned
+# test dep is a way for CI and a laptop to disagree.
+
+pytest==8.4.2
+# Line-level coverage of backend/app; the suite's whole point is
+# proving which lines never run
+pytest-cov==6.2.1
+# Deterministic clocks for expiry, retention and rate-limit tests
+time-machine==2.19.0
+# Fake HTTP for the scrapers — no test may touch knf.vu.lt
+responses==0.25.8
+# Parallel execution — the suite is CPU-bound and every test
+# already gets its own temp database, so workers cannot collide
+pytest-xdist==3.8.0

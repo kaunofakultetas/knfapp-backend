@@ -20,8 +20,11 @@
 #  failed send.
 #
 #  Every route is @require_auth, the user coming from
-#  request.user. require_role and notify_all_users are
-#  imported but never used here — dead imports.
+#  request.user, and every WRITE route is rate limited under
+#  it with auth's shared decorator (per-user key, the house
+#  429 body). The channel names come from push.py's
+#  VALID_CHANNELS — one list, used by the sender and by the
+#  switches alike.
 #
 #    POST   /api/notifications/register — add or reactivate
 #    DELETE /api/notifications/register — remove a token
@@ -30,24 +33,32 @@
 ############################################################
 
 
+import logging
+import re
+import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 
-# require_role and notify_all_users are dead imports — every
-# route here is plain @require_auth and nothing sends a push
-from app.auth.routes import require_auth, require_role
+from app.auth.routes import get_json_object, rate_limit, require_auth
 from app.database import get_db
-from app.notifications.push import notify_all_users
+from app.notifications.push import VALID_CHANNELS, token_digest
+
+logger = logging.getLogger(__name__)
 
 notifications_bp = Blueprint("notifications", __name__)
 
-# The channel names the switches accept — mirrors the CHECK
-# on notification_channels.channel (database/__init__.py),
-# which is the real guard; update_channels skips unknown
-# names silently rather than rejecting them
-VALID_CHANNELS = ("news", "chat", "schedule", "admin")
+# The whole token grammar, not just the prefix: Expo mints
+# "ExponentPushToken[" + an opaque id + "]", so anything with
+# a control character, a quote or a tag in it was never a
+# token. Migration v47 deleted the rows that predate this.
+_TOKEN_RE = re.compile(r"ExponentPushToken\[[A-Za-z0-9_-]{10,64}\]")
+
+# A phone, a tablet, the odd reinstall — ten rows is already
+# generous. Past that the oldest row goes, so one account can
+# never amplify a broadcast without bound
+MAX_TOKENS_PER_USER = 10
 
 
 
@@ -62,26 +73,44 @@ VALID_CHANNELS = ("news", "chat", "schedule", "admin")
 #
 # POST /api/notifications/register
 #
-# Body {"token", "platform"?}. token must be a string that
-# starts with "ExponentPushToken[" (the closing bracket is
-# not checked) and is at most 200 chars after strip();
-# a platform outside ios/android/web is quietly stored as
-# "unknown" — the app only ever sends ios or android.
+# Body {"token", "platform"?, "language"?}. token must match
+# the WHOLE Expo grammar (_TOKEN_RE) — the old prefix-only
+# check let control characters, markup and SQL-looking
+# payloads into the table and out again through every log
+# line that quoted them; a platform outside ios/android/web
+# is quietly stored as "unknown" — the app only ever sends
+# ios or android. language is the app language 'lt' or 'en'
+# (anything else, or absent, becomes 'lt'), stored on the
+# row (migration v11) so push.py can pick per-language copy;
+# the app re-registers on every start and on a language
+# switch, so the stored value tracks the setting.
 #
-# Three outcomes, all {"registered": true, "tokenId"}:
-#   - the user already holds this token → 200, and a row
-#     push.py had deactivated is switched back on
-#   - the token belongs to ANOTHER user (device changed
-#     hands) → that row is deleted first, because
-#     idx_push_tokens_token is UNIQUE and the INSERT would
-#     otherwise die with IntegrityError → 500
-#   - otherwise a new active row → 201
+# Two outcomes, both {"registered": true, "tokenId"}:
+#   - the caller already holds this token → 200; a row
+#     push.py had deactivated comes back on and platform,
+#     language and updated_at are refreshed either way (the
+#     old code skipped the UPDATE when nothing had changed,
+#     so a live device's row aged as if it were dead)
+#   - a new token, or one that belonged to ANOTHER user
+#     (the device changed hands) → 201
 #
-# The pre-checks and the INSERT are separate statements,
-# so two racing registrations of one new token can still
-# hit the unique index; one device registering at a time
-# makes that academic. Timestamps are utcnow().isoformat()
-# ("T", no offset), not the datetime('now') column default.
+# One atomic INSERT ... ON CONFLICT(token) DO UPDATE covers
+# all of it. The SELECT/DELETE/INSERT it replaces could
+# interleave with a racing registration — a duplicate INSERT
+# died on the UNIQUE index as a 500, and a takeover deleted
+# the previous owner's row with nothing written in its place.
+# A takeover is legitimate (phones do change hands) but never
+# silent any more: it is logged with both user ids and the
+# token's digest. DO UPDATE keeps the ORIGINAL row id, so
+# tokenId is re-selected from the table rather than assumed.
+#
+# The route is rate limited per user (20 per 5-minute window)
+# and the caller's row count is capped at MAX_TOKENS_PER_USER
+# — a script could otherwise register tokens forever and
+# every broadcast would carry the weight.
+#
+# Timestamps are naive-UTC isoformat ("T", no offset), not
+# the datetime('now') column default.
 #
 # Used by:
 #   - services/api/notifications.ts — registerPushToken,
@@ -94,11 +123,12 @@ VALID_CHANNELS = ("news", "chat", "schedule", "admin")
 
 @notifications_bp.route("/register", methods=["POST"])
 @require_auth
+@rate_limit("push_register", max_attempts=20)
 def register_token():
-    # STEP 1: validate the body — shape, prefix, length and
-    # the platform whitelist
-    # =====================================================
-    data = request.get_json()
+    # STEP 1: validate the body — shape, the full token
+    # grammar, length and the platform whitelist
+    # =================================================
+    data = get_json_object()
     if not data or not data.get("token"):
         return jsonify({"error": "Push token required"}), 400
 
@@ -108,61 +138,96 @@ def register_token():
     token = data["token"].strip()
     if len(token) > 200:
         return jsonify({"error": "Token too long"}), 400
-    if not token.startswith("ExponentPushToken["):
+    if not _TOKEN_RE.fullmatch(token):
         return jsonify({"error": "Invalid Expo push token format"}), 400
 
     platform = data.get("platform", "unknown")
     if platform not in ("ios", "android", "web", "unknown"):
         platform = "unknown"
 
+    # 'lt' is the app default; anything unexpected falls back to it
+    language = data.get("language")
+    if language not in ("lt", "en"):
+        language = "lt"
+
     user_id = request.user["id"]
+    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 
-    # STEP 2: the user already has this token — reactivate
-    # it if push.py had flipped active to 0 on
-    # DeviceNotRegistered, and answer 200 either way
-    # ====================================================
+    # STEP 2: who holds this token today — that decides 200
+    # vs 201 and is the only place a device changing hands
+    # can be noticed
+    # =====================================================
     db = get_db()
     try:
         existing = db.execute(
-            "SELECT id, active FROM push_tokens WHERE user_id = ? AND token = ?",
-            (user_id, token),
+            "SELECT id, user_id FROM push_tokens WHERE token = ?",
+            (token,),
         ).fetchone()
+        own = bool(existing) and existing["user_id"] == user_id
 
-        if existing:
-            if not existing["active"]:
-                db.execute(
-                    "UPDATE push_tokens SET active = 1, updated_at = ? WHERE id = ?",
-                    (datetime.utcnow().isoformat(), existing["id"]),
-                )
-                db.commit()
-            return jsonify({"registered": True, "tokenId": existing["id"]})
+        if existing and not own:
+            logger.warning(
+                "Push token reassigned from user %s to user %s (token:%s)",
+                existing["user_id"], user_id, token_digest(token),
+            )
 
 
-        # STEP 3: the same device now belongs to someone else —
-        # drop the old owner's row so the UNIQUE token index
-        # lets the INSERT through
-        # =====================================================
-        other = db.execute(
-            "SELECT id FROM push_tokens WHERE token = ? AND user_id != ?",
-            (token, user_id),
-        ).fetchone()
-        if other:
-            db.execute("DELETE FROM push_tokens WHERE id = ?", (other["id"],))
+        # STEP 3: keep the caller's fleet bounded — the rows
+        # that have gone longest without re-registering are
+        # the ones that go
+        # ==================================================
+        surplus = db.execute(
+            """SELECT id FROM push_tokens
+               WHERE user_id = ? AND token != ?
+               ORDER BY updated_at DESC
+               LIMIT -1 OFFSET ?""",
+            (user_id, token, MAX_TOKENS_PER_USER - 1),
+        ).fetchall()
+
+        if surplus:
+            placeholders = ",".join("?" * len(surplus))
+            db.execute(
+                f"DELETE FROM push_tokens WHERE id IN ({placeholders})",
+                [r["id"] for r in surplus],
+            )
+            logger.info("Dropped %d push token(s) over the cap for user %s", len(surplus), user_id)
 
 
-        # STEP 4: a fresh row, active from the start
-        # ==========================================
-        token_id = str(uuid.uuid4())
-        now = datetime.utcnow().isoformat()
-        db.execute(
-            """INSERT INTO push_tokens (id, user_id, token, platform, created_at, updated_at, active)
-               VALUES (?, ?, ?, ?, ?, ?, 1)""",
-            (token_id, user_id, token, platform, now, now),
-        )
-        db.commit()
+        # STEP 4: one atomic upsert — insert, reactivate and
+        # reassign are the same statement, so nothing can
+        # interleave between a check and a write
+        # ==================================================
+        try:
+            db.execute(
+                """INSERT INTO push_tokens (id, user_id, token, platform, language, created_at, updated_at, active)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                   ON CONFLICT(token) DO UPDATE SET
+                       user_id = excluded.user_id,
+                       platform = excluded.platform,
+                       language = excluded.language,
+                       active = 1,
+                       updated_at = excluded.updated_at""",
+                (str(uuid.uuid4()), user_id, token, platform, language, now, now),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            # Belt and braces: a racing writer won: their row
+            # says the same thing ours would have, so answer
+            # with it instead of a 500
+            db.rollback()
+            logger.warning("Push token registration raced (token:%s)", token_digest(token))
 
-        return jsonify({"registered": True, "tokenId": token_id}), 201
+
+        # STEP 5: DO UPDATE keeps the original row id, so the
+        # id goes out of the TABLE, never out of the INSERT
+        # ===================================================
+        row = db.execute("SELECT id FROM push_tokens WHERE token = ?", (token,)).fetchone()
+        if not row:
+            logger.error("Push token vanished during registration (token:%s)", token_digest(token))
+            return jsonify({"error": "Could not register push token"}), 500
+
+        return jsonify({"registered": True, "tokenId": row["id"]}), (200 if own else 201)
     finally:
         db.close()
 
@@ -179,14 +244,23 @@ def register_token():
 #
 # DELETE /api/notifications/register
 #
-# Body {"token"} — the same string/200-char checks as the
-# POST, minus the prefix check. Deletes the caller's OWN
-# row for that token (user_id AND token), so a token that
-# has since moved to another user answers 404 "Token not
-# found", as does one never registered. The mobile wrapper
-# swallows every error here (logout must never block), so
-# that 404 is invisible in practice. This is real removal,
-# unlike the active=0 push.py uses for dead tokens.
+# Body {"token"} — a string, and that is the only check on
+# it: neither the token grammar nor the POST's 200-character
+# cap applies here, because an owner must be able to remove
+# a legacy row of ANY shape that predates _TOKEN_RE. The cap
+# used to be shared with the POST and answered 400 "Token
+# too long" for the longest of those rows, which left them
+# in the table with nobody able to name them. Dropping it
+# unbounds nothing: the body is capped at MAX_CONTENT_LENGTH
+# (app/__init__.py), the statement is parameterised and the
+# match is owner-scoped, so an absurd string simply hits no
+# row. Deletes the caller's OWN row for that token (user_id
+# AND token), so a token that has since moved to another
+# user answers 404 "Token not found", as does one never
+# registered. The mobile wrapper swallows every error here
+# (logout must never block), so that 404 is invisible in
+# practice. This is real removal, unlike the active=0
+# push.py uses for dead tokens.
 #
 # Used by:
 #   - services/api/notifications.ts — unregisterPushToken,
@@ -198,17 +272,19 @@ def register_token():
 
 @notifications_bp.route("/register", methods=["DELETE"])
 @require_auth
+@rate_limit("push_register", max_attempts=20)
 def unregister_token():
-    data = request.get_json()
+    data = get_json_object()
     if not data or not data.get("token"):
         return jsonify({"error": "Push token required"}), 400
 
     if not isinstance(data["token"], str):
         return jsonify({"error": "Token must be a string"}), 400
 
+    # No length cap on this route: a legacy row longer than the
+    # POST's 200 characters would otherwise be unnameable by the
+    # only person entitled to remove it
     token = data["token"].strip()
-    if len(token) > 200:
-        return jsonify({"error": "Token too long"}), 400
 
     user_id = request.user["id"]
 
@@ -287,19 +363,21 @@ def get_channels():
 # PUT /api/notifications/channels
 #
 # Body {"channels": {"news": true, "chat": false, ...}} —
-# partial is fine, only the names present are written.
-# Names outside VALID_CHANNELS are skipped silently (in
-# validation and in the write loop alike); a value that is
-# not a JSON boolean (1/0 included) is a 400 naming the
-# channel and the Python type it got. Validation runs over
-# the whole dict BEFORE the first write, so a bad value
-# never leaves a half-applied batch; an empty dict is a
-# no-op 200. Each channel is upserted through
-# ON CONFLICT(user_id, channel) — the table's composite
-# PRIMARY KEY — under one commit, with updated_at as
-# utcnow().isoformat(). The response is the full resulting
-# state in GET's shape; settings.tsx takes it as the
-# confirmed truth after a debounced batch of toggles.
+# partial is fine, only the names present are written. A
+# name outside VALID_CHANNELS is a 400 naming it (it used to
+# be skipped silently in validation and in the write loop
+# alike, so a typo answered 200 and changed nothing);
+# contract-safe because the app's typed NotificationChannel
+# can only send the four real names. A value that is not a
+# JSON boolean (1/0 included) is a 400 naming the channel
+# and the Python type it got. Validation runs over the whole
+# dict BEFORE the first write, so a bad entry never leaves a
+# half-applied batch; an empty dict is a no-op 200. Each
+# channel is upserted through ON CONFLICT(user_id, channel)
+# — the table's composite PRIMARY KEY — under one commit.
+# The response is the full resulting state in GET's shape;
+# settings.tsx takes it as the confirmed truth after a
+# debounced batch of toggles.
 #
 # Used by:
 #   - services/api/notifications.ts —
@@ -310,21 +388,22 @@ def get_channels():
 
 @notifications_bp.route("/channels", methods=["PUT"])
 @require_auth
+@rate_limit("push_channels", max_attempts=60)
 def update_channels():
-    # STEP 1: shape check, then every value must be a real
-    # boolean before anything is written
-    # ====================================================
-    data = request.get_json()
+    # STEP 1: shape check, then every name must be real and
+    # every value a real boolean before anything is written
+    # =====================================================
+    data = get_json_object()
     if not data or not isinstance(data.get("channels"), dict):
         return jsonify({"error": "channels dict required"}), 400
 
     channels_input = data["channels"]
     user_id = request.user["id"]
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
     for channel, enabled in channels_input.items():
         if channel not in VALID_CHANNELS:
-            continue
+            return jsonify({"error": f"Unknown channel '{channel}'"}), 400
         if not isinstance(enabled, bool):
             return jsonify({"error": f"Channel '{channel}' value must be a boolean (true/false), got {type(enabled).__name__}"}), 400
 
@@ -335,9 +414,6 @@ def update_channels():
     db = get_db()
     try:
         for channel, enabled in channels_input.items():
-            if channel not in VALID_CHANNELS:
-                continue
-
             db.execute(
                 """INSERT INTO notification_channels (user_id, channel, enabled, updated_at)
                    VALUES (?, ?, ?, ?)
@@ -360,5 +436,73 @@ def update_channels():
             result[row["channel"]] = bool(row["enabled"])
 
         return jsonify({"channels": result})
+    finally:
+        db.close()
+
+
+
+
+
+
+
+
+############################################################
+# get_chat_preview / update_chat_preview
+############################################################
+#
+# GET  /api/notifications/chat-preview → {enabled}
+# PUT  /api/notifications/chat-preview {enabled} → {enabled}
+#
+# The "show message text in notifications" switch
+# (users.chat_push_preview, migration v56). Enabled ships
+# the first 100 characters of a chat message to Expo as the
+# push body, exactly as before the setting existed; disabled
+# sends the content-free "Nauja žinutė" instead, so private
+# text never leaves for the push processor at all. Separate
+# from the channels dict on purpose: this is not an on/off
+# topic subscription, and a new key of a different shape
+# inside "channels" would be a contract change for the
+# mobile settings screen.
+#
+# Used by:
+#   - services/api/notifications.ts — fetchChatPreview /
+#     updateChatPreview (the settings screen's toggle)
+############################################################
+
+@notifications_bp.route("/chat-preview", methods=["GET"])
+@require_auth
+def get_chat_preview():
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT chat_push_preview FROM users WHERE id = ?",
+            (request.user["id"],),
+        ).fetchone()
+        return jsonify({"enabled": bool(row["chat_push_preview"]) if row else True})
+    finally:
+        db.close()
+
+
+@notifications_bp.route("/chat-preview", methods=["PUT"])
+@require_auth
+@rate_limit("notif_prefs", max_attempts=30)
+def update_chat_preview():
+    # STEP 1: the body — enabled must be an actual boolean
+    # ====================================================
+    data = get_json_object()
+    if not data or not isinstance(data.get("enabled"), bool):
+        return jsonify({"error": "enabled must be a boolean"}), 400
+
+
+    # STEP 2: one column write on the caller's own row
+    # ================================================
+    db = get_db()
+    try:
+        db.execute(
+            "UPDATE users SET chat_push_preview = ? WHERE id = ?",
+            (1 if data["enabled"] else 0, request.user["id"]),
+        )
+        db.commit()
+        return jsonify({"enabled": data["enabled"]})
     finally:
         db.close()
