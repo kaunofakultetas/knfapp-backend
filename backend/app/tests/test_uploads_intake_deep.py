@@ -1704,7 +1704,7 @@ def test_a_storage_failure_leaves_the_account_able_to_try_again(client, actor, a
 # POST /api/uploads — the stored name, the row and the answer
 # -----------------------------------------------------------
 
-def test_a_successful_upload_answers_201_with_exactly_two_fields(client, actor):
+def test_a_successful_upload_answers_201_with_exactly_five_fields(client, actor):
     _, headers = actor
 
     response = _post(client, headers, _encode("PNG"))
@@ -1712,7 +1712,10 @@ def test_a_successful_upload_answers_201_with_exactly_two_fields(client, actor):
     assert response.status_code == 201
     assert response.headers["Content-Type"].startswith("application/json")
     body = response.get_json()
-    assert set(body) == {"url", "filename"}
+    # url + filename are what the client persists; name, size and
+    # mime are additive — what a file message carries as its
+    # attachment (v57)
+    assert set(body) == {"url", "filename", "name", "size", "mime"}
 
 
 def test_the_url_is_the_relative_one_clients_persist(client, actor):

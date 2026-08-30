@@ -66,7 +66,9 @@ HEX = "0123456789abcdef0123456789abcdef"
 # The five extensions _FILENAME_RE admits. Note bmp/tif/tiff
 # are uploadABLE (ALLOWED_EXTENSIONS) yet never servable —
 # the re-encode never writes them
-SERVABLE = ("jpg", "jpeg", "png", "gif", "webp")
+SERVABLE = ("jpg", "jpeg", "png", "gif", "webp",
+            # documents (kind=file uploads) since v57
+            "pdf", "docx", "xlsx", "pptx", "zip", "txt")
 
 
 
@@ -205,8 +207,8 @@ def test_a_name_secure_filename_empties_is_refused_as_a_bad_filename(client, seg
     assert response.get_json() == {"error": "Invalid filename", "code": "bad_filename"}
 
 
-@pytest.mark.parametrize("ext", ["bmp", "tif", "tiff", "svg", "avif", "heic", "ico", "jpe", "jfif", "txt", "part"])
-def test_only_five_extensions_are_ever_servable(client, app, ext):
+@pytest.mark.parametrize("ext", ["bmp", "tif", "tiff", "svg", "avif", "heic", "ico", "jpe", "jfif", "doc", "exe", "html", "part"])
+def test_only_the_stored_name_patterns_extensions_are_ever_servable(client, app, ext):
     # bmp/tif/tiff are accepted by the UPLOAD gate and still
     # unservable: the re-encode never writes one, so a name
     # carrying that extension cannot be ours

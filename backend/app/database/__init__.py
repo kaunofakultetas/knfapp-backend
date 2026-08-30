@@ -69,6 +69,8 @@
 #        published_at DESC) index for the profile lists
 #    v56 user_blocks + reports tables, users.chat_push_preview
 #        (block/report abuse handling, content-free pushes)
+#    v57 messages.kind / edited_at / attachment_* (system rows,
+#        edits, document attachments)
 #
 #  Gotchas:
 #    - _SCHEMA already carries the v3–v11 objects
@@ -481,6 +483,11 @@ def _run_migrations(conn):
         49: ("Demote planted multi-member 'direct' conversations to 'group'", _migration_v49_direct_room_audit),
         55: ("Composite author/source/date index on news_posts", _migration_v55_news_posts_author_index),
         56: ("Add user_blocks + reports tables and users.chat_push_preview", _migration_v56_blocks_reports_preview),
+        57: ("Add messages.kind / edited_at / attachment_* columns", _migration_v57_message_kinds),
+        58: ("Add messages.attachment_meta (media frame size, duration, poster)", _migration_v58_attachment_meta),
+        59: ("Add messages.link_preview (the unfurled card of the first URL)", _migration_v59_link_preview),
+        60: ("Add messages.gallery (several photos in one message)", _migration_v60_gallery),
+        61: ("Add message pins, forwarding marks and disappearing messages", _migration_v61_pins_forward_ttl),
     }
 
 
@@ -938,6 +945,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     type TEXT NOT NULL DEFAULT 'direct' CHECK(type IN ('direct', 'group')),
     title TEXT,
     avatar_emoji TEXT,
+    message_ttl_seconds INTEGER,
     created_by TEXT REFERENCES users(id),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -961,6 +969,19 @@ CREATE TABLE IF NOT EXISTS messages (
     reply_to_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
     deleted_at TEXT,
     client_msg_id TEXT,
+    kind TEXT NOT NULL DEFAULT 'text',
+    edited_at TEXT,
+    attachment_url TEXT,
+    attachment_name TEXT,
+    attachment_size INTEGER,
+    attachment_mime TEXT,
+    attachment_meta TEXT,
+    link_preview TEXT,
+    gallery TEXT,
+    pinned_at TEXT,
+    pinned_by TEXT,
+    forwarded INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -2542,3 +2563,180 @@ def _migration_v56_blocks_reports_preview(conn):
         logger.warning("  'chat_push_preview' column already exists, skipping")
     conn.commit()
     logger.info("  user_blocks + reports tables ready")
+
+
+
+
+
+
+
+
+############################################################
+# _migration_v57_message_kinds
+############################################################
+#
+# Migration v57: a message is no longer only text-plus-photo.
+#
+#   kind          — 'text' | 'image' | 'file' | 'system';
+#                   'system' rows are the room's own narration
+#                   ("X sukūrė grupę", "Y paliko pokalbį")
+#   edited_at     — set by the sender's edit; the client shows
+#                   "redaguota"
+#   attachment_*  — a document sent through the composer (url
+#                   under /api/uploads/, original name, byte
+#                   size, mime type)
+#
+# Every column is nullable or defaulted, so existing rows read
+# as plain text messages. Idempotent (caught duplicate column),
+# the _SCHEMA pattern for columns.
+#
+# Used by:
+#   - _run_migrations (above) — via the _MIGRATIONS dict
+############################################################
+
+def _migration_v57_message_kinds(conn):
+    for statement, label in (
+        ("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'", "kind"),
+        ("ALTER TABLE messages ADD COLUMN edited_at TEXT", "edited_at"),
+        ("ALTER TABLE messages ADD COLUMN attachment_url TEXT", "attachment_url"),
+        ("ALTER TABLE messages ADD COLUMN attachment_name TEXT", "attachment_name"),
+        ("ALTER TABLE messages ADD COLUMN attachment_size INTEGER", "attachment_size"),
+        ("ALTER TABLE messages ADD COLUMN attachment_mime TEXT", "attachment_mime"),
+    ):
+        try:
+            conn.execute(statement)
+            logger.info("  Added '%s' column to messages table", label)
+        except sqlite3.OperationalError as e:
+            # The normal path on a fresh DB: _SCHEMA already
+            # created the column — anything else must re-raise
+            if "duplicate column" not in str(e).lower():
+                raise
+            logger.warning("  '%s' column already exists, skipping", label)
+    conn.commit()
+
+
+
+
+
+
+
+############################################################
+# _migration_v58_attachment_meta
+############################################################
+#
+# Migration v58: what a photo or a video message knows about
+# its frame, as one JSON column —
+#
+#   {"width": 1280, "height": 720, "duration": 12.4,
+#    "thumbnailUrl": "/api/uploads/<hex>.jpg"}
+#
+# — so the client lays the bubble out at its final size before
+# the bytes arrive and a video shows its poster and length.
+# Nullable; existing rows read as "unknown", which the client
+# already handles by measuring. Idempotent, the _SCHEMA pattern
+# for columns.
+#
+# Used by:
+#   - _run_migrations (above) — via the _MIGRATIONS dict
+############################################################
+
+def _migration_v58_attachment_meta(conn):
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN attachment_meta TEXT")
+        logger.info("  Added 'attachment_meta' column to messages table")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+        logger.warning("  'attachment_meta' column already exists, skipping")
+    conn.commit()
+
+
+
+
+
+
+
+############################################################
+# _migration_v59_link_preview
+############################################################
+#
+# Migration v59: the unfurled card of a message's first URL,
+# as one JSON column — {"url", "title", "description",
+# "siteName", "imageUrl"} — written by chat/linkpreview.py
+# after the send, off the request thread. Nullable; idempotent.
+#
+# Used by:
+#   - _run_migrations (above) — via the _MIGRATIONS dict
+############################################################
+
+def _migration_v59_link_preview(conn):
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN link_preview TEXT")
+        logger.info("  Added 'link_preview' column to messages table")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+        logger.warning("  'link_preview' column already exists, skipping")
+    conn.commit()
+
+
+
+
+
+
+
+# _migration_v60_gallery
+# ======================
+#
+# Migration v60: several photos in one message. The `gallery`
+# column holds a JSON list of {url, width, height} — each url an
+# own upload, validated exactly like imageUrl on the way in. A
+# single photo keeps riding image_url; only a multi-photo send
+# fills gallery (kind stays 'image' for both, so list previews
+# and reply quotes need no new branch).
+
+def _migration_v60_gallery(conn):
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN gallery TEXT")
+        logger.info("  Added 'gallery' column to messages table")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+        logger.warning("  'gallery' column already exists, skipping")
+    conn.commit()
+
+
+
+
+
+
+
+# _migration_v61_pins_forward_ttl
+# ===============================
+#
+# Migration v61, three small message features in one pass:
+# pinned_at/pinned_by (any member may pin; the newest pins feed
+# the room's banner), forwarded (the "forwarded" mark on a
+# message re-sent from another room — content is copied by the
+# client, the flag is the only trace), and disappearing
+# messages: conversations.message_ttl_seconds set by any member
+# stamps every LATER message's expires_at at insert; expired
+# rows are hard-deleted (files included) by the opportunistic
+# sweep in the chat routes.
+
+def _migration_v61_pins_forward_ttl(conn):
+    for table, column, decl in (
+        ("messages", "pinned_at", "TEXT"),
+        ("messages", "pinned_by", "TEXT"),
+        ("messages", "forwarded", "INTEGER NOT NULL DEFAULT 0"),
+        ("messages", "expires_at", "TEXT"),
+        ("conversations", "message_ttl_seconds", "INTEGER"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            logger.info("  Added '%s' column to %s table", column, table)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+            logger.warning("  '%s' column already exists on %s, skipping", column, table)
+    conn.commit()

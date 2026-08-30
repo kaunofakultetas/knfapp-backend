@@ -303,9 +303,12 @@ def create_app():
     app.config["INVITATION_EXPIRY_HOURS"] = _env_int("INVITATION_EXPIRY_HOURS", 168)
     app.config["UPLOAD_DIR"] = os.environ.get("UPLOAD_DIR", os.path.join(os.path.dirname(__file__), "..", "data", "uploads"))
     # Werkzeug answers 413 before buffering anything bigger — uploads
-    # cap at 5 MB (uploads/routes.py MAX_FILE_SIZE) and the extra MB
-    # covers the multipart envelope
-    app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024
+    # cap at 5 MB for photos and documents and 50 MB for videos
+    # (uploads/routes.py MAX_FILE_SIZE / VIDEO_MAX_SIZE); the extra
+    # MB covers the multipart envelope. Caddy holds every OTHER
+    # /api/* route to 6 MB, so only /api/uploads ever spools this
+    # much into /tmp
+    app.config["MAX_CONTENT_LENGTH"] = 52 * 1024 * 1024
 
 
     # STEP 2: reverse-proxy awareness, CORS, Socket.IO

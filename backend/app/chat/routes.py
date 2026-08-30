@@ -44,10 +44,11 @@
 ############################################################
 
 
+import json
 import logging
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from flask import Blueprint, jsonify, request
@@ -273,18 +274,234 @@ def _reply_payload(row):
             "text": "",
             "imageUrl": None,
             "deleted": True,
+            "kind": "text",
+            "fileName": None,
         }
 
     deleted = row["reply_deleted_at"] is not None
+    # A quoted gallery lends its first photo as the thumbnail
+    reply_image = row["reply_image_url"]
+    if not reply_image and "reply_gallery" in row.keys() and row["reply_gallery"]:
+        try:
+            first = (json.loads(row["reply_gallery"]) or [{}])[0]
+            reply_image = first.get("url") if isinstance(first, dict) else None
+        except (TypeError, ValueError):
+            reply_image = None
     return {
         "id": row["reply_to_id"],
         "senderId": row["reply_sender_id"],
         "senderName": row["reply_sender_name"],
         "text": "" if deleted else (row["reply_text"] or ""),
-        "imageUrl": None if deleted else row["reply_image_url"],
+        "imageUrl": None if deleted else reply_image,
         "deleted": deleted,
+        # The quote line says "Video" / the file's name when the
+        # quoted row has no text
+        "kind": row["reply_kind"] or "text",
+        "fileName": None if deleted else row["reply_file_name"],
     }
 
+
+
+
+
+
+
+
+############################################################
+# _insert_system_message
+############################################################
+#
+# The room narrating itself: "X sukūrė grupę „Y“", "X paliko
+# pokalbį". A 'system' row is stored like any message (the
+# actor is its sender, so every JOIN keeps working) and the
+# returned payload is what emit_new_message broadcasts; the
+# client renders kind 'system' as a centred caption. LT text
+# on purpose — the app is Lithuanian-first and the in-app
+# previews say the same. Bumps the conversation so the room
+# sorts to the top of the list like any activity would.
+#
+# Used by:
+#   - create_conversation, leave_conversation (below)
+############################################################
+
+def _insert_system_message(db, conv_id, actor, text):
+    msg_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    db.execute(
+        "INSERT INTO messages (id, conversation_id, sender_id, text, kind, created_at) VALUES (?, ?, ?, ?, 'system', ?)",
+        (msg_id, conv_id, actor["id"], text, now),
+    )
+    db.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conv_id))
+    return {
+        "id": msg_id,
+        "conversationId": conv_id,
+        "senderId": actor["id"],
+        "senderName": actor["display_name"],
+        "senderAvatar": actor.get("avatar_url"),
+        "text": text,
+        "imageUrl": None,
+        "time": _format_time(now),
+        "createdAt": now,
+        "clientMsgId": None,
+        "reactions": [],
+        "replyTo": None,
+        "deleted": False,
+        "kind": "system",
+        "editedAt": None,
+        "attachment": None,
+    }
+
+
+
+
+
+
+
+############################################################
+# _attachment_payload
+############################################################
+#
+# The `attachment` object of a 'file' message — None for
+# every other row and for an unsent one (the blanking in
+# delete_message clears the columns, this mirrors it on the
+# wire).
+#
+# Used by:
+#   - get_messages, _find_committed_send, send_message,
+#     list_conversations (below)
+############################################################
+
+def _attachment_payload(row, deleted=False):
+    if deleted or not row["attachment_url"]:
+        return None
+    return {
+        "url": row["attachment_url"],
+        "name": row["attachment_name"] or "",
+        "size": row["attachment_size"] or 0,
+        "mime": row["attachment_mime"] or "",
+    }
+
+
+# The media frame of a photo / video row (migration v58) — the
+# JSON column parsed, None for text/file rows, unsent ones and
+# anything unparseable
+def _media_payload(row, deleted=False):
+    raw = row["attachment_meta"] if "attachment_meta" in row.keys() else None
+    if deleted or not raw:
+        return None
+    try:
+        meta = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    return {
+        "width": meta.get("width"),
+        "height": meta.get("height"),
+        "duration": meta.get("duration"),
+        "thumbnailUrl": meta.get("thumbnailUrl"),
+        "preview": meta.get("preview"),
+        "waveform": meta.get("waveform"),
+    }
+
+
+# The unfurled card of the first URL (migration v59), None on
+# text without one, unsent rows and anything unparseable
+def _link_preview_payload(row, deleted=False):
+    raw = row["link_preview"] if "link_preview" in row.keys() else None
+    if deleted or not raw:
+        return None
+    try:
+        card = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(card, dict) or not card.get("url"):
+        return None
+    return {
+        "url": card.get("url"),
+        "title": card.get("title") or "",
+        "description": card.get("description") or "",
+        "siteName": card.get("siteName") or "",
+        "imageUrl": card.get("imageUrl"),
+        "imagePreview": card.get("imagePreview"),
+    }
+
+
+# The photo list of a multi-photo row (migration v60) — the JSON
+# column parsed, None for everything else, unsent rows and
+# anything unparseable
+def _gallery_payload(row, deleted=False):
+    raw = row["gallery"] if "gallery" in row.keys() else None
+    if deleted or not raw:
+        return None
+    try:
+        items = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(items, list) or not items:
+        return None
+    return [
+        {"url": item.get("url"), "width": item.get("width"), "height": item.get("height"), "preview": item.get("preview")}
+        for item in items
+        if isinstance(item, dict) and item.get("url")
+    ] or None
+
+
+# _sweep_expired
+# ==============
+#
+# Disappearing messages: hard-deletes this conversation's rows
+# whose expires_at has passed — files first (photo, attachment,
+# poster, link card image, every gallery photo), then the
+# reaction and receipt rows, then the messages. Called
+# opportunistically from get_messages and send_message; clients
+# also drop expired rows by their own clocks, so a row that
+# slips into a page between sweeps still vanishes on screen.
+#
+# Used by:
+#   - get_messages (STEP 1), send_message (STEP 2)
+def _sweep_expired(db, conv_id):
+    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    rows = db.execute(
+        "SELECT id, image_url, attachment_url, attachment_meta, link_preview, gallery FROM messages"
+        " WHERE conversation_id = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+        (conv_id, now),
+    ).fetchall()
+    if not rows:
+        return
+
+    for row in rows:
+        stored_urls = [row["image_url"], row["attachment_url"]]
+        try:
+            stored_urls.append((json.loads(row["attachment_meta"]) or {}).get("thumbnailUrl") if row["attachment_meta"] else None)
+        except (TypeError, ValueError):
+            pass
+        try:
+            stored_urls.append((json.loads(row["link_preview"]) or {}).get("imageUrl") if row["link_preview"] else None)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if row["gallery"]:
+                stored_urls.extend(item.get("url") for item in (json.loads(row["gallery"]) or []) if isinstance(item, dict))
+        except (TypeError, ValueError):
+            pass
+        for stored in stored_urls:
+            if not _is_local_upload_url(stored):
+                continue
+            try:
+                from app.uploads.routes import delete_upload
+                delete_upload(stored)
+            except ImportError:
+                pass
+            except Exception:
+                logger.exception("Upload cleanup failed for expired message")
+
+    ids = [row["id"] for row in rows]
+    marks = ",".join("?" * len(ids))
+    db.execute(f"DELETE FROM message_reactions WHERE message_id IN ({marks})", ids)
+    db.execute(f"DELETE FROM message_reads WHERE message_id IN ({marks})", ids)
+    db.execute(f"DELETE FROM messages WHERE id IN ({marks})", ids)
+    db.commit()
 
 
 
@@ -317,8 +534,11 @@ def _find_committed_send(db, conv_id, user_id, sender_name, sender_avatar, clien
         """
         SELECT m.id, m.text, m.image_url, m.created_at, m.client_msg_id,
                m.reply_to_id, m.deleted_at,
+               m.kind, m.edited_at, m.attachment_url, m.attachment_name, m.attachment_size, m.attachment_mime,
+                       m.attachment_meta, m.link_preview, m.gallery, m.pinned_at, m.pinned_by, m.forwarded, m.expires_at,
                r.sender_id AS reply_sender_id, r.text AS reply_text,
-               r.image_url AS reply_image_url, r.deleted_at AS reply_deleted_at,
+               r.image_url AS reply_image_url, r.gallery AS reply_gallery, r.deleted_at AS reply_deleted_at,
+                       r.kind AS reply_kind, r.attachment_name AS reply_file_name,
                ru.display_name AS reply_sender_name
         FROM messages m
         LEFT JOIN messages r ON r.id = m.reply_to_id
@@ -347,6 +567,16 @@ def _find_committed_send(db, conv_id, user_id, sender_name, sender_avatar, clien
         "reactions": [],
         "replyTo": _reply_payload(row),
         "deleted": deleted,
+        "kind": row["kind"] or "text",
+        "editedAt": row["edited_at"],
+        "attachment": _attachment_payload(row, deleted),
+        "media": _media_payload(row, deleted),
+        "linkPreview": _link_preview_payload(row, deleted),
+        "gallery": _gallery_payload(row, deleted),
+        "pinnedAt": row["pinned_at"] if "pinned_at" in row.keys() else None,
+        "pinnedBy": row["pinned_by"] if "pinned_by" in row.keys() else None,
+        "forwarded": bool(row["forwarded"]) if "forwarded" in row.keys() else False,
+        "expiresAt": row["expires_at"] if "expires_at" in row.keys() else None,
         "isOwn": True,
         "status": "sent",
         "readBy": [user_id],
@@ -643,10 +873,10 @@ def list_conversations():
             # when two stamps match to the microsecond
             for m in db.execute(
                 f"""
-                SELECT conversation_id, id, text, image_url, created_at,
+                SELECT conversation_id, id, text, image_url, kind, created_at,
                        sender_id, deleted_at, sender_name
                 FROM (
-                    SELECT m.conversation_id, m.id, m.text, m.image_url, m.created_at,
+                    SELECT m.conversation_id, m.id, m.text, m.image_url, m.kind, m.created_at,
                            m.sender_id, m.deleted_at, u.display_name AS sender_name,
                            ROW_NUMBER() OVER (
                                PARTITION BY m.conversation_id
@@ -734,6 +964,7 @@ def list_conversations():
                     "id": last_msg["id"],
                     "text": last_msg["text"] or "",
                     "imageUrl": last_msg["image_url"],
+                    "kind": last_msg["kind"] or "text",
                     "time": _format_time(last_msg["created_at"]),
                     "senderId": last_msg["sender_id"],
                     "senderName": last_msg["sender_name"],
@@ -946,6 +1177,15 @@ def create_conversation():
                 (conv_id, uid, now),
             )
 
+        # A group opens with its own first line — who made it and
+        # what it is called — so the room never starts blank
+        system_payload = None
+        if conv_type == "group":
+            system_payload = _insert_system_message(
+                db, conv_id, request.user,
+                f"{request.user['display_name']} sukūrė grupę „{(title or '').strip()}“",
+            )
+
         db.commit()
 
 
@@ -970,6 +1210,14 @@ def create_conversation():
                     # snapshot and this call — presence plumbing
                     # must never fail an already-committed create
                     logger.debug("join_room skipped for departed sid %s", sid)
+
+        # The opening line reaches the members now in the room
+        if system_payload:
+            try:
+                from app.chat.events import emit_new_message
+                emit_new_message(_get_socketio(), conv_id, system_payload)
+            except Exception:
+                logger.exception("System message broadcast failed after create")
 
         return jsonify({"conversationId": conv_id}), 201
     finally:
@@ -1042,73 +1290,106 @@ def get_messages(conv_id):
         if not participant:
             return jsonify({"error": "Not a participant"}), 403
 
+        # Disappearing messages leave before the page is read
+        _sweep_expired(db, conv_id)
 
-        # STEP 2: the page — newest first, strictly older than
-        # the (?before, ?before_id) composite cursor when
-        # given. The stamp is the raw createdAt string compared
-        # as text, the id breaks stamp ties so equal-stamp
-        # siblings never fall through a page boundary; without
-        # before_id the id arm compares against NULL (never
-        # true) and the filter degrades to the old bare-stamp
-        # cut. Garbage in ?limit is a 400, and the clamp keeps
-        # a negative from reaching SQLite as LIMIT -n ("no
-        # limit"). SQLite is asked for limit+1 rows: the extra
-        # one never leaves the server, it only answers hasMore
+
+        # STEP 2: the page — newest first. Three windows share
+        # one SELECT (_page_rows):
+        #   default        the newest rows
+        #   ?before[&before_id]
+        #                  strictly older than the (stamp, id)
+        #                  composite cursor. The stamp is the raw
+        #                  createdAt string compared as text, the
+        #                  id breaks stamp ties so equal-stamp
+        #                  siblings never fall through a page
+        #                  boundary; without before_id the id arm
+        #                  compares against NULL (never true) and
+        #                  the filter degrades to the bare-stamp cut
+        #   ?after&after_id
+        #                  strictly newer than the cursor — the
+        #                  client walking forward from an anchored
+        #                  window back to the head
+        #   ?around=<id>   half a page either side of one message
+        #                  (the anchor included): a search hit or a
+        #                  quoted message beyond the loaded history
+        #                  lands in one round trip
+        # hasMore says whether older rows exist beyond the page,
+        # hasNewer whether newer ones do (always False for the
+        # default and before windows — they end at the head).
+        # Garbage in ?limit is a 400, and the clamp keeps a
+        # negative from reaching SQLite as LIMIT -n ("no limit").
+        # SQLite is asked for limit+1 rows per side: the extra one
+        # never leaves the server, it only answers the flags
         # ====================================================
         before = request.args.get("before")
         before_id = request.args.get("before_id")
+        after = request.args.get("after")
+        after_id = request.args.get("after_id")
+        around = request.args.get("around")
         try:
             limit = int(request.args.get("limit", 50))
         except (TypeError, ValueError):
             return jsonify({"error": "limit must be an integer"}), 400
         limit = max(1, min(limit, 100))
-
-        if before:
-            rows = db.execute(
-                """
-                SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id,
-                       m.client_msg_id,
-                       u.display_name AS sender_name, u.avatar_url AS sender_avatar,
-                       m.reply_to_id, m.deleted_at,
-                       r.sender_id AS reply_sender_id, r.text AS reply_text,
-                       r.image_url AS reply_image_url, r.deleted_at AS reply_deleted_at,
-                       ru.display_name AS reply_sender_name
-                FROM messages m
-                JOIN users u ON u.id = m.sender_id
-                LEFT JOIN messages r ON r.id = m.reply_to_id
-                LEFT JOIN users ru ON ru.id = r.sender_id
-                WHERE m.conversation_id = ?
-                  AND (m.created_at < ? OR (m.created_at = ? AND m.id < ?))
-                ORDER BY m.created_at DESC, m.id DESC LIMIT ?
-                """,
-                (conv_id, before, before, before_id, limit + 1),
-            ).fetchall()
+        has_newer = False
+        if around:
+            anchor = db.execute(
+                "SELECT created_at, id FROM messages WHERE id = ? AND conversation_id = ?",
+                (around, conv_id),
+            ).fetchone()
+            if not anchor:
+                return jsonify({"error": "Message not found"}), 404
+            half = max(1, limit // 2)
+            older = _page_rows(
+                db,
+                "m.conversation_id = ? AND (m.created_at < ? OR (m.created_at = ? AND m.id <= ?))",
+                (conv_id, anchor["created_at"], anchor["created_at"], anchor["id"]),
+                "DESC",
+                half + 1,
+            )
+            newer = _page_rows(
+                db,
+                "m.conversation_id = ? AND (m.created_at > ? OR (m.created_at = ? AND m.id > ?))",
+                (conv_id, anchor["created_at"], anchor["created_at"], anchor["id"]),
+                "ASC",
+                half + 1,
+            )
+            has_more = len(older) > half
+            has_newer = len(newer) > half
+            rows = list(reversed(newer[:half])) + older[:half]
+        elif after:
+            newer = _page_rows(
+                db,
+                "m.conversation_id = ? AND (m.created_at > ? OR (m.created_at = ? AND m.id > ?))",
+                (conv_id, after, after, after_id),
+                "ASC",
+                limit + 1,
+            )
+            has_newer = len(newer) > limit
+            rows = list(reversed(newer[:limit]))
+            # Older than this page: the caller already holds it, but
+            # the flag stays truthful for a client that started here
+            has_more = bool(
+                db.execute(
+                    "SELECT 1 FROM messages WHERE conversation_id = ? AND (created_at < ? OR (created_at = ? AND id <= ?)) LIMIT 1",
+                    (conv_id, after, after, after_id),
+                ).fetchone()
+            )
+        elif before:
+            rows = _page_rows(
+                db,
+                "m.conversation_id = ? AND (m.created_at < ? OR (m.created_at = ? AND m.id < ?))",
+                (conv_id, before, before, before_id),
+                "DESC",
+                limit + 1,
+            )
+            has_more = len(rows) > limit
+            rows = rows[:limit]
         else:
-            rows = db.execute(
-                """
-                SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id,
-                       m.client_msg_id,
-                       u.display_name AS sender_name, u.avatar_url AS sender_avatar,
-                       m.reply_to_id, m.deleted_at,
-                       r.sender_id AS reply_sender_id, r.text AS reply_text,
-                       r.image_url AS reply_image_url, r.deleted_at AS reply_deleted_at,
-                       ru.display_name AS reply_sender_name
-                FROM messages m
-                JOIN users u ON u.id = m.sender_id
-                LEFT JOIN messages r ON r.id = m.reply_to_id
-                LEFT JOIN users ru ON ru.id = r.sender_id
-                WHERE m.conversation_id = ?
-                ORDER BY m.created_at DESC, m.id DESC LIMIT ?
-                """,
-                (conv_id, limit + 1),
-            ).fetchall()
-
-        # The probe row answers hasMore exactly and is then
-        # dropped — the page itself is never longer than limit
-        has_more = len(rows) > limit
-        rows = rows[:limit]
-
-
+            rows = _page_rows(db, "m.conversation_id = ?", (conv_id,), "DESC", limit + 1)
+            has_more = len(rows) > limit
+            rows = rows[:limit]
         # STEP 3: reactions and read receipts for the whole page
         # in two IN (...) queries instead of two per message
         # ======================================================
@@ -1158,7 +1439,7 @@ def get_messages(conv_id):
         # The conversation itself — a room opened from a push
         # notification has no title or type in its route params
         conv_row = db.execute(
-            "SELECT id, type, title, avatar_emoji FROM conversations WHERE id = ?",
+            "SELECT id, type, title, avatar_emoji, message_ttl_seconds FROM conversations WHERE id = ?",
             (conv_id,),
         ).fetchone()
         conversation = {
@@ -1166,6 +1447,7 @@ def get_messages(conv_id):
             "type": conv_row["type"],
             "title": conv_row["title"],
             "avatarEmoji": conv_row["avatar_emoji"],
+            "messageTtlSeconds": conv_row["message_ttl_seconds"] if "message_ttl_seconds" in conv_row.keys() else None,
         } if conv_row else None
 
 
@@ -1218,23 +1500,159 @@ def get_messages(conv_id):
                 "reactions": reactions,
                 "replyTo": _reply_payload(row),
                 "deleted": deleted,
+                "kind": row["kind"] or "text",
+                "editedAt": row["edited_at"],
+                "attachment": _attachment_payload(row, deleted),
+                "media": _media_payload(row, deleted),
+                "linkPreview": _link_preview_payload(row, deleted),
+                "gallery": _gallery_payload(row, deleted),
+                "pinnedAt": row["pinned_at"] if "pinned_at" in row.keys() else None,
+                "pinnedBy": row["pinned_by"] if "pinned_by" in row.keys() else None,
+                "forwarded": bool(row["forwarded"]) if "forwarded" in row.keys() else False,
+                "expiresAt": row["expires_at"] if "expires_at" in row.keys() else None,
             })
 
 
-        # STEP 6: DESC fetch → chronological list; hasMore was
-        # settled by the probe row back in STEP 2
+        # STEP 6: DESC fetch → chronological list; hasMore and
+        # hasNewer were settled by the probe rows back in STEP 2
         # =====================================================
         messages.reverse()
 
         return jsonify({
             "messages": messages,
             "hasMore": has_more,
+            "hasNewer": has_newer,
             "participants": participants,
             "conversation": conversation,
+            # The server clock at the time of the page — the point the
+            # client's change feed (get_changes) resumes from
+            "cursor": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         })
     finally:
         db.close()
 
+
+
+
+
+
+
+
+############################################################
+# get_changes
+############################################################
+#
+# GET /api/chat/conversations/<id>/changes?since=<iso>
+#
+# What changed in a room after a moment: every message edited
+# or unsent since `since` (the cursor a history page or an
+# earlier feed answered), as full rows — an unsent one blank
+# and deleted:true — plus the new cursor. A client that was
+# offline resyncs its newest page and then asks this for the
+# rows further up it still holds; without it an edit or an
+# unsend outside that page stayed stale until the room was
+# reopened. Members only (403); a malformed `since` is a 400;
+# at most 500 rows (a room that changed more than that is
+# reopened by the client on its own).
+#
+# Used by:
+#   - packages/chatengine adapters/knf/rest.ts — fetchChanges
+#     (hooks/useConversation.ts — resync)
+############################################################
+
+@chat_bp.route("/conversations/<conv_id>/changes", methods=["GET"])
+@require_auth
+def get_changes(conv_id):
+    # STEP 1: the cursor — an ISO stamp, nothing else
+    # ===============================================
+    user_id = request.user["id"]
+    since = (request.args.get("since") or "").strip()
+    if not since:
+        return jsonify({"error": "since is required"}), 400
+    try:
+        datetime.fromisoformat(since.replace("Z", "+00:00"))
+    except ValueError:
+        return jsonify({"error": "since must be an ISO datetime"}), 400
+    # Naive UTC, the shape every stamp in this database has
+    since_key = since.replace("Z", "").split("+")[0]
+
+    db = get_db()
+    try:
+
+
+        # STEP 2: membership
+        # ==================
+        participant = db.execute(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not participant:
+            return jsonify({"error": "Not a participant"}), 403
+
+
+        # STEP 3: the rows that moved after the cursor, shaped like
+        # a history row (the client applies them to what it holds)
+        # ========================================================
+        rows = db.execute(
+            f"""
+            SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id, m.reply_to_id, m.deleted_at,
+                   m.client_msg_id, u.display_name AS sender_name, u.avatar_url AS sender_avatar,
+                   m.kind, m.edited_at, m.attachment_url, m.attachment_name, m.attachment_size, m.attachment_mime,
+                   m.attachment_meta, m.link_preview, m.gallery, m.pinned_at, m.pinned_by, m.forwarded, m.expires_at,
+                   r.sender_id AS reply_sender_id, r.text AS reply_text,
+                   r.image_url AS reply_image_url, r.gallery AS reply_gallery, r.deleted_at AS reply_deleted_at,
+                   r.kind AS reply_kind, r.attachment_name AS reply_file_name,
+                   ru.display_name AS reply_sender_name
+            FROM messages m
+            JOIN users u ON u.id = m.sender_id
+            LEFT JOIN messages r ON r.id = m.reply_to_id
+            LEFT JOIN users ru ON ru.id = r.sender_id
+            WHERE m.conversation_id = ?
+              AND (m.edited_at > ? OR m.deleted_at > ?)
+            ORDER BY m.created_at ASC, m.id ASC
+            LIMIT 500
+            """,
+            (conv_id, since_key, since_key),
+        ).fetchall()
+
+        messages = []
+        for row in rows:
+            deleted = row["deleted_at"] is not None
+            messages.append({
+                "id": row["id"],
+                "conversationId": conv_id,
+                "senderId": row["sender_id"],
+                "senderName": row["sender_name"],
+                "senderAvatar": row["sender_avatar"],
+                "text": "" if deleted else row["text"],
+                "imageUrl": None if deleted else row["image_url"],
+                "time": _format_time(row["created_at"]),
+                "createdAt": row["created_at"],
+                "clientMsgId": row["client_msg_id"],
+                "isOwn": row["sender_id"] == user_id,
+                "status": "read",
+                "readBy": [],
+                "reactions": [],
+                "replyTo": _reply_payload(row),
+                "deleted": deleted,
+                "kind": row["kind"] or "text",
+                "editedAt": row["edited_at"],
+                "attachment": _attachment_payload(row, deleted),
+                "media": _media_payload(row, deleted),
+                "linkPreview": _link_preview_payload(row, deleted),
+                "gallery": _gallery_payload(row, deleted),
+                "pinnedAt": row["pinned_at"] if "pinned_at" in row.keys() else None,
+                "pinnedBy": row["pinned_by"] if "pinned_by" in row.keys() else None,
+                "forwarded": bool(row["forwarded"]) if "forwarded" in row.keys() else False,
+                "expiresAt": row["expires_at"] if "expires_at" in row.keys() else None,
+            })
+
+        return jsonify({
+            "messages": messages,
+            "cursor": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+        })
+    finally:
+        db.close()
 
 
 
@@ -1324,8 +1742,115 @@ def send_message(conv_id):
     text = raw_text.strip()
     image_url = data.get("imageUrl")
 
-    if not text and not image_url:
-        return jsonify({"error": "Message must have text or image"}), 400
+    # An optional document: {url, name, size, mime} — url must be an
+    # own upload (the same beacon guard photos pass), name bounded,
+    # size a non-negative int. A message may carry ONLY a file
+    attachment = data.get("attachment")
+    if attachment is not None:
+        if not isinstance(attachment, dict):
+            return jsonify({"error": "attachment must be an object"}), 400
+        att_url = attachment.get("url")
+        att_name = attachment.get("name", "")
+        att_size = attachment.get("size", 0)
+        att_mime = attachment.get("mime", "")
+        if not isinstance(att_url, str) or not _is_local_upload_url(att_url):
+            return jsonify({"error": "attachment.url must be an /api/uploads/ path"}), 400
+        if not isinstance(att_name, str) or not att_name.strip() or len(att_name) > 200:
+            return jsonify({"error": "attachment.name must be a non-blank string of at most 200 characters"}), 400
+        if not isinstance(att_size, int) or isinstance(att_size, bool) or att_size < 0:
+            return jsonify({"error": "attachment.size must be a non-negative integer"}), 400
+        if not isinstance(att_mime, str) or len(att_mime) > 100:
+            return jsonify({"error": "attachment.mime must be a short string"}), 400
+        attachment = {"url": att_url, "name": att_name.strip(), "size": att_size, "mime": att_mime.strip()}
+
+    # The frame of a photo / video: optional non-negative numbers
+    # and a poster that must be an own upload (the same beacon
+    # guard the photo itself passes)
+    media = data.get("media")
+    if media is not None:
+        if not isinstance(media, dict):
+            return jsonify({"error": "media must be an object"}), 400
+        clean = {}
+        for key in ("width", "height", "duration"):
+            value = media.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 10_000_000:
+                return jsonify({"error": f"media.{key} must be a non-negative number"}), 400
+            clean[key] = value
+        thumb = media.get("thumbnailUrl")
+        if thumb is not None:
+            if not isinstance(thumb, str) or not _is_local_upload_url(thumb):
+                return jsonify({"error": "media.thumbnailUrl must be an /api/uploads/ path"}), 400
+            clean["thumbnailUrl"] = thumb
+        # The upload route's ~14px micro copy, echoed back so every
+        # reader draws the blur before the bytes; a data URI only —
+        # never a fetchable address
+        preview_uri = media.get("preview")
+        if preview_uri is not None:
+            if not isinstance(preview_uri, str) or not preview_uri.startswith("data:image/") or len(preview_uri) > 2000:
+                return jsonify({"error": "media.preview must be a small data:image/ URI"}), 400
+            clean["preview"] = preview_uri
+        # A voice note's amplitude bars: up to 64 numbers in 0..1
+        waveform = media.get("waveform")
+        if waveform is not None:
+            if not isinstance(waveform, list) or len(waveform) > 64:
+                return jsonify({"error": "media.waveform must be a list of at most 64 numbers"}), 400
+            bars = []
+            for value in waveform:
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 1:
+                    return jsonify({"error": "media.waveform values must be numbers between 0 and 1"}), 400
+                bars.append(round(float(value), 3))
+            clean["waveform"] = bars
+        media = clean or None
+
+    # Several photos in one message: a list of 2–8 {url, width,
+    # height} objects, every url an own upload (the same beacon
+    # guard a single photo passes). A gallery rides alone — no
+    # single imageUrl and no file beside it
+    gallery = data.get("gallery")
+    if gallery is not None:
+        if not isinstance(gallery, list) or not 2 <= len(gallery) <= 8:
+            return jsonify({"error": "gallery must be a list of 2 to 8 photos"}), 400
+        clean_items = []
+        for item in gallery:
+            if not isinstance(item, dict):
+                return jsonify({"error": "every gallery item must be an object"}), 400
+            item_url = item.get("url")
+            if not isinstance(item_url, str) or not _is_local_upload_url(item_url):
+                return jsonify({"error": "every gallery url must be an /api/uploads/ path"}), 400
+            clean_item = {"url": item_url}
+            for key in ("width", "height"):
+                value = item.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 10_000_000:
+                    return jsonify({"error": f"gallery {key} must be a non-negative number"}), 400
+                clean_item[key] = value
+            item_preview = item.get("preview")
+            if item_preview is not None:
+                if not isinstance(item_preview, str) or not item_preview.startswith("data:image/") or len(item_preview) > 2000:
+                    return jsonify({"error": "gallery preview must be a small data:image/ URI"}), 400
+                clean_item["preview"] = item_preview
+            clean_items.append(clean_item)
+        gallery = clean_items
+        if image_url or attachment:
+            return jsonify({"error": "A gallery cannot ride with a single image or a file"}), 400
+        if data.get("kind") not in (None, "image"):
+            return jsonify({"error": "A gallery message's kind is image"}), 400
+
+    # The declared kind must match the content: a video is an
+    # attachment with kind=video, a file is the default for one
+    kind_param = data.get("kind")
+    if kind_param is not None and kind_param not in ("text", "image", "file", "video", "audio"):
+        return jsonify({"error": "kind must be text, image, file, video or audio"}), 400
+    if kind_param in ("video", "audio") and not attachment:
+        return jsonify({"error": "A video or audio message needs an attachment"}), 400
+    if kind_param == "image" and not image_url and not gallery:
+        return jsonify({"error": "An image message needs imageUrl"}), 400
+
+    if not text and not image_url and not attachment and not gallery:
+        return jsonify({"error": "Message must have text, an image or an attachment"}), 400
 
     if text and len(text) > 5000:
         return jsonify({"error": "Message text must not exceed 5000 characters"}), 400
@@ -1343,6 +1868,13 @@ def send_message(conv_id):
         return jsonify({"error": "client_msg_id must be a string"}), 400
     if client_msg_id and len(client_msg_id) > 128:
         return jsonify({"error": "client_msg_id too long"}), 400
+
+    # A message re-sent from another room carries only this mark —
+    # the content itself is the client's copy
+    forwarded = data.get("forwarded")
+    if forwarded is not None and not isinstance(forwarded, bool):
+        return jsonify({"error": "forwarded must be a boolean"}), 400
+    forwarded = bool(forwarded)
 
 
     # STEP 1.1: imageUrl must be a string and, when it names
@@ -1377,6 +1909,9 @@ def send_message(conv_id):
         if not participant:
             return jsonify({"error": "Not a participant"}), 403
 
+        # Disappearing messages leave before the room grows
+        _sweep_expired(db, conv_id)
+
 
         # STEP 2.0: a DIRECT chat between a blocked pair (either
         # direction) refuses the send — create_conversation stops
@@ -1408,7 +1943,8 @@ def send_message(conv_id):
             reply_row = db.execute(
                 """
                 SELECT r.id AS reply_to_id, r.sender_id AS reply_sender_id, r.text AS reply_text,
-                       r.image_url AS reply_image_url, r.deleted_at AS reply_deleted_at,
+                       r.image_url AS reply_image_url, r.gallery AS reply_gallery, r.deleted_at AS reply_deleted_at,
+                       r.kind AS reply_kind, r.attachment_name AS reply_file_name,
                        ru.display_name AS reply_sender_name
                 FROM messages r
                 JOIN users ru ON ru.id = r.sender_id
@@ -1447,9 +1983,38 @@ def send_message(conv_id):
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
         try:
+            if attachment:
+                kind = kind_param if kind_param in ("video", "audio") else "file"
+            else:
+                kind = "image" if image_url or gallery else "text"
+            # The frame only means something on a photo, a video or
+            # a voice note (its duration)
+            media_json = json.dumps(media) if media and kind in ("image", "video", "audio") else None
+            gallery_json = json.dumps(gallery) if gallery else None
+            # Disappearing messages: the room's TTL at SEND time
+            # stamps this row's hard-delete deadline — changing the
+            # TTL later never touches what was already sent
+            ttl_row = db.execute("SELECT message_ttl_seconds FROM conversations WHERE id = ?", (conv_id,)).fetchone()
+            ttl_seconds = ttl_row["message_ttl_seconds"] if ttl_row and "message_ttl_seconds" in ttl_row.keys() else None
+            expires_at = (
+                (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=ttl_seconds)).isoformat()
+                if ttl_seconds
+                else None
+            )
             db.execute(
-                "INSERT INTO messages (id, conversation_id, sender_id, text, image_url, reply_to_id, client_msg_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (msg_id, conv_id, user_id, text, image_url, reply_to_id or None, client_msg_id or None, now),
+                """INSERT INTO messages
+                   (id, conversation_id, sender_id, text, image_url, reply_to_id, client_msg_id, created_at,
+                    kind, attachment_url, attachment_name, attachment_size, attachment_mime, attachment_meta, gallery,
+                    forwarded, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (msg_id, conv_id, user_id, text, image_url, reply_to_id or None, client_msg_id or None, now,
+                 kind,
+                 attachment["url"] if attachment else None,
+                 attachment["name"] if attachment else None,
+                 attachment["size"] if attachment else None,
+                 attachment["mime"] if attachment else None,
+                 media_json, gallery_json,
+                 1 if forwarded else 0, expires_at),
             )
         except sqlite3.IntegrityError:
             # Only the (conversation_id, sender_id,
@@ -1509,6 +2074,18 @@ def send_message(conv_id):
             "reactions": [],
             "replyTo": _reply_payload(reply_row) if reply_row else None,
             "deleted": False,
+            "kind": kind,
+            "editedAt": None,
+            "attachment": attachment,
+            "media": json.loads(media_json) if media_json else None,
+            "gallery": gallery or None,
+            # Filled in by the unfurl task after the send; the room
+            # hears 'message_updated' when it lands
+            "linkPreview": None,
+            "forwarded": forwarded,
+            "expiresAt": expires_at,
+            "pinnedAt": None,
+            "pinnedBy": None,
         }
 
         from app.chat.events import emit_new_message
@@ -1577,6 +2154,13 @@ def send_message(conv_id):
                 push_data = {"type": "chat_message", "conversationId": conv_id}
                 if text:
                     preview = text[:100]
+                elif attachment and kind == "video":
+                    # LT for the same reason the photo marker is
+                    preview = "Vaizdo įrašas"
+                    push_data["preview"] = "video"
+                elif attachment:
+                    preview = "Failas"
+                    push_data["preview"] = "file"
                 else:
                     # A push with an empty body renders nothing on a
                     # lock screen, so a photo-only message ships the
@@ -1614,6 +2198,17 @@ def send_message(conv_id):
                     )
         except Exception:
             logger.exception("Push notification failed for chat message")
+
+        # STEP 7: a URL in the text gets its card, off the request
+        # thread — see chat/linkpreview.py
+        # =======================================================
+        try:
+            from app.chat.linkpreview import find_url, unfurl_message
+            link = find_url(text)
+            if link:
+                _get_socketio().start_background_task(unfurl_message, _get_socketio(), conv_id, msg_id, link, user_id)
+        except Exception:
+            logger.exception("Link preview task failed to start")
 
         # The sender's own view of the message: only their own
         # receipt exists yet, hence status "sent"
@@ -1681,7 +2276,7 @@ def delete_message(conv_id, msg_id):
         # so a repeat call stays silent on the wire
         # ===================================================
         row = db.execute(
-            "SELECT sender_id, deleted_at, image_url FROM messages WHERE id = ? AND conversation_id = ?",
+            "SELECT sender_id, deleted_at, image_url, attachment_url, attachment_meta, link_preview, gallery FROM messages WHERE id = ? AND conversation_id = ?",
             (msg_id, conv_id),
         ).fetchone()
         if not row:
@@ -1692,7 +2287,7 @@ def delete_message(conv_id, msg_id):
         if row["deleted_at"] is None:
             now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             db.execute(
-                "UPDATE messages SET text = '', image_url = NULL, deleted_at = ? WHERE id = ?",
+                "UPDATE messages SET text = '', image_url = NULL, attachment_url = NULL, attachment_name = NULL, attachment_size = NULL, attachment_mime = NULL, attachment_meta = NULL, link_preview = NULL, gallery = NULL, pinned_at = NULL, pinned_by = NULL, deleted_at = ? WHERE id = ?",
                 (now, msg_id),
             )
             db.execute("DELETE FROM message_reactions WHERE message_id = ?", (msg_id,))
@@ -1708,11 +2303,28 @@ def delete_message(conv_id, msg_id):
             # also takes, and every photo sent that way outlived
             # its message on disk. The helper reads the last path
             # segment, so it takes either form verbatim
-            image_url = row["image_url"]
-            if _is_local_upload_url(image_url):
+            poster = None
+            try:
+                poster = (json.loads(row["attachment_meta"]) or {}).get("thumbnailUrl") if row["attachment_meta"] else None
+            except (TypeError, ValueError):
+                poster = None
+            preview_image = None
+            try:
+                preview_image = (json.loads(row["link_preview"]) or {}).get("imageUrl") if row["link_preview"] else None
+            except (TypeError, ValueError):
+                preview_image = None
+            gallery_urls = []
+            try:
+                if row["gallery"]:
+                    gallery_urls = [item.get("url") for item in (json.loads(row["gallery"]) or []) if isinstance(item, dict)]
+            except (TypeError, ValueError):
+                gallery_urls = []
+            for stored in (row["image_url"], row["attachment_url"], poster, preview_image, *gallery_urls):
+                if not _is_local_upload_url(stored):
+                    continue
                 try:
                     from app.uploads.routes import delete_upload
-                    delete_upload(image_url)
+                    delete_upload(stored)
                 except ImportError:
                     pass
                 except Exception:
@@ -1725,6 +2337,326 @@ def delete_message(conv_id, msg_id):
     finally:
         db.close()
 
+
+
+
+
+
+
+
+############################################################
+# edit_message
+############################################################
+#
+# PUT /api/chat/conversations/<id>/messages/<mid> {text}
+#
+# The sender rewrites their own text. Bounded like a send (a
+# non-blank string ≤ 5000), only text/image rows (a system
+# row is the room's, a file row's name is not prose), never
+# an unsent one (409 — there is nothing to edit). edited_at is
+# stamped so every reader shows "redaguota"; the quote inside
+# replies re-reads the row, so quotes follow the edit too.
+# Broadcasts 'message_edited' {conversationId, messageId,
+# text, editedAt} to the room. Outsider → 403, unknown → 404,
+# somebody else's → 403. Capped at 100 edits per 5 min.
+#
+# Used by:
+#   - services/api/chat.ts — editMessageApi
+#     (hooks/chat/useChatComposer.ts — edit mode)
+############################################################
+
+@chat_bp.route("/conversations/<conv_id>/messages/<msg_id>", methods=["PUT"])
+@require_auth
+@rate_limit("chat_edit", max_attempts=100)
+def edit_message(conv_id, msg_id):
+    # STEP 1: the body — a non-blank, bounded string
+    # ==============================================
+    user_id = request.user["id"]
+    data = get_json_object()
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+    raw_text = data.get("text")
+    if not isinstance(raw_text, str):
+        return jsonify({"error": "Text must be a string"}), 400
+    text = raw_text.strip()
+    if not text:
+        return jsonify({"error": "Message text required"}), 400
+    if len(text) > 5000:
+        return jsonify({"error": "Message text must not exceed 5000 characters"}), 400
+
+    db = get_db()
+    try:
+
+
+        # STEP 2: membership, the row, its owner, its state
+        # =================================================
+        participant = db.execute(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not participant:
+            return jsonify({"error": "Not a participant"}), 403
+
+        row = db.execute(
+            "SELECT sender_id, deleted_at, kind FROM messages WHERE id = ? AND conversation_id = ?",
+            (msg_id, conv_id),
+        ).fetchone()
+        if not row:
+            return jsonify({"error": "Message not found"}), 404
+        if row["sender_id"] != user_id:
+            return jsonify({"error": "Only the sender can edit a message"}), 403
+        if row["deleted_at"] is not None:
+            return jsonify({"error": "An unsent message cannot be edited"}), 409
+        if (row["kind"] or "text") not in ("text", "image"):
+            return jsonify({"error": "Only text messages can be edited"}), 400
+
+
+        # STEP 3: the rewrite, stamped, then the broadcast
+        # ================================================
+        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        db.execute(
+            "UPDATE messages SET text = ?, edited_at = ? WHERE id = ?",
+            (text, now, msg_id),
+        )
+        db.commit()
+
+        try:
+            from app.chat.events import emit_message_edited
+            emit_message_edited(_get_socketio(), conv_id, msg_id, text, now)
+        except Exception:
+            logger.exception("message_edited broadcast failed")
+
+        return jsonify({"id": msg_id, "text": text, "editedAt": now})
+    finally:
+        db.close()
+
+
+
+
+
+
+
+############################################################
+# pin_message
+############################################################
+#
+# PUT    /api/chat/conversations/<id>/messages/<mid>/pin
+# DELETE /api/chat/conversations/<id>/messages/<mid>/pin
+#
+# Any member may pin or unpin a message (a small room's
+# etiquette is its own; the pinner's name is kept). The room
+# hears 'message_updated' with {pinnedAt, pinnedBy}, the same
+# patch door the link preview uses, so every client merges it
+# into the row it already holds. Unsent and system rows cannot
+# be pinned (404 / 400).
+#
+# Used by:
+#   - mobile chat room — the menu's Pin/Unpin action
+############################################################
+
+@chat_bp.route("/conversations/<conv_id>/messages/<msg_id>/pin", methods=["PUT", "DELETE"])
+@require_auth
+@rate_limit("chat_pin", max_attempts=60)
+def pin_message(conv_id, msg_id):
+    # STEP 1: membership, the row, its state
+    # ======================================
+    user_id = request.user["id"]
+    db = get_db()
+    try:
+        participant = db.execute(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not participant:
+            return jsonify({"error": "Not a participant"}), 403
+
+        row = db.execute(
+            "SELECT deleted_at, kind FROM messages WHERE id = ? AND conversation_id = ?",
+            (msg_id, conv_id),
+        ).fetchone()
+        if not row or row["deleted_at"] is not None:
+            return jsonify({"error": "Message not found"}), 404
+        if (row["kind"] or "text") == "system":
+            return jsonify({"error": "System messages cannot be pinned"}), 400
+
+
+        # STEP 2: flip the pin and tell the room
+        # ======================================
+        if request.method == "PUT":
+            pinned_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+            pinned_by = user_id
+        else:
+            pinned_at = None
+            pinned_by = None
+        db.execute(
+            "UPDATE messages SET pinned_at = ?, pinned_by = ? WHERE id = ?",
+            (pinned_at, pinned_by, msg_id),
+        )
+        db.commit()
+
+        from app.chat.events import emit_message_updated
+        emit_message_updated(_get_socketio(), conv_id, msg_id, {"pinnedAt": pinned_at, "pinnedBy": pinned_by})
+        return jsonify({"pinnedAt": pinned_at, "pinnedBy": pinned_by}), 200
+    finally:
+        db.close()
+
+
+
+
+
+
+
+############################################################
+# get_pins
+############################################################
+#
+# GET /api/chat/conversations/<id>/pins
+#
+# The room's pinned messages, newest pin first, capped at 20 —
+# what the pinned banner shows and cycles through; a tap jumps
+# by id (the around-window reaches pins outside the loaded
+# history). Shaped like a page row minus reactions/receipts —
+# the banner needs the content, not the chrome.
+#
+# Used by:
+#   - mobile chat room — the pinned banner
+############################################################
+
+@chat_bp.route("/conversations/<conv_id>/pins", methods=["GET"])
+@require_auth
+def get_pins(conv_id):
+    # STEP 1: membership gate
+    # =======================
+    user_id = request.user["id"]
+    db = get_db()
+    try:
+        participant = db.execute(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not participant:
+            return jsonify({"error": "Not a participant"}), 403
+
+
+        # STEP 2: the pinned rows, shaped lean
+        # ====================================
+        rows = db.execute(
+            """SELECT m.id, m.text, m.image_url, m.created_at, m.client_msg_id, m.sender_id,
+                      m.kind, m.edited_at, m.attachment_url, m.attachment_name, m.attachment_size, m.attachment_mime,
+                      m.attachment_meta, m.link_preview, m.gallery, m.pinned_at, m.pinned_by, m.forwarded, m.expires_at,
+                      m.deleted_at, u.display_name, u.avatar_url
+               FROM messages m
+               JOIN users u ON u.id = m.sender_id
+               WHERE m.conversation_id = ? AND m.pinned_at IS NOT NULL AND m.deleted_at IS NULL
+               ORDER BY m.pinned_at DESC
+               LIMIT 20""",
+            (conv_id,),
+        ).fetchall()
+
+        pins = []
+        for row in rows:
+            deleted = row["deleted_at"] is not None
+            pins.append({
+                "id": row["id"],
+                "conversationId": conv_id,
+                "senderId": row["sender_id"],
+                "senderName": row["display_name"],
+                "senderAvatar": row["avatar_url"],
+                "text": row["text"] or "",
+                "imageUrl": row["image_url"],
+                "createdAt": row["created_at"],
+                "clientMsgId": row["client_msg_id"],
+                "reactions": [],
+                "replyTo": None,
+                "deleted": deleted,
+                "kind": row["kind"] or "text",
+                "editedAt": row["edited_at"],
+                "attachment": _attachment_payload(row, deleted),
+                "media": _media_payload(row, deleted),
+                "gallery": _gallery_payload(row, deleted),
+                "linkPreview": _link_preview_payload(row, deleted),
+                "pinnedAt": row["pinned_at"],
+                "pinnedBy": row["pinned_by"],
+                "forwarded": bool(row["forwarded"]),
+                "expiresAt": row["expires_at"],
+            })
+        return jsonify({"pins": pins}), 200
+    finally:
+        db.close()
+
+
+
+
+
+
+
+############################################################
+# set_message_ttl
+############################################################
+#
+# PUT /api/chat/conversations/<id>/ttl
+#
+# Disappearing messages: any member sets the room's TTL — 0 or
+# null switches it off, otherwise 60s..365d. Only messages sent
+# AFTER the change carry an expires_at (history is never
+# retroactively burned). The room narrates the change with a
+# system row and every client hears 'conversation_updated'
+# {messageTtlSeconds} to move its own clock.
+#
+# Used by:
+#   - mobile chat room — the room menu's disappearing option
+############################################################
+
+@chat_bp.route("/conversations/<conv_id>/ttl", methods=["PUT"])
+@require_auth
+@rate_limit("chat_ttl", max_attempts=30)
+def set_message_ttl(conv_id):
+    # STEP 1: the body — null/0 (off) or one bounded window
+    # =====================================================
+    user_id = request.user["id"]
+    data = get_json_object()
+    if data is None:
+        return jsonify({"error": "JSON body required"}), 400
+    seconds = data.get("seconds")
+    if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, int)):
+        return jsonify({"error": "seconds must be an integer or null"}), 400
+    if seconds is not None and seconds != 0 and not 60 <= seconds <= 31_536_000:
+        return jsonify({"error": "seconds must be 0 (off) or between 60 and 31536000"}), 400
+    ttl = seconds or None
+
+
+    # STEP 2: membership, the write, the narration
+    # ============================================
+    db = get_db()
+    try:
+        participant = db.execute(
+            "SELECT 1 FROM conversation_participants WHERE conversation_id = ? AND user_id = ?",
+            (conv_id, user_id),
+        ).fetchone()
+        if not participant:
+            return jsonify({"error": "Not a participant"}), 403
+
+        db.execute("UPDATE conversations SET message_ttl_seconds = ? WHERE id = ?", (ttl, conv_id))
+
+        if ttl:
+            if ttl < 3600:
+                window = f"{ttl // 60} min."
+            elif ttl < 86_400:
+                window = f"{ttl // 3600} val."
+            else:
+                window = f"{ttl // 86_400} d."
+            narration = f"{request.user['display_name']} įjungė nykstančias žinutes ({window})"
+        else:
+            narration = f"{request.user['display_name']} išjungė nykstančias žinutes"
+        system_payload = _insert_system_message(db, conv_id, request.user, narration)
+        db.commit()
+
+        from app.chat.events import emit_conversation_updated, emit_new_message
+        emit_new_message(_get_socketio(), conv_id, system_payload)
+        emit_conversation_updated(_get_socketio(), conv_id, {"messageTtlSeconds": ttl})
+        return jsonify({"messageTtlSeconds": ttl}), 200
+    finally:
+        db.close()
 
 
 
@@ -2263,13 +3195,29 @@ def leave_conversation(conv_id):
             (conv_id,),
         ).fetchone()[0]
 
+        system_payload = None
         if remaining == 0:
             db.execute("DELETE FROM message_reads WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)", (conv_id,))
             db.execute("DELETE FROM message_reactions WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?)", (conv_id,))
             db.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
             db.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+        else:
+            # The members who stay see who left — a group's
+            # narration; a direct chat's other half simply keeps
+            # the conversation as it was
+            conv_type_row = db.execute("SELECT type FROM conversations WHERE id = ?", (conv_id,)).fetchone()
+            if conv_type_row and conv_type_row["type"] == "group":
+                system_payload = _insert_system_message(
+                    db, conv_id, request.user, f"{request.user['display_name']} paliko pokalbį",
+                )
 
         db.commit()
+        if system_payload:
+            try:
+                from app.chat.events import emit_new_message
+                emit_new_message(_get_socketio(), conv_id, system_payload)
+            except Exception:
+                logger.exception("System message broadcast failed after leave")
 
 
         # STEP 3: evict every socket of the leaver from the room
@@ -2716,4 +3664,33 @@ def search_users():
             ]
         })
     finally:
-        db.close()
+        db.close()# One SELECT for every window of the messages page: the columns
+# the row serialiser reads (STEP 5), the reply join, filtered by a
+# WHERE fragment over `m`, ordered by (created_at, id) either way.
+# The ASC order is what the forward windows (after / the newer
+# half of around) need; callers reverse it back to newest-first
+def _page_rows(db, where, params, order, limit):
+    return db.execute(
+        f"""
+        SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id,
+               m.client_msg_id,
+               m.kind, m.edited_at, m.attachment_url, m.attachment_name, m.attachment_size, m.attachment_mime,
+               m.attachment_meta, m.link_preview, m.gallery, m.pinned_at, m.pinned_by, m.forwarded, m.expires_at,
+               u.display_name AS sender_name, u.avatar_url AS sender_avatar,
+               m.reply_to_id, m.deleted_at,
+               r.sender_id AS reply_sender_id, r.text AS reply_text,
+               r.image_url AS reply_image_url, r.gallery AS reply_gallery, r.deleted_at AS reply_deleted_at,
+               r.kind AS reply_kind, r.attachment_name AS reply_file_name,
+               ru.display_name AS reply_sender_name
+        FROM messages m
+        JOIN users u ON u.id = m.sender_id
+        LEFT JOIN messages r ON r.id = m.reply_to_id
+        LEFT JOIN users ru ON ru.id = r.sender_id
+        WHERE {where}
+        ORDER BY m.created_at {order}, m.id {order} LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+
+
+

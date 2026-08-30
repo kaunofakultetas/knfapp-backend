@@ -28,12 +28,23 @@
     route {
 
 
+        # Uploads: the one route that may carry a video (50 MB
+        # + the multipart envelope — Flask's MAX_CONTENT_LENGTH)
+        handle /api/uploads* {
+            request_body {
+                max_size 52MB
+            }
+            reverse_proxy knfapp-backend:8000 {
+                header_up -X-Forwarded-Prefix
+            }
+        }
+
+
         # API backend
         handle /api/* {
             # Oversized bodies die here instead of filling the
-            # backend's /tmp tmpfs; matches Flask's own
-            # MAX_CONTENT_LENGTH (6 MB = 5 MB image + multipart
-            # envelope)
+            # backend's /tmp tmpfs; 6 MB is more than any JSON
+            # body this API takes
             request_body {
                 max_size 6MB
             }

@@ -1387,6 +1387,17 @@ paths:
     get:
       tags: [chat]
       summary: Get messages for a conversation (cursor-based pagination)
+      description: |
+        Newest first by default, oldest-first in the answer. Three windows:
+        `before` (+ `before_id`) answers the rows strictly older than the
+        (stamp, id) cursor; `after` + `after_id` the rows strictly newer
+        (a client walking forward from an anchored window); `around`
+        half a page either side of one message, the anchor included —
+        a search hit or a quoted message beyond the loaded history in one
+        round trip (404 when the message is not in this conversation).
+        `hasMore` says whether older rows exist beyond the page, `hasNewer`
+        whether newer ones do (always false for the default and before
+        windows).
       security:
         - bearerAuth: []
       parameters:
@@ -1397,7 +1408,27 @@ paths:
             type: string
         - name: before
           in: query
-          description: Cursor — ISO datetime string; returns messages older than this
+          description: Cursor — the createdAt of the oldest held row; returns messages older than it
+          schema:
+            type: string
+        - name: before_id
+          in: query
+          description: The id half of the before cursor (breaks equal-stamp ties)
+          schema:
+            type: string
+        - name: after
+          in: query
+          description: Cursor — the createdAt of the newest held row; returns messages newer than it
+          schema:
+            type: string
+        - name: after_id
+          in: query
+          description: The id half of the after cursor
+          schema:
+            type: string
+        - name: around
+          in: query
+          description: A message id — the window is centred on it
           schema:
             type: string
         - name: limit
@@ -1421,6 +1452,10 @@ paths:
                       $ref: "#/components/schemas/Message"
                   hasMore:
                     type: boolean
+                    description: Older rows exist beyond this page
+                  hasNewer:
+                    type: boolean
+                    description: Newer rows exist beyond this page (only an around / after window can say true)
                   participants:
                     type: array
                     description: Every member of the conversation (portraits for the room header)
@@ -1430,6 +1465,9 @@ paths:
                         id: {type: string}
                         displayName: {type: string}
                         avatarUrl: {type: string, nullable: true}
+                  cursor:
+                    type: string
+                    description: The server clock at the time of the page (ISO, naive UTC) — the point GET …/changes resumes from
                   conversation:
                     type: object
                     nullable: true
@@ -1439,6 +1477,7 @@ paths:
                       type: {type: string, enum: [direct, group]}
                       title: {type: string, nullable: true}
                       avatarEmoji: {type: string, nullable: true}
+                      messageTtlSeconds: {type: integer, nullable: true, description: The disappearing-messages window stamped on every LATER send; null when off}
         "403":
           description: Not a participant
     post:
@@ -1474,6 +1513,65 @@ paths:
                     The client's optimistic-send nonce, at most 128 characters.
                     Repeating one already committed answers 200 with the EXISTING
                     message instead of inserting a duplicate.
+                attachment:
+                  type: object
+                  description: >
+                    A document or a video uploaded first through POST /uploads
+                    (kind=file / kind=video). A message may carry ONLY an
+                    attachment. url must be an own /api/uploads/... path; name
+                    non-blank, at most 200 characters; size a non-negative
+                    integer; mime at most 100 characters.
+                  properties:
+                    url: {type: string}
+                    name: {type: string}
+                    size: {type: integer}
+                    mime: {type: string}
+                media:
+                  type: object
+                  description: >
+                    The frame of a photo or a video: optional non-negative
+                    width / height / duration (seconds) and, for a video, the
+                    poster frame's own /api/uploads/... path. Stored only on
+                    image and video rows.
+                  properties:
+                    width: {type: integer}
+                    height: {type: integer}
+                    duration: {type: number}
+                    thumbnailUrl: {type: string}
+                    preview: {type: string, description: "The upload route's ~14px micro copy as a data:image/ URI (max 2000 chars) — the blur shown while the real bytes download"}
+                    waveform:
+                      type: array
+                      maxItems: 64
+                      items: {type: number}
+                      description: A voice note's amplitude bars, numbers in 0..1
+                gallery:
+                  type: array
+                  minItems: 2
+                  maxItems: 8
+                  description: >
+                    Several photos in one message (migration v60). Each url
+                    must be an own /api/uploads/... path; width/height are
+                    optional non-negative numbers. A gallery rides alone —
+                    no imageUrl and no attachment beside it; kind, when
+                    given, must be `image`.
+                  items:
+                    type: object
+                    properties:
+                      url: {type: string}
+                      width: {type: integer}
+                      height: {type: integer}
+                      preview: {type: string, description: "The photo's micro copy (data:image/ URI, max 2000 chars)"}
+                forwarded:
+                  type: boolean
+                  description: Marks a message re-sent from another room — the content itself is the client's copy
+                kind:
+                  type: string
+                  enum: [text, image, file, video, audio]
+                  description: >
+                    Optional. `video` marks an attachment as a clip and
+                    `audio` as a voice note (default for an attachment is
+                    `file`; both need one); `image` requires imageUrl, a
+                    gallery counts.
       responses:
         "201":
           description: Message sent
@@ -1503,6 +1601,51 @@ paths:
           description: Not a participant
         "429":
           description: Send rate limit exceeded (150 per 5 minutes per user)
+
+  /chat/conversations/{convId}/changes:
+    get:
+      tags: [chat]
+      summary: Messages edited or unsent since a cursor (the offline resync feed)
+      description: >
+        Every message of the conversation edited or unsent after `since` — the
+        `cursor` a history page or an earlier call of this route answered — as
+        full Message rows (an unsent one is blank with deleted=true), plus the
+        new cursor. Clients that were offline resync their newest page and then
+        apply this feed to the older rows they still hold. Reactions and
+        receipts are not part of the feed (empty here); at most 500 rows.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: true
+          schema:
+            type: string
+          description: ISO datetime, naive UTC (a cursor from GET …/messages or this route)
+      responses:
+        "200":
+          description: The feed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Message"
+                  cursor:
+                    type: string
+                    description: ISO datetime, naive UTC — pass it as `since` next time
+        "400":
+          description: since missing or not an ISO datetime
+        "403":
+          description: Not a participant
 
   /chat/conversations/{convId}/messages/search:
     get:
@@ -1559,6 +1702,59 @@ paths:
           description: Search rate limit exceeded (100 per 5 minutes per user)
 
   /chat/conversations/{convId}/messages/{msgId}:
+    put:
+      tags: [chat]
+      summary: Edit your own message's text
+      description: >
+        The sender rewrites the text of a text or image message (a caption
+        counts). Stamps editedAt and broadcasts the message_edited socket
+        event {conversationId, messageId, text, editedAt} to the room; quotes
+        of the message re-read the row, so they follow the edit. System and
+        file rows cannot be edited (400), an unsent one answers 409.
+        Capped at 100 edits per 5 minutes.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: msgId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text:
+                  type: string
+                  description: Stripped server-side, non-blank, at most 5000 characters
+      responses:
+        "200":
+          description: Edited
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  text: {type: string}
+                  editedAt: {type: string, description: ISO datetime, naive UTC}
+        "400":
+          description: Bad body, or a system / file message
+        "403":
+          description: Not a participant, or not the sender
+        "404":
+          description: Message not found in this conversation
+        "409":
+          description: The message was unsent
     delete:
       tags: [chat]
       summary: Unsend (soft-delete) your own message
@@ -1584,6 +1780,118 @@ paths:
         "404":
           description: Message not found in this conversation
 
+  /chat/conversations/{convId}/messages/{msgId}/pin:
+    put:
+      tags: [chat]
+      summary: Pin a message (any member; the room hears message_updated {pinnedAt, pinnedBy})
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: msgId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Pinned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pinnedAt: {type: string}
+                  pinnedBy: {type: string}
+        "400":
+          description: System messages cannot be pinned
+        "403":
+          description: Not a participant
+        "404":
+          description: Message not found or unsent
+    delete:
+      tags: [chat]
+      summary: Unpin a message
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: msgId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Unpinned (pinnedAt/pinnedBy come back null)
+  /chat/conversations/{convId}/pins:
+    get:
+      tags: [chat]
+      summary: The room's pinned messages, newest pin first (max 20), shaped like page rows minus reactions/receipts
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The pins
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pins:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ChatMessage'
+  /chat/conversations/{convId}/ttl:
+    put:
+      tags: [chat]
+      summary: >
+        Disappearing messages: any member sets the room's TTL (0/null off,
+        else 60..31536000 seconds). Only messages sent AFTER the change get
+        an expiry; the room narrates it with a system row and hears the
+        conversation_updated socket event {conversationId, patch:
+        {messageTtlSeconds}}.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: convId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                seconds:
+                  type: integer
+                  nullable: true
+      responses:
+        "200":
+          description: The new TTL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messageTtlSeconds: {type: integer, nullable: true}
   /chat/conversations/{convId}/messages/{msgId}/react:
     post:
       tags: [chat]
@@ -3005,6 +3313,16 @@ paths:
                 file:
                   type: string
                   format: binary
+                kind:
+                  type: string
+                  enum: [image, file, video, audio]
+                  description: >
+                    Absent/`image`: a photo, re-encoded (5 MB). `file`: a
+                    document — pdf, docx, xlsx, pptx, zip, txt — stored as sent
+                    once its bytes prove the type (5 MB). `video`: mp4, mov,
+                    m4v, webm by container signature, stored as sent (50 MB).
+                    `audio`: a voice note — m4a, aac, mp3 by signature, stored
+                    as sent (5 MB).
       responses:
         "201":
           description: File uploaded successfully
@@ -3019,6 +3337,29 @@ paths:
                   filename:
                     type: string
                     example: abc123.png
+                  name:
+                    type: string
+                    description: The name the sender chose (sanitised) — what a file message shows
+                  size:
+                    type: integer
+                    description: Stored bytes
+                  mime:
+                    type: string
+                    description: The canonical mime for the stored extension
+                  width:
+                    type: integer
+                    nullable: true
+                    description: Photos only — the stored pixel width after the re-encode
+                  height:
+                    type: integer
+                    nullable: true
+                  preview:
+                    type: string
+                    nullable: true
+                    description: >
+                      Photos only — a ~14px micro copy as a data:image/ URI,
+                      echoed back in media.preview / gallery previews so every
+                      reader draws the blur before the bytes
         "400":
           description: |
             Bad request; code is one of no_file, empty_file, file_too_large,
@@ -3026,7 +3367,7 @@ paths:
         "401":
           description: Authentication required
         "413":
-          description: Storage quota reached (code quota_exceeded), or the body exceeded the 6 MB request limit
+          description: Storage quota reached (code quota_exceeded), or the body exceeded the request limit (52 MB on this route — a 50 MB video plus the multipart envelope)
         "429":
           description: Too many uploads (code rate_limited); Retry-After tells the client when to try again
         "507":
@@ -3839,9 +4180,92 @@ components:
             text: {type: string}
             imageUrl: {type: string, nullable: true}
             deleted: {type: boolean}
+            kind: {type: string, enum: [text, image, video, file, audio, system]}
+            fileName: {type: string, nullable: true, description: The quoted file's name (kind file)}
         deleted:
           type: boolean
-          description: True when the message was unsent — text and imageUrl come back blank
+          description: True when the message was unsent — text, imageUrl, attachment and media come back blank
+        kind:
+          type: string
+          enum: [text, image, video, file, audio, system]
+          description: >
+            What the row carries (migration v57). system rows are the room's
+            own narration ("X sukūrė grupę", "Y paliko pokalbį") — the sender
+            is the actor. video, file and audio (voice note) rows carry
+            `attachment`; a voice note's length rides in `media.duration`.
+        editedAt:
+          type: string
+          nullable: true
+          description: ISO datetime of the sender's last edit, null when never edited
+        attachment:
+          type: object
+          nullable: true
+          description: The document (kind file) or the clip (kind video); null otherwise and on unsent rows
+          properties:
+            url: {type: string, description: The relative /api/uploads/... path}
+            name: {type: string, description: The name the sender chose}
+            size: {type: integer, description: Bytes}
+            mime: {type: string}
+        media:
+          type: object
+          nullable: true
+          description: >
+            What a photo or video message knows about its frame (migration
+            v58) — so clients lay the bubble out at its final size before the
+            bytes arrive. Null for text/file/system rows and on unsent ones.
+          properties:
+            width: {type: integer, nullable: true}
+            height: {type: integer, nullable: true}
+            duration: {type: number, nullable: true, description: Seconds (video)}
+            thumbnailUrl: {type: string, nullable: true, description: The poster frame's /api/uploads/... path (video)}
+        linkPreview:
+          type: object
+          nullable: true
+          description: >
+            The card of the first URL in the text (migration v59), unfurled by
+            the SERVER after the send (null in the send response; the room hears
+            the message_updated socket event {conversationId, messageId, patch:
+            {linkPreview}} when it lands). The picture is stored as an own
+            upload — clients never fetch a stranger's host.
+          properties:
+            url: {type: string}
+            title: {type: string}
+            description: {type: string}
+            siteName: {type: string}
+            imageUrl: {type: string, nullable: true, description: An /api/uploads/... path}
+            imagePreview: {type: string, nullable: true, description: The picture's ~14px micro copy (data URI)}
+        gallery:
+          type: array
+          nullable: true
+          description: >
+            The photos of a multi-photo message (migration v60), in the order
+            they were sent. Null on single-photo rows, every other kind and
+            unsent ones.
+          items:
+            type: object
+            properties:
+              url: {type: string, description: The relative /api/uploads/... path}
+              width: {type: integer, nullable: true}
+              height: {type: integer, nullable: true}
+              preview: {type: string, nullable: true, description: The photo's micro copy (data URI)}
+        forwarded:
+          type: boolean
+          description: Re-sent from another room (migration v61)
+        expiresAt:
+          type: string
+          nullable: true
+          description: >
+            Hard-delete deadline stamped at send when the room's
+            disappearing-messages TTL was on (migration v61); the sweep
+            removes the row and its files after this moment.
+        pinnedAt:
+          type: string
+          nullable: true
+          description: When a member pinned this message (migration v61); null when unpinned
+        pinnedBy:
+          type: string
+          nullable: true
+          description: Who pinned it
         isOwn:
           type: boolean
         status:

@@ -996,6 +996,38 @@ def emit_reaction_update(socketio, conv_id: str, msg_id: str, reactions: list):
 #     preview → placeholder)
 ############################################################
 
+def emit_message_edited(socketio, conv_id: str, msg_id: str, text: str, edited_at: str):
+    # "message_edited" {conversationId, messageId, text, editedAt}
+    # — every client in the room replaces the row's text in place
+    socketio.emit(
+        "message_edited",
+        {"conversationId": conv_id, "messageId": msg_id, "text": text, "editedAt": edited_at},
+        to=f"conv:{conv_id}",
+    )
+
+
+def emit_message_updated(socketio, conv_id: str, msg_id: str, patch: dict):
+    # "message_updated" {conversationId, messageId, patch} — the
+    # server filled something in after the send (today: the link
+    # preview card); every client merges the patch into the row
+    socketio.emit(
+        "message_updated",
+        {"conversationId": conv_id, "messageId": msg_id, "patch": patch},
+        to=f"conv:{conv_id}",
+    )
+
+
+def emit_conversation_updated(socketio, conv_id: str, patch: dict):
+    # "conversation_updated" {conversationId, patch} — a room
+    # setting changed (today: the disappearing-messages TTL);
+    # clients merge the patch into the conversation meta they hold
+    socketio.emit(
+        "conversation_updated",
+        {"conversationId": conv_id, "patch": patch},
+        to=f"conv:{conv_id}",
+    )
+
+
 def emit_message_deleted(socketio, conv_id: str, msg_id: str):
     socketio.emit(
         "message_deleted",

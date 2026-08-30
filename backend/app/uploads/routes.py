@@ -46,6 +46,7 @@
 ############################################################
 
 
+import base64
 import io
 import logging
 import os
@@ -67,6 +68,45 @@ logger = logging.getLogger(__name__)
 # cheap filename pre-filter — the BYTES decide what is stored
 # (kept sorted so the message reads the same in every process)
 ALLOWED_EXTENSIONS = ("bmp", "gif", "jpeg", "jpg", "png", "tif", "tiff", "webp")
+
+# Documents (form field kind=file): stored as sent, never
+# re-encoded, so the bytes must prove their type — PDF and the
+# ZIP container behind docx/xlsx/pptx/zip by signature, plain
+# text by decoding cleanly. Same size cap as photos
+ALLOWED_DOC_EXTENSIONS = ("pdf", "docx", "xlsx", "pptx", "zip", "txt")
+
+# Videos (form field kind=video): stored as sent, proven by
+# container signature — the ISO base-media 'ftyp' box for
+# mp4/mov/m4v, the EBML header for webm. Their own, larger cap
+# (a phone's minute of 1080p is tens of MB); the multipart
+# ceiling in create_app and Caddy's /api/uploads body limit
+# are sized to it
+ALLOWED_VIDEO_EXTENSIONS = ("mp4", "mov", "m4v", "webm")
+
+# Voice notes (form field kind=audio): stored as sent, proven
+# by container signature — the ISO 'ftyp' box for m4a, the
+# ADTS sync for raw aac, an ID3 tag or MPEG frame sync for mp3
+ALLOWED_AUDIO_EXTENSIONS = ("m4a", "aac", "mp3")
+VIDEO_MAX_SIZE = 50 * 1024 * 1024        # mirrored by mobile MAX_VIDEO_UPLOAD_BYTES
+_VIDEO_MIME = {
+    "mp4": "video/mp4",
+    "mov": "video/quicktime",
+    "m4v": "video/x-m4v",
+    "webm": "video/webm",
+}
+_AUDIO_MIME = {
+    "m4a": "audio/mp4",
+    "aac": "audio/aac",
+    "mp3": "audio/mpeg",
+}
+_DOC_MIME = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "zip": "application/zip",
+    "txt": "text/plain",
+}
 
 MAX_FILE_SIZE = 5 * 1024 * 1024          # mirrored by mobile MAX_UPLOAD_BYTES
 MAX_IMAGE_PIXELS = 30 * 1000 * 1000      # 30 MP decoded, animation frames counted
@@ -98,11 +138,139 @@ _MAGIC_BYTES = {
 # Stored names are a uuid4 hex plus a canonical extension, and
 # nothing else is ever served or deleted; the files written
 # before migration v43 match this shape too
-_FILENAME_RE = re.compile(r"^[0-9a-f]{32}\.(jpg|jpeg|png|gif|webp)$")
+_FILENAME_RE = re.compile(r"^[0-9a-f]{32}\.(jpg|jpeg|png|gif|webp|pdf|docx|xlsx|pptx|zip|txt|mp4|mov|m4v|webm)$")
 
 # Resolved (and created) once per process by _get_upload_dir
 _upload_dir = None
 
+
+
+
+
+
+
+
+############################################################
+# _accept_document
+############################################################
+#
+# (ext, bytes, None) for a document whose bytes match its
+# claimed extension, else (None, None, (message, code)). PDF
+# opens with %PDF; docx/xlsx/pptx/zip are ZIP containers
+# (PK\x03\x04); txt must decode as UTF-8 with no NUL byte in
+# its first 4 KB — enough to keep an executable in a .txt
+# coat from being stored. Nothing else is accepted.
+#
+# Used by:
+#   - upload_file (below) — the kind=file branch
+############################################################
+
+def _accept_document(file_obj):
+    name = file_obj.filename or ""
+    ext = name.rsplit(".", 1)[1].lower() if "." in name else ""
+    if ext not in ALLOWED_DOC_EXTENSIONS:
+        return None, None, (
+            f"File type not allowed. Use: {', '.join(ALLOWED_DOC_EXTENSIONS)}",
+            "bad_file_type",
+        )
+    file_obj.seek(0)
+    blob = file_obj.read()
+    head = blob[:4096]
+    if ext == "pdf":
+        ok = head.startswith(b"%PDF")
+    elif ext in ("docx", "xlsx", "pptx", "zip"):
+        ok = head.startswith(b"PK\x03\x04")
+    else:
+        try:
+            head.decode("utf-8")
+            ok = b"\x00" not in head
+        except UnicodeDecodeError:
+            ok = False
+    if not ok:
+        return None, None, ("File content does not match its extension", "bad_file_content")
+    return ext, blob, None
+
+
+
+
+
+
+
+############################################################
+# _accept_video
+############################################################
+#
+# (ext, bytes, None) for a video whose bytes match its claimed
+# container, else (None, None, (message, code)). mp4/mov/m4v
+# carry the ISO base-media 'ftyp' box at offset 4; webm opens
+# with the EBML magic. The bytes are stored as sent — there is
+# no transcoder in this container — so the signature is the
+# whole proof, the same bar documents clear.
+#
+# Used by:
+#   - upload_file (below) — the kind=video branch
+############################################################
+
+def _accept_video(file_obj):
+    name = file_obj.filename or ""
+    ext = name.rsplit(".", 1)[1].lower() if "." in name else ""
+    if ext not in ALLOWED_VIDEO_EXTENSIONS:
+        return None, None, (
+            f"File type not allowed. Use: {', '.join(ALLOWED_VIDEO_EXTENSIONS)}",
+            "bad_file_type",
+        )
+    file_obj.seek(0)
+    blob = file_obj.read()
+    head = blob[:16]
+    if ext == "webm":
+        ok = head.startswith(b"\x1a\x45\xdf\xa3")
+    else:
+        ok = len(head) >= 8 and head[4:8] == b"ftyp"
+    if not ok:
+        return None, None, ("File content does not match its extension", "bad_file_content")
+    return ext, blob, None
+
+
+
+
+
+
+
+############################################################
+# _accept_audio
+############################################################
+#
+# (ext, bytes, None) for a voice note whose bytes match the
+# container its name claims, else (None, None, (message,
+# code)). m4a is ISO base-media like mp4 ('ftyp' at offset
+# 4); raw aac opens with the ADTS sync (0xFFF); mp3 with an
+# ID3 tag or an MPEG frame sync. Stored as sent — the same
+# bar documents and videos clear, no transcoder here.
+#
+# Used by:
+#   - upload_file (below) — the kind=audio branch
+############################################################
+
+def _accept_audio(file_obj):
+    name = file_obj.filename or ""
+    ext = name.rsplit(".", 1)[1].lower() if "." in name else ""
+    if ext not in ALLOWED_AUDIO_EXTENSIONS:
+        return None, None, (
+            f"File type not allowed. Use: {', '.join(ALLOWED_AUDIO_EXTENSIONS)}",
+            "bad_file_type",
+        )
+    file_obj.seek(0)
+    blob = file_obj.read()
+    head = blob[:16]
+    if ext == "m4a":
+        ok = len(head) >= 8 and head[4:8] == b"ftyp"
+    elif ext == "aac":
+        ok = len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xF0) == 0xF0
+    else:
+        ok = head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0)
+    if not ok:
+        return None, None, ("File content does not match its extension", "bad_file_content")
+    return ext, blob, None
 
 
 
@@ -371,9 +539,12 @@ def upload_file():
     size = file.tell()
     file.seek(0)
 
-    if size > MAX_FILE_SIZE:
+    # The kind decides the cap: a video may be ten times a photo
+    upload_kind = request.form.get("kind") or request.args.get("kind") or "image"
+    size_cap = VIDEO_MAX_SIZE if upload_kind == "video" else MAX_FILE_SIZE
+    if size > size_cap:
         return jsonify({
-            "error": f"File too large. Max {MAX_FILE_SIZE // (1024 * 1024)} MB",
+            "error": f"File too large. Max {size_cap // (1024 * 1024)} MB",
             "code": "file_too_large",
         }), 400
 
@@ -381,29 +552,66 @@ def upload_file():
         return jsonify({"error": "Empty file", "code": "empty_file"}), 400
 
 
-    # STEP 3: the bytes decide — the signature is the first
-    # opinion, the client's filename only shapes the message
-    # when that opinion is "not an image at all"
-    # ======================================================
-    if not _validate_magic_bytes(file):
-        if not _allowed_file(file.filename):
+    # STEP 3: a DOCUMENT (kind=file) or a VIDEO (kind=video) is
+    # stored as sent once its bytes prove the type it claims; a
+    # photo goes through the signature check and the re-encode
+    # ========================================================
+    width = height = None
+    preview = None
+    if upload_kind == "file":
+        ext, blob, rejection = _accept_document(file)
+        if rejection:
+            message, code = rejection
+            return jsonify({"error": message, "code": code}), 400
+    elif upload_kind == "video":
+        ext, blob, rejection = _accept_video(file)
+        if rejection:
+            message, code = rejection
+            return jsonify({"error": message, "code": code}), 400
+    elif upload_kind == "audio":
+        ext, blob, rejection = _accept_audio(file)
+        if rejection:
+            message, code = rejection
+            return jsonify({"error": message, "code": code}), 400
+    else:
+        # The bytes decide — the signature is the first opinion,
+        # the client's filename only shapes the message when that
+        # opinion is "not an image at all"
+        if not _validate_magic_bytes(file):
+            if not _allowed_file(file.filename):
+                return jsonify({
+                    "error": f"File type not allowed. Use: {', '.join(ALLOWED_EXTENSIONS)}",
+                    "code": "bad_file_type",
+                }), 400
             return jsonify({
-                "error": f"File type not allowed. Use: {', '.join(ALLOWED_EXTENSIONS)}",
-                "code": "bad_file_type",
+                "error": "File content does not match an allowed image format",
+                "code": "bad_file_content",
             }), 400
-        return jsonify({
-            "error": "File content does not match an allowed image format",
-            "code": "bad_file_content",
-        }), 400
 
 
-    # STEP 4: re-encode — strips metadata, caps pixels,
-    # downscales and picks the canonical stored format
-    # =================================================
-    ext, blob, rejection = _reencode_image(file.read())
-    if rejection:
-        message, code = rejection
-        return jsonify({"error": message, "code": code}), 400
+        # STEP 4: re-encode — strips metadata, caps pixels,
+        # downscales and picks the canonical stored format
+        # =================================================
+        ext, blob, rejection = _reencode_image(file.read())
+        if rejection:
+            message, code = rejection
+            return jsonify({"error": message, "code": code}), 400
+        # The stored pixel size, read back off the header — the
+        # client lays a photo bubble out at its final proportions
+        # before the bytes arrive — and a ~14px micro copy as a
+        # data URI, the blurry placeholder shown while the real
+        # bytes download (bilinear upscale does the blurring)
+        try:
+            with Image.open(io.BytesIO(blob)) as stored:
+                width, height = stored.size
+                tiny = stored.convert("RGB")
+                tiny.thumbnail((14, 14))
+                tiny_buf = io.BytesIO()
+                tiny.save(tiny_buf, format="JPEG", quality=60)
+                preview = "data:image/jpeg;base64," + base64.b64encode(tiny_buf.getvalue()).decode("ascii")
+        except Exception:
+            width = height = None
+            preview = None
 
 
     # STEP 5: the per-account storage quota, counted from
@@ -461,7 +669,20 @@ def upload_file():
     finally:
         db.close()
 
-    return jsonify({"url": f"/api/uploads/{safe_name}", "filename": safe_name}), 201
+    return jsonify({
+        "url": f"/api/uploads/{safe_name}",
+        "filename": safe_name,
+        # Additive: what a document message carries as its
+        # attachment — the name the sender chose, the byte size,
+        # the canonical mime for the stored extension
+        "name": secure_filename(file.filename) or safe_name,
+        "size": len(blob),
+        "mime": _DOC_MIME.get(ext) or _VIDEO_MIME.get(ext) or _AUDIO_MIME.get(ext) or f"image/{'jpeg' if ext == 'jpg' else ext}",
+        # Photos only — None for documents, videos and audio
+        "width": width,
+        "height": height,
+        "preview": preview,
+    }), 201
 
 
 

@@ -1497,14 +1497,15 @@ def test_the_sweep_on_an_empty_directory_removes_nothing(app):
 
 @pytest.mark.contract
 def test_a_successful_upload_answers_the_shape_the_client_stores(client, actor):
-    # services/api/uploads.ts UploadResponse: { url, filename }
+    # services/api/uploads.ts UploadResponse: { url, filename,
+    # name, size, mime } — the last three additive since v57
     _, headers = actor
 
     response = _upload(client, headers, _image_bytes())
 
     assert response.status_code == 201
     body = response.get_json()
-    assert set(body) == {"url", "filename"}
+    assert set(body) == {"url", "filename", "name", "size", "mime"}
     assert body["url"] == f"/api/uploads/{body['filename']}"
     assert body["url"].startswith("/api/uploads/"), "the stored value must stay RELATIVE"
 

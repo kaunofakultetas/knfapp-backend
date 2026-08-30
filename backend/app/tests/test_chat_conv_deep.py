@@ -1430,7 +1430,7 @@ def test_a_row_with_messages_adds_exactly_the_last_message_key(client, db, actor
 
     assert set(row) == {"id", "type", "title", "avatarEmoji", "pinned", "unreadCount",
                         "lastUpdatedMs", "participants", "lastMessage"}
-    assert set(row["lastMessage"]) == {"id", "text", "imageUrl", "time", "senderId",
+    assert set(row["lastMessage"]) == {"id", "text", "imageUrl", "kind", "time", "senderId",
                                        "senderName", "deleted"}
 
 

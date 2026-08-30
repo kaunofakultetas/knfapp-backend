@@ -985,7 +985,7 @@ def test_a_message_that_strips_to_nothing_needs_a_photo(client, room, no_push, b
                            json={"text": blank}, headers=headers)
 
     assert response.status_code == 400
-    assert response.get_json() == {"error": "Message must have text or image"}
+    assert response.get_json() == {"error": "Message must have text, an image or an attachment"}
 
 
 def test_a_zero_width_space_is_text_enough_to_send(client, db, room, no_push):
@@ -1719,6 +1719,9 @@ def test_the_replay_lookup_shapes_the_whole_send_response(chat_routes, db, room)
         "isOwn": True,
         "status": "sent",
         "readBy": [user["id"]],
+        "kind": "text",
+        "editedAt": None,
+        "attachment": None,
     }
 
 
