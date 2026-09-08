@@ -80,7 +80,7 @@ from app.api import (
     parse_pagination,
 )
 from app.auth.routes import get_current_user, get_json_object, rate_limit, require_auth
-from app.database import get_db, utc_now_iso
+from app.database import drop_activity, get_db, record_activity, utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -992,6 +992,10 @@ def send_friend_request():
                     "((from_user_id = ? AND to_user_id = ?) OR (from_user_id = ? AND to_user_id = ?))",
                     (my_id, target_id, target_id, my_id),
                 )
+                # The original requester learns their ask landed;
+                # my own pending row about THEIR request is acted on
+                record_activity(db, target_id, "connect_accept", my_id)
+                drop_activity(db, my_id, "connect_request", target_id, pending["id"])
                 db.commit()
                 return jsonify({"status": "accepted", "message": "Friend request auto-accepted (they already requested you)"}), 200
             return jsonify({"error": "Friend request already pending"}), 409
@@ -1038,6 +1042,7 @@ def send_friend_request():
                 " VALUES (?, ?, ?, ?, ?)",
                 (req_id, my_id, target_id, now, now),
             )
+            record_activity(db, target_id, "connect_request", my_id, req_id)
             db.commit()
         except sqlite3.IntegrityError:
             db.rollback()
@@ -1247,6 +1252,10 @@ def accept_friend_request(request_id):
             "((from_user_id = ? AND to_user_id = ?) OR (from_user_id = ? AND to_user_id = ?))",
             (fr["from_user_id"], fr["to_user_id"], fr["to_user_id"], fr["from_user_id"]),
         )
+        # The requester learns the ask landed; the accepted
+        # request stops sitting on my activity list
+        record_activity(db, fr["from_user_id"], "connect_accept", request.user["id"])
+        drop_activity(db, fr["to_user_id"], "connect_request", fr["from_user_id"], request_id)
         db.commit()
 
         return jsonify({"status": "accepted"})
@@ -1312,6 +1321,9 @@ def reject_friend_request(request_id):
                 "UPDATE friend_requests SET status = 'rejected', updated_at = ? WHERE id = ?",
                 (utc_now_iso(), request_id),
             )
+        # Withdrawn or declined, the ask leaves the recipient's
+        # activity list either way
+        drop_activity(db, fr["to_user_id"], "connect_request", fr["from_user_id"], request_id)
         db.commit()
 
         return jsonify({"status": "rejected"})
@@ -2161,3 +2173,163 @@ def create_report():
         return jsonify({"status": "submitted", "id": report_id}), 201
     finally:
         db.close()
+
+
+
+
+
+
+
+############################################################
+# list_activity
+############################################################
+#
+# GET /api/social/activity
+#
+# The caller's in-app notification list, newest first, keyset-
+# paged: `cursor` is the "<created_at>|<id>" of the last row of
+# the previous page, opaque to clients (the mobile adapter
+# passes it back verbatim). Each row carries the ACTOR as the
+# mobile engine's SocialUser shape wants it; rows whose actor
+# account was deleted are gone already (ON DELETE CASCADE), and
+# deactivated actors still show — their gesture happened.
+#
+# Used by:
+#   - @knf/socialengine KNF adapter fetchNotifications —
+#     useNotifications / the activity screen (when it lands)
+############################################################
+
+_ACTIVITY_PER_PAGE = 30
+
+
+@social_bp.route("/activity", methods=["GET"])
+@require_auth
+def list_activity():
+    # STEP 1: the keyset cursor — malformed input reads as the
+    # first page rather than erroring (the cursor is ours)
+    # ========================================================
+    cursor = request.args.get("cursor", "")
+    before, before_id = None, None
+    if cursor and "|" in cursor:
+        before, before_id = cursor.split("|", 1)
+
+    db = get_db()
+    try:
+
+
+        # STEP 2: one page + one probe row for hasMore
+        # ============================================
+        params = [request.user["id"]]
+        keyset = ""
+        if before and before_id:
+            keyset = " AND (a.created_at < ? OR (a.created_at = ? AND a.id < ?))"
+            params.extend([before, before, before_id])
+        params.append(_ACTIVITY_PER_PAGE + 1)
+
+        rows = db.execute(
+            f"""SELECT a.id, a.kind, a.subject_id, a.subject_preview, a.created_at, a.read,
+                       u.id AS actor_id, u.display_name, u.avatar_url
+                FROM activity a
+                JOIN users u ON u.id = a.actor_id
+                WHERE a.user_id = ?{keyset}
+                ORDER BY a.created_at DESC, a.id DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+
+        has_more = len(rows) > _ACTIVITY_PER_PAGE
+        page = rows[:_ACTIVITY_PER_PAGE]
+
+        notifications = [
+            {
+                "id": r["id"],
+                "kind": r["kind"],
+                "actor": {
+                    "id": r["actor_id"],
+                    "displayName": r["display_name"],
+                    "avatarUrl": r["avatar_url"],
+                },
+                "createdAt": r["created_at"],
+                "read": bool(r["read"]),
+                "subjectId": r["subject_id"],
+                "subjectPreview": r["subject_preview"],
+            }
+            for r in page
+        ]
+        next_cursor = f'{page[-1]["created_at"]}|{page[-1]["id"]}' if page and has_more else None
+        return jsonify({
+            "notifications": notifications,
+            "hasMore": has_more,
+            **({"cursor": next_cursor} if next_cursor else {}),
+        })
+    finally:
+        db.close()
+
+
+
+
+
+
+
+############################################################
+# mark_activity_read
+############################################################
+#
+# POST /api/social/activity/read
+#
+# Flips every unread row of the caller — the mobile engine
+# calls it when the activity screen opens (optimistic on its
+# side, so the wire answer is just the confirmation).
+#
+# Used by:
+#   - @knf/socialengine KNF adapter markNotificationsRead
+############################################################
+
+@social_bp.route("/activity/read", methods=["POST"])
+@require_auth
+def mark_activity_read():
+    db = get_db()
+    try:
+        db.execute(
+            "UPDATE activity SET read = 1 WHERE user_id = ? AND read = 0",
+            (request.user["id"],),
+        )
+        db.commit()
+        return jsonify({"status": "ok"})
+    finally:
+        db.close()
+
+
+
+
+
+
+
+############################################################
+# activity_unread_count
+############################################################
+#
+# GET /api/social/activity/unread
+#
+# The cheap probe behind the badge — a COUNT the mobile engine
+# polls on an interval, kept apart from the list so the badge
+# never pays for a page.
+#
+# Used by:
+#   - @knf/socialengine KNF adapter fetchUnreadCount —
+#     useUnreadBadge
+############################################################
+
+@social_bp.route("/activity/unread", methods=["GET"])
+@require_auth
+def activity_unread_count():
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT COUNT(*) AS n FROM activity WHERE user_id = ? AND read = 0",
+            (request.user["id"],),
+        ).fetchone()
+        return jsonify({"count": row["n"]})
+    finally:
+        db.close()
+

@@ -61,6 +61,8 @@ tags:
     description: Faculty information (contacts, links, hours, FAQ)
   - name: notifications
     description: Expo push tokens & per-channel switches
+  - name: wayfind
+    description: The indoor map — published building graphs, admin drafts and op log, panoramas and plans
 
 # ── Socket.IO ─────────────────────────────────────────────────────────────
 # The realtime half of chat. OpenAPI cannot express it, so it lives here as a
@@ -1503,7 +1505,10 @@ paths:
                   description: Stripped server-side, at most 5000 characters; at least one of text/imageUrl is required
                 imageUrl:
                   type: string
-                  description: Must be the relative /api/uploads/... path the upload route returned (or its same-origin absolute form)
+                  description: >
+                    Must be a relative /api/uploads/... path the upload route
+                    returned, or a shared-library /api/memes/file/... path
+                    (same-origin absolute forms of either also pass)
                 replyToId:
                   type: string
                   description: Id of a message in the same conversation to quote (400 if it is not, blank string included)
@@ -1780,6 +1785,112 @@ paths:
         "404":
           description: Message not found in this conversation
 
+  /memes:
+    get:
+      tags: [memes]
+      summary: >
+        The shared meme library, newest first (60 a page). q filters
+        title/tags on this origin: diacritic-folded on both sides
+        (ačiū finds ACIU and back) and word-split — every word must
+        match somewhere.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - name: offset
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: The page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hasMore: {type: boolean}
+                  memes:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                        url: {type: string, description: The relative /api/memes/file/... path a message's imageUrl may carry}
+                        title: {type: string}
+                        tags: {type: string}
+                        width: {type: integer, nullable: true}
+                        height: {type: integer, nullable: true}
+                        preview: {type: string, nullable: true, description: The ~14px micro copy (data URI)}
+                        animated: {type: boolean, description: True for a GIF kept byte-identical; false for a re-encoded static meme}
+                        addedBy: {type: string, nullable: true}
+                        createdAt: {type: string}
+    post:
+      tags: [memes]
+      summary: >
+        Push a meme into the shared library (any signed-in user). A GIF must
+        carry the GIF signature and stays byte-identical under 8 MB (the
+        animation survives); a static image (jpg/png/webp, 5 MB) goes through
+        the uploads route's re-encode. Title defaults to the filename stem.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                title:
+                  type: string
+                tags:
+                  type: string
+      responses:
+        "201":
+          description: The new library row (see GET /memes items)
+        "400":
+          description: no_file / empty_file / file_too_large / bad_file_type / bad_file_content
+  /memes/{memeId}:
+    delete:
+      tags: [memes]
+      summary: Remove a library meme (the pusher or an admin) — old messages referencing it lose their picture, deliberately
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: memeId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Removed
+        "403":
+          description: Only the pusher or an admin
+        "404":
+          description: Not found
+  /memes/file/{name}:
+    get:
+      tags: [memes]
+      summary: The meme bytes (public, cached a week — bubbles render without a token)
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The file
+        "404":
+          description: Not found
   /chat/conversations/{convId}/messages/{msgId}/pin:
     put:
       tags: [chat]
@@ -2676,6 +2787,86 @@ paths:
         "200":
           description: Unblocked
 
+  /social/activity:
+    get:
+      tags: [social]
+      summary: The caller's in-app notification list
+      description: >
+        Newest first, keyset-paged. `cursor` is the `<createdAt>|<id>` of the
+        previous page's last row, opaque to clients — echo it back verbatim.
+        One row per (kind, actor, subject): a repeated gesture refreshes its
+        one row to the top instead of piling duplicates, and an unlike or an
+        answered friend request takes its row away.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: One page, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notifications:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        kind:
+                          type: string
+                          enum: [like, comment, connect_request, connect_accept]
+                        actor:
+                          type: object
+                          properties:
+                            id: { type: string }
+                            displayName: { type: string }
+                            avatarUrl: { type: string, nullable: true }
+                        createdAt: { type: string, format: date-time }
+                        read: { type: boolean }
+                        subjectId: { type: string, nullable: true }
+                        subjectPreview: { type: string, nullable: true }
+                  hasMore: { type: boolean }
+                  cursor: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /social/activity/read:
+    post:
+      tags: [social]
+      summary: Mark every activity row read
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Flipped
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /social/activity/unread:
+    get:
+      tags: [social]
+      summary: The unread badge probe
+      description: A bare COUNT the mobile badge polls — kept apart from the list so the badge never pays for a page.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /social/reports:
     post:
       tags: [social]
@@ -3786,6 +3977,617 @@ paths:
         "429":
           description: Too many updates for this user (code rate_limited; 30 per 5 minutes)
 
+  /wayfind/buildings:
+    get:
+      tags: [wayfind]
+      summary: >
+        Every building with what a student can fetch: the published
+        revision and its ETag (null until the first publish). Public.
+      responses:
+        "200":
+          description: The buildings
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  buildings:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                        name: {type: string}
+                        northDeg: {type: number, nullable: true}
+                        publishedRevision: {type: integer, nullable: true}
+                        draftRevision: {type: integer}
+                        etag: {type: string, nullable: true}
+                        publishedAt: {type: string, nullable: true}
+    post:
+      tags: [wayfind]
+      summary: Create an empty building draft (admin). The id is the slug every URL carries.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, name]
+              properties:
+                id: {type: string, description: "Lowercase slug: a-z, 0-9, -"}
+                name: {type: string}
+                northDeg: {type: number, nullable: true, description: Compass bearing of the plans' "up"}
+                entranceNodeId: {type: string, nullable: true}
+      responses:
+        "201":
+          description: Created
+        "400":
+          description: bad_id / bad_name / bad_north
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "409":
+          description: exists
+
+  /wayfind/buildings/{buildingId}/graph:
+    get:
+      tags: [wayfind]
+      summary: >
+        The published BuildingGraph document (the engine package's shape,
+        stamped with revision and publishedAt), byte for byte as hashed at
+        publish time, under its ETag. If-None-Match with that ETag answers
+        304 and no body; Cache-Control is no-cache. Public. 404 until the
+        building has been published once.
+      parameters:
+        - name: buildingId
+          in: path
+          required: true
+          schema: {type: string}
+        - name: If-None-Match
+          in: header
+          schema: {type: string}
+      responses:
+        "200":
+          description: The document
+          headers:
+            ETag: {schema: {type: string}}
+          content:
+            application/json:
+              schema: {type: object}
+        "304":
+          description: The client already holds this revision
+        "404":
+          description: not_published
+
+  /wayfind/buildings/{buildingId}/draft:
+    get:
+      tags: [wayfind]
+      summary: >
+        The draft (admin / curator). Whole: the compiled document, its
+        revision and the validator's issues. With since=<revision>: only
+        the entity rows changed after it, tombstones included, so a phone
+        re-syncs a long edit session in one small answer.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildingId
+          in: path
+          required: true
+          schema: {type: string}
+        - name: since
+          in: query
+          schema: {type: integer}
+      responses:
+        "200":
+          description: The draft or the delta
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revision: {type: integer}
+                  publishedRevision: {type: integer, nullable: true}
+                  building: {type: object}
+                  document: {type: object, description: Whole form only}
+                  issues: {type: array, items: {$ref: "#/components/schemas/WayfindIssue"}, description: Whole form only}
+                  revisions: {type: object, additionalProperties: {type: integer}, description: "Whole form only: 'kind:id' → the revision the entity last changed in"}
+                  since: {type: integer, description: Delta form only}
+                  entities:
+                    type: array
+                    description: Delta form only
+                    items:
+                      type: object
+                      properties:
+                        kind: {type: string, enum: [level, node, edge, room]}
+                        id: {type: string}
+                        data: {type: object, nullable: true, description: null for a tombstone}
+                        revision: {type: integer}
+                        deleted: {type: boolean}
+                        updatedAt: {type: string}
+                        updatedBy: {type: string, nullable: true}
+        "404":
+          description: not_found
+
+  /wayfind/buildings/{buildingId}/ops:
+    post:
+      tags: [wayfind]
+      summary: >
+        Apply an op batch to the draft (admin / curator): one transaction,
+        one revision bump, ONE answer per op — applied, rejected (reason;
+        on a conflict also the entity as it stands) or duplicate (op id
+        seen before in THIS building; nothing re-applied, and `of`,
+        `reason` and `revision` say what the logged op did). A conflict
+        is an entity whose revision is past the op's baseRevision; an op
+        without baseRevision overwrites. Deletes are tombstones. Batches
+        serialise on the building row's write lock, so overlapping
+        batches cannot both pass the conflict check on one entity. At
+        most 500 ops per batch.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildingId
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ops]
+              properties:
+                ops:
+                  type: array
+                  items: {$ref: "#/components/schemas/WayfindOp"}
+      responses:
+        "200":
+          description: The batch's answers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revision: {type: integer, description: The draft revision after the batch}
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string, nullable: true}
+                        status: {type: string, enum: [applied, rejected, duplicate]}
+                        of: {type: string, enum: [applied, rejected], description: On a duplicate — the logged op's status}
+                        reason: {type: string, nullable: true}
+                        revision: {type: integer, nullable: true, description: On a duplicate of an applied op — the revision it applied at; null for one of a rejected op}
+                        current: {type: object, nullable: true, description: On a conflict — data, revision, deleted}
+        "400":
+          description: bad_batch / batch_too_large
+        "404":
+          description: not_found
+
+  /wayfind/buildings/{buildingId}/publish:
+    post:
+      tags: [wayfind]
+      summary: >
+        Validate and publish the draft (admin). Refuses with 422 and the
+        issue list on any error (the engine's own codes: duplicate_id,
+        unknown_level, dangling_edge, unknown_kind, bad_length,
+        cross_level_hallway, connector_without_length, room_without_node,
+        missing_entrance); 409 when the draft has not changed since the
+        last publish.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildingId
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: {type: string}
+      responses:
+        "200":
+          description: Published
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revision: {type: integer}
+                  etag: {type: string}
+                  publishedAt: {type: string}
+                  bytes: {type: integer}
+        "409":
+          description: unchanged
+        "422":
+          description: invalid — the issues
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: {type: string}
+                  code: {type: string}
+                  issues: {type: array, items: {$ref: "#/components/schemas/WayfindIssue"}}
+
+  /wayfind/buildings/{buildingId}/versions:
+    get:
+      tags: [wayfind]
+      summary: The publish history, newest first (admin / curator).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildingId
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: The versions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  publishedRevision: {type: integer, nullable: true}
+                  versions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        revision: {type: integer}
+                        etag: {type: string}
+                        note: {type: string, nullable: true}
+                        publishedBy: {type: string, nullable: true}
+                        publishedAt: {type: string}
+                        bytes: {type: integer}
+
+  /wayfind/buildings/{buildingId}/panoramas:
+    post:
+      tags: [wayfind]
+      summary: >
+        Store a panorama (admin / curator). Verified, turned upright,
+        capped at 8192 px on the long edge, re-encoded as a metadata-free
+        progressive JPEG; the sha256 of THOSE bytes is the id, so the same
+        picture twice answers the same id. Coverage defaults to a full turn
+        with the vertical band the aspect gives. Body cap 6 MB (app-wide).
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildingId
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+                nodeId: {type: string}
+                hfovDeg: {type: number}
+                vfovDeg: {type: number}
+                headingRawDeg: {type: number, description: The sensor reading at capture, kept as a hint}
+                headingSource: {type: string, enum: [manual, aligned, compass, path, auto]}
+      responses:
+        "201":
+          description: Stored (or already there)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, description: sha256 of the stored bytes}
+                  url: {type: string, description: The relative /api/wayfind/panoramas/<id>.jpg a node's pano field stores}
+                  width: {type: integer}
+                  height: {type: integer}
+                  bytes: {type: integer}
+                  hfovDeg: {type: number}
+                  vfovDeg: {type: number}
+        "400":
+          description: no_file / bad_image / bad_geometry / bad_node
+        "413":
+          description: too_large — the decoded picture would pass 60 megapixels, the hard decompression-bomb stop
+
+  /wayfind/panoramas/{name}:
+    get:
+      tags: [wayfind]
+      summary: A stored panorama by its hashed name — public, immutable (a year of caching).
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: {type: string, description: "<sha256>.jpg"}
+      responses:
+        "200":
+          description: The JPEG
+          content:
+            image/jpeg:
+              schema: {type: string, format: binary}
+        "404":
+          description: not_found
+
+  /wayfind/buildings/{buildingId}/plans:
+    post:
+      tags: [wayfind]
+      summary: >
+        Store a level's SVG plan (admin / curator, 2 MB). Scripts,
+        event-handler attributes and script hrefs are cut; the sha256 of
+        the sanitised text names the file.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildingId
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: {type: string, format: binary}
+                levelId: {type: string}
+      responses:
+        "201":
+          description: Stored (or already there)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  url: {type: string, description: The relative /api/wayfind/plans/<id>.svg a level's plan field stores}
+                  bytes: {type: integer}
+        "400":
+          description: no_file / bad_plan / bad_level
+        "413":
+          description: too_large
+
+  /wayfind/plans/{name}:
+    get:
+      tags: [wayfind]
+      summary: A stored plan by its hashed name — public, immutable, served with a no-script policy.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: {type: string, description: "<sha256>.svg"}
+      responses:
+        "200":
+          description: The SVG
+          content:
+            image/svg+xml:
+              schema: {type: string}
+        "404":
+          description: not_found
+
+  /wayfind/buildings/{buildingId}/captures:
+    post:
+      tags: [wayfind]
+      summary: >
+        Open a guided capture session (admin / curator). The id is a
+        CLIENT uuid, scoped per building like op ids — a replayed create
+        answers 200 with the row as it stands, and the same id works on a
+        second building. targets is the phone's aim plan (planTargets),
+        stored verbatim.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: buildingId
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, mode, targets]
+              properties:
+                id: {type: string, pattern: "^[A-Za-z0-9-]{8,64}$"}
+                nodeId: {type: string}
+                mode: {type: string, enum: [full, walls]}
+                frameHfovDeg: {type: number, default: 60}
+                targets:
+                  type: array
+                  items:
+                    type: object
+                    required: [id, yawDeg, pitchDeg]
+                    properties:
+                      id: {type: string, description: "'r<pitch>-<n>', e.g. r0-0, r-70-2"}
+                      yawDeg: {type: number}
+                      pitchDeg: {type: number}
+      responses:
+        "201":
+          description: Opened
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, description: The bare client id}
+                  status: {type: string, enum: [uploading]}
+        "200":
+          description: Replayed create — the session as it stands
+        "400":
+          description: bad_id / bad_mode / bad_hfov / bad_node / bad_targets
+        "404":
+          description: not_found
+
+  /wayfind/captures/{captureId}/frames/{targetId}:
+    put:
+      tags: [wayfind]
+      summary: >
+        Store one captured frame with the tracker's pose at the shutter
+        (admin / curator). Idempotent per target — a re-upload replaces.
+        The picture is verified, EXIF-uprighted, refused past 60
+        megapixels (413), capped at 2048 px on the long edge and
+        re-encoded JPEG q85. 409 once the capture left 'uploading'. buildingId disambiguates the (uuid-unlikely) case of
+        one client id in two buildings.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: captureId
+          in: path
+          required: true
+          schema: {type: string}
+        - name: targetId
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, yawDeg, pitchDeg, rollDeg]
+              properties:
+                file: {type: string, format: binary}
+                yawDeg: {type: number, description: "[0,360) clockwise seen from above; zero is wherever calibration ended"}
+                pitchDeg: {type: number, description: "[-90,90], positive up"}
+                rollDeg: {type: number, description: "(-180,180], positive = tilted clockwise from upright portrait"}
+                buildingId: {type: string}
+      responses:
+        "200":
+          description: Stored (or replaced)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stored: {type: integer, description: Frames stored so far}
+                  expected: {type: integer, description: The plan's target count}
+        "400":
+          description: bad_pose / no_file / bad_image
+        "404":
+          description: not_found / unknown_target
+        "409":
+          description: not_uploading / ambiguous
+        "413":
+          description: too_large — the decoded frame would pass 60 megapixels, the hard decompression-bomb stop
+
+  /wayfind/captures/{captureId}/finish:
+    post:
+      tags: [wayfind]
+      summary: >
+        Close the intake and queue the stitch (admin / curator). The
+        optional body's centreYawDeg — the yaw of the session's
+        chronologically FIRST ACCEPTED frame (the manifest's firstYawDeg)
+        — becomes the stitched panorama's centre column; without it the
+        stitcher falls back to the frame with the earliest upload time.
+        409 unless the capture is still 'uploading'; 422 when fewer than
+        8 frames arrived. The background worker picks the capture up
+        within seconds.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: captureId
+          in: path
+          required: true
+          schema: {type: string}
+        - name: buildingId
+          in: query
+          required: false
+          schema: {type: string}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                centreYawDeg:
+                  type: number
+                  description: >
+                    Yaw of the first ACCEPTED frame, degrees clockwise seen
+                    from above. Parked in the capture's report until the
+                    stitch reads it.
+      responses:
+        "200":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, enum: [queued]}
+        "400":
+          description: bad_centre (centreYawDeg is not a finite number)
+        "404":
+          description: not_found
+        "409":
+          description: not_uploading / ambiguous
+        "422":
+          description: too_few_frames (carries frames + required)
+
+  /wayfind/captures/{captureId}:
+    get:
+      tags: [wayfind]
+      summary: >
+        The capture as it stands (admin / curator) — polled while the
+        stitch runs. On 'done' the pano block carries what the alignment
+        tool needs; centreYawDeg (the canvas centre column) is the finish
+        body's centreYawDeg when the client sent one, else the
+        earliest-uploaded frame's yaw. On 'failed' the report carries the
+        reason.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: captureId
+          in: path
+          required: true
+          schema: {type: string}
+        - name: buildingId
+          in: query
+          required: false
+          schema: {type: string}
+      responses:
+        "200":
+          description: The capture
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string, description: The bare client id}
+                  status: {type: string, enum: [uploading, queued, stitching, done, failed]}
+                  frames: {type: integer}
+                  expected: {type: integer}
+                  progressPct: {type: integer}
+                  report:
+                    type: object
+                    description: framesUsed, framesExpected, coverage {hfovDeg, vfovDeg, vOffsetDeg, centreYawDeg, coveredPct}, timingMs — or {reason} on failure; between finish and done it may carry just the finish body's parked {centreYawDeg}
+                  pano:
+                    type: object
+                    properties:
+                      id: {type: string}
+                      url: {type: string, description: The relative /api/wayfind/panoramas/<id>.jpg a node's pano field stores}
+                      width: {type: integer}
+                      height: {type: integer}
+                      hfovDeg: {type: number}
+                      vfovDeg: {type: number}
+                      centreYawDeg: {type: number}
+        "404":
+          description: not_found
+        "409":
+          description: ambiguous
+
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3793,6 +4595,32 @@ components:
       scheme: bearer
 
   schemas:
+    WayfindIssue:
+      type: object
+      description: One validator finding, in the engine package's own shape
+      properties:
+        severity: {type: string, enum: [error, warning]}
+        code: {type: string}
+        ref: {type: string, description: The offending id (node, edge "a-b", room, level)}
+        message: {type: string}
+    WayfindOp:
+      type: object
+      description: >
+        One draft edit. type upsert / delete address an entity (kind +
+        entityId; upsert carries the entity's data in the engine's shape);
+        type building patches name / northDeg / entranceNodeId. The id is
+        client-generated and makes the op idempotent WITHIN ITS BUILDING —
+        the server logs it under "<building>:<id>", so a fixed id (a seed)
+        can bootstrap a second building. Unknown fields (the client's
+        `fresh` marker) are ignored and logged with the op.
+      required: [id, type]
+      properties:
+        id: {type: string}
+        type: {type: string, enum: [upsert, delete, building]}
+        kind: {type: string, enum: [level, node, edge, room]}
+        entityId: {type: string}
+        data: {type: object}
+        baseRevision: {type: integer, description: The revision the phone's copy came from; an entity changed since is a conflict}
     Error:
       type: object
       description: >

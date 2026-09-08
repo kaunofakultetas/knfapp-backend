@@ -61,7 +61,7 @@ from flask import Blueprint, jsonify, make_response, request
 
 from app.api import MAX_CONTENT_LENGTH, MAX_TITLE_LENGTH, SUMMARY_LENGTH, parse_pagination
 from app.auth.routes import get_current_user, get_json_object, rate_limit, require_auth
-from app.database import get_db, utc_now_iso
+from app.database import drop_activity, get_db, record_activity, utc_now_iso
 
 # Hard caps behind the 400s in add_comment / create_poll.
 # The post-body pair (MAX_TITLE_LENGTH / MAX_CONTENT_LENGTH)
@@ -1128,6 +1128,23 @@ def toggle_like(post_id):
             (post_id, post_id),
         )
 
+        # The author's activity row rides the same transaction:
+        # a like lands one (record_activity drops self-likes and
+        # authorless scraped rows itself), an unlike takes it
+        # back — the list never advertises a gesture that was
+        # withdrawn
+        author = db.execute(
+            "SELECT author_id, title FROM news_posts WHERE id = ?", (post_id,)
+        ).fetchone()
+        if author:
+            if liked:
+                record_activity(
+                    db, author["author_id"], "like", request.user["id"],
+                    post_id, (author["title"] or "")[:80] or None,
+                )
+            else:
+                drop_activity(db, author["author_id"], "like", request.user["id"], post_id)
+
         db.commit()
         # Re-read after the commit — the reply carries the real
         # counter, not a likes±1 computed locally. The row can be
@@ -1360,6 +1377,16 @@ def add_comment(post_id):
         db.execute(
             "UPDATE news_posts SET comments_count = (SELECT COUNT(*) FROM news_comments WHERE post_id = ?) WHERE id = ?",
             (post_id, post_id),
+        )
+        # The author hears about the comment (self-comments and
+        # authorless scraped posts are dropped by the helper).
+        # The POST id keys the row — that is what a tap on the
+        # activity row opens — so several comments from one
+        # person on one post refresh a single row to the top
+        # carrying the newest excerpt
+        record_activity(
+            db, post["author_id"] if "author_id" in post.keys() else None,
+            "comment", request.user["id"], post_id, comment_text[:80],
         )
         db.commit()
 

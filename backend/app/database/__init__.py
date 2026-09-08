@@ -68,6 +68,7 @@
 #    v55 composite news_posts(author_id, source,
 #        published_at DESC) index for the profile lists
 #    v56 user_blocks + reports tables, users.chat_push_preview
+#    v63 activity table (the in-app notification list)
 #        (block/report abuse handling, content-free pushes)
 #    v57 messages.kind / edited_at / attachment_* (system rows,
 #        edits, document attachments)
@@ -255,7 +256,9 @@ def init_db(db_path):
 #     notifications/routes.py, notifications/push.py,
 #     scraper/routes.py, scraper/knf_scraper.py,
 #     scraper/vu_scraper.py, scraper/schedule_scraper.py,
-#     scraper/info_scraper.py — every DB access in the app
+#     scraper/info_scraper.py, wayfind/routes.py,
+#     wayfind/captures.py, wayfind/stitch.py — every DB
+#     access in the app
 ############################################################
 
 def get_db():
@@ -488,6 +491,10 @@ def _run_migrations(conn):
         59: ("Add messages.link_preview (the unfurled card of the first URL)", _migration_v59_link_preview),
         60: ("Add messages.gallery (several photos in one message)", _migration_v60_gallery),
         61: ("Add message pins, forwarding marks and disappearing messages", _migration_v61_pins_forward_ttl),
+        62: ("Add the shared meme library table", _migration_v62_memes),
+        63: ("Add activity table (the in-app notification list)", _migration_v63_activity),
+        64: ("Add the wayfind tables (building graph drafts, versions, panoramas, plans)", _migration_v64_wayfind),
+        65: ("Add the wayfind capture tables (guided panorama capture + stitch queue)", _migration_v65_wayfind_captures),
     }
 
 
@@ -993,6 +1000,22 @@ CREATE TABLE IF NOT EXISTS message_reactions (
     PRIMARY KEY (message_id, user_id)
 );
 
+CREATE TABLE IF NOT EXISTS memes (
+    id TEXT PRIMARY KEY,
+    filename TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    tags TEXT,
+    added_by TEXT REFERENCES users(id),
+    byte_size INTEGER NOT NULL DEFAULT 0,
+    width INTEGER,
+    height INTEGER,
+    preview TEXT,
+    search TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_memes_created ON memes(created_at DESC);
+
 CREATE TABLE IF NOT EXISTS message_reads (
     message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1042,6 +1065,20 @@ CREATE TABLE IF NOT EXISTS faculty_info (
     UNIQUE(lang, section)
 );
 
+CREATE TABLE IF NOT EXISTS activity (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK(kind IN ('like', 'comment', 'connect_request', 'connect_accept')),
+    actor_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    subject_id TEXT,
+    subject_preview TEXT,
+    created_at TEXT NOT NULL,
+    read INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(user_id, kind, actor_id, subject_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_user ON activity(user_id, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_unread ON activity(user_id, read);
 CREATE INDEX IF NOT EXISTS idx_user_blocks_blocked ON user_blocks(blocked_id);
 CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_news_posts_published ON news_posts(published_at DESC);
@@ -2740,3 +2777,342 @@ def _migration_v61_pins_forward_ttl(conn):
                 raise
             logger.warning("  '%s' column already exists on %s, skipping", column, table)
     conn.commit()
+
+
+
+
+
+
+
+# _migration_v62_memes
+# ====================
+#
+# Migration v62: the shared meme library. One table naming
+# every file in MEMES_DIR (a separate tree from the per-user
+# uploads): title/tags feed the composer tab's on-origin
+# search, preview is the ~14px micro copy the grid blurs,
+# added_by gates the non-admin delete. GIFs are stored AS SENT
+# (a re-encode would flatten the animation); static images are
+# re-encoded like any upload. A pre-rebuild 'gifs' table (the
+# seeding scripts created one before the rename) donates its
+# rows and leaves.
+
+def _migration_v62_memes(conn):
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS memes (
+            id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            tags TEXT,
+            added_by TEXT REFERENCES users(id),
+            byte_size INTEGER NOT NULL DEFAULT 0,
+            width INTEGER,
+            height INTEGER,
+            preview TEXT,
+            search TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_memes_created ON memes(created_at DESC)")
+    try:
+        conn.execute("ALTER TABLE memes ADD COLUMN search TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+    legacy = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'gifs'").fetchone()
+    if legacy:
+        conn.execute(
+            """INSERT OR IGNORE INTO memes (id, filename, title, tags, added_by, byte_size, width, height, preview, created_at)
+               SELECT id, filename, title, tags, added_by, byte_size, width, height, preview, created_at FROM gifs"""
+        )
+        conn.execute("DROP TABLE gifs")
+        logger.info("  Migrated the pre-rename 'gifs' rows into 'memes'")
+    # Backfill the folded haystack for every row that lacks one
+    # (SQLite lower() is ASCII-only, hence the Python fold)
+    fold = str.maketrans("ąčęėįšųūžĄČĘĖĮŠŲŪŽ", "aceeisuuzaceeisuuz")
+    for row in conn.execute("SELECT id, title, COALESCE(tags, '') AS tags FROM memes WHERE search IS NULL").fetchall():
+        haystack = f"{row['title']} {row['tags']}".translate(fold).lower()
+        conn.execute("UPDATE memes SET search = ? WHERE id = ?", (haystack, row["id"]))
+    logger.info("  Created 'memes' table")
+    conn.commit()
+
+
+
+
+
+
+
+############################################################
+# _migration_v63_activity
+############################################################
+#
+# The in-app notification list: one row per (recipient, kind,
+# actor, subject) — the UNIQUE key is what lets a repeat like
+# refresh ONE row to the top instead of spamming a new one.
+# created_at is stamped by the writer (T-form UTC like every
+# other stamp this API serves), never by a column default.
+#
+# Used by:
+#   - _run_migrations (registry v63)
+############################################################
+
+def _migration_v63_activity(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS activity (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('like', 'comment', 'connect_request', 'connect_accept')),
+            actor_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            subject_id TEXT,
+            subject_preview TEXT,
+            created_at TEXT NOT NULL,
+            read INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(user_id, kind, actor_id, subject_id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activity_user ON activity(user_id, created_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activity_unread ON activity(user_id, read)"
+    )
+
+
+
+
+
+
+
+############################################################
+# record_activity
+############################################################
+#
+# One activity row for user_id: "actor_id did kind to
+# subject_id". INSERT OR REPLACE rides the table's UNIQUE
+# (user, kind, actor, subject) key, so a repeat of the same
+# gesture refreshes the ONE existing row — new stamp, unread
+# again, back to the top — instead of piling duplicates. Self-
+# notifications are dropped here so no caller has to remember;
+# a NULL user (a scraped post with no author) is dropped the
+# same way. Never commits — it rides the caller's transaction.
+#
+# Used by:
+#   - app/news/routes.py — toggle_like, create_comment
+#   - app/social/routes.py — send/accept friend request
+############################################################
+
+def record_activity(conn, user_id, kind, actor_id, subject_id=None, subject_preview=None):
+    if not user_id or user_id == actor_id:
+        return
+    conn.execute(
+        """INSERT OR REPLACE INTO activity
+           (id, user_id, kind, actor_id, subject_id, subject_preview, created_at, read)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
+        (str(uuid.uuid4()), user_id, kind, actor_id, subject_id, subject_preview, utc_now_iso()),
+    )
+
+
+
+
+
+
+
+############################################################
+# drop_activity
+############################################################
+#
+# The undo: an unlike takes its row back, an answered friend
+# request takes the request row off the recipient's list. Never
+# commits — it rides the caller's transaction.
+#
+# Used by:
+#   - app/news/routes.py — toggle_like (the unlike half)
+#   - app/social/routes.py — accept/reject friend request
+############################################################
+
+def drop_activity(conn, user_id, kind, actor_id, subject_id=None):
+    if not user_id:
+        return
+    conn.execute(
+        "DELETE FROM activity WHERE user_id = ? AND kind = ? AND actor_id = ? AND subject_id IS ?",
+        (user_id, kind, actor_id, subject_id),
+    )
+
+
+
+
+
+
+
+
+############################################################
+# _migration_v64_wayfind
+############################################################
+#
+# Migration v64: the indoor map. One building row per graph
+# (its draft and published revision counters), one entity
+# row per level / node / edge / room of the DRAFT (the JSON
+# the engine reads, plus the revision it last changed in and
+# a tombstone flag so deletes travel in deltas), the op log
+# admins' edits arrive through (client ids — a replayed batch
+# applies once), the published snapshots (one document per
+# revision, hashed for the ETag) and the content-addressed
+# panoramas and SVG plans.
+#
+# Used by:
+#   - _run_migrations (registry v64)
+#   - app/wayfind/routes.py — every table
+############################################################
+
+def _migration_v64_wayfind(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wf_buildings (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            north_deg REAL,
+            entrance_node_id TEXT,
+            draft_revision INTEGER NOT NULL DEFAULT 0,
+            published_revision INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wf_entities (
+            building_id TEXT NOT NULL REFERENCES wf_buildings(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK(kind IN ('level', 'node', 'edge', 'room')),
+            id TEXT NOT NULL,
+            data TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (building_id, kind, id)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wf_entities_revision ON wf_entities(building_id, revision)"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wf_ops (
+            id TEXT PRIMARY KEY,
+            building_id TEXT NOT NULL REFERENCES wf_buildings(id) ON DELETE CASCADE,
+            revision INTEGER,
+            op TEXT NOT NULL,
+            author_id TEXT,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('applied', 'rejected')),
+            reason TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wf_ops_building ON wf_ops(building_id, created_at)"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wf_versions (
+            building_id TEXT NOT NULL REFERENCES wf_buildings(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL,
+            document TEXT NOT NULL,
+            etag TEXT NOT NULL,
+            note TEXT,
+            published_by TEXT,
+            published_at TEXT NOT NULL,
+            PRIMARY KEY (building_id, revision)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wf_panoramas (
+            id TEXT PRIMARY KEY,
+            building_id TEXT NOT NULL REFERENCES wf_buildings(id) ON DELETE CASCADE,
+            node_id TEXT,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            bytes INTEGER NOT NULL,
+            hfov_deg REAL,
+            vfov_deg REAL,
+            heading_raw_deg REAL,
+            heading_source TEXT,
+            uploaded_by TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wf_plans (
+            id TEXT PRIMARY KEY,
+            building_id TEXT NOT NULL REFERENCES wf_buildings(id) ON DELETE CASCADE,
+            level_id TEXT,
+            bytes INTEGER NOT NULL,
+            uploaded_by TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+
+
+
+
+
+
+
+
+############################################################
+# _migration_v65_wayfind_captures
+############################################################
+#
+# Migration v65: guided panorama capture. One wf_captures row
+# per phone capture session — the id is scoped
+# '<building_id>:<client id>' like wf_ops so a replayed
+# create applies once and the same client id works on a
+# second building; targets holds the client's aim plan as
+# JSON, expected its length, and status walks
+# uploading → queued → stitching → done/failed with the
+# stitch worker's progress and report riding along. One
+# wf_capture_frames row per accepted frame: the pose the
+# tracker measured at the shutter plus the stored file's
+# size (the JPEG itself lives under
+# UPLOAD_DIR/wayfind/captures/, deleted after a successful
+# stitch). The (status, updated_at) index is the worker's
+# queue poll.
+#
+# Used by:
+#   - _run_migrations (registry v65)
+#   - app/wayfind/captures.py — both tables
+#   - app/wayfind/stitch.py — the queue poll and the outcome
+############################################################
+
+def _migration_v65_wayfind_captures(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wf_captures (
+            id TEXT PRIMARY KEY,
+            building_id TEXT NOT NULL REFERENCES wf_buildings(id) ON DELETE CASCADE,
+            node_id TEXT,
+            mode TEXT NOT NULL CHECK(mode IN ('full', 'walls')),
+            frame_hfov_deg REAL NOT NULL,
+            targets TEXT NOT NULL,
+            expected INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('uploading', 'queued', 'stitching', 'done', 'failed')),
+            progress_pct INTEGER NOT NULL DEFAULT 0,
+            report TEXT,
+            pano_id TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wf_captures_status ON wf_captures(status, updated_at)"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS wf_capture_frames (
+            capture_id TEXT NOT NULL REFERENCES wf_captures(id) ON DELETE CASCADE,
+            target_id TEXT NOT NULL,
+            yaw_deg REAL NOT NULL,
+            pitch_deg REAL NOT NULL,
+            roll_deg REAL NOT NULL,
+            bytes INTEGER NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (capture_id, target_id)
+        )
+    """)

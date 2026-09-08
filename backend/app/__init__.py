@@ -372,9 +372,11 @@ def create_app():
     from app.scraper.routes import scraper_bp
     from app.chat.routes import chat_bp
     from app.social.routes import social_bp
+    from app.memes import memes_bp
     from app.uploads.routes import uploads_bp
     from app.info.routes import info_bp
     from app.notifications.routes import notifications_bp
+    from app.wayfind import wayfind_bp
 
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(news_bp, url_prefix="/api/news")
@@ -384,8 +386,10 @@ def create_app():
     app.register_blueprint(chat_bp, url_prefix="/api/chat")
     app.register_blueprint(social_bp, url_prefix="/api/social")
     app.register_blueprint(uploads_bp, url_prefix="/api/uploads")
+    app.register_blueprint(memes_bp, url_prefix="/api/memes")
     app.register_blueprint(info_bp, url_prefix="/api/info")
     app.register_blueprint(notifications_bp, url_prefix="/api/notifications")
+    app.register_blueprint(wayfind_bp, url_prefix="/api/wayfind")
 
 
     # STEP 5: realtime chat handlers
@@ -398,6 +402,14 @@ def create_app():
     # to hit knf.vu.lt and push real notifications within 2 seconds;
     # main.py now starts it once, in the serving process only, and
     # only when SCRAPER_ENABLED is not "0"
+
+    # The wayfind stitch worker IS started here, unlike the scraper
+    # scheduler: it only polls the local database and composes files
+    # already on disk — no external traffic, no pushes — and a finished
+    # capture must stitch in whichever process serves. Idempotent per
+    # process; WAYFIND_STITCH_ENABLED=0 turns it off
+    from app.wayfind.stitch import start_stitch_worker
+    start_stitch_worker(app)
 
 
     # STEP 6: request/response hooks, the health route and the JSON

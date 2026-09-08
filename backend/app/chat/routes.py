@@ -51,7 +51,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, has_request_context, jsonify, request
 from flask_socketio import join_room, leave_room
 
 from app.auth.routes import get_json_object, rate_limit, require_auth
@@ -228,11 +228,32 @@ def _is_local_upload_url(url):
 
     # Absolute only counts when scheme, host AND path all
     # agree: "//localhost/api/uploads/a.png" carries no scheme
-    # and "localhost:9999" is a different origin
+    # and "localhost:9999" is a different origin. Outside a
+    # request (the scheduler's expiry sweep) there is no host to
+    # agree with — stored paths are relative anyway
+    if not has_request_context():
+        return False
     parsed = urlparse(url)
     return (parsed.scheme in ("http", "https")
             and parsed.netloc == request.host
             and parsed.path.startswith("/api/uploads/"))
+
+
+# A shared-library meme (served by app/memes) may ride as a
+# message's imageUrl too — same origin, same beacon guard. Kept
+# APART from _is_local_upload_url on purpose: the unsend/expiry
+# cleanup deletes only /api/uploads/ files, never the library's
+def _is_meme_library_url(url):
+    if not isinstance(url, str):
+        return False
+    if url.startswith("/api/memes/file/"):
+        return True
+    if not has_request_context():
+        return False
+    parsed = urlparse(url)
+    return (parsed.scheme in ("http", "https")
+            and parsed.netloc == request.host
+            and parsed.path.startswith("/api/memes/file/"))
 
 
 
@@ -1893,8 +1914,8 @@ def send_message(conv_id):
     if image_url is not None and not isinstance(image_url, str):
         return jsonify({"error": "imageUrl must be a string"}), 400
 
-    if image_url and not _is_local_upload_url(image_url):
-        return jsonify({"error": "imageUrl must be an /api/uploads/ path"}), 400
+    if image_url and not _is_local_upload_url(image_url) and not _is_meme_library_url(image_url):
+        return jsonify({"error": "imageUrl must be an /api/uploads/ or /api/memes/file/ path"}), 400
 
 
     # STEP 2: membership gate — 403 for outsiders; a quoted
@@ -2185,6 +2206,44 @@ def send_message(conv_id):
                 }
                 full_recipients = [r for r in recipients if r not in no_preview]
                 quiet_recipients = [r for r in recipients if r in no_preview]
+
+                # Mentions get their own lane: "X paminėjo jus" — a
+                # lock-screen line the reader cannot mistake for room
+                # chatter. Matched against each recipient's display
+                # name as typed, case-insensitively, ending at a word
+                # boundary ("@Ona" never claims "@Onaitė"). Mentioned
+                # readers leave the plain lanes so nobody gets two
+                mentioned = set()
+                if text:
+                    lowered = text.lower()
+                    for name_row in db.execute(
+                        f"SELECT id, display_name FROM users WHERE id IN ({users_ph})", recipients,
+                    ).fetchall():
+                        needle = f"@{(name_row['display_name'] or '').strip().lower()}"
+                        start = lowered.find(needle) if len(needle) > 1 else -1
+                        while start >= 0:
+                            after = lowered[start + len(needle):start + len(needle) + 1]
+                            before = lowered[start - 1] if start > 0 else " "
+                            if (not after or not (after.isalnum() or after == "_")) and before.isspace():
+                                mentioned.add(name_row["id"])
+                                break
+                            start = lowered.find(needle, start + 1)
+                if mentioned:
+                    mention_title = f"{user['display_name']} paminėjo jus"
+                    if conv_row and conv_row["type"] == "group" and conv_row["title"]:
+                        mention_title = f"{mention_title} · {conv_row['title']}"
+                    mention_data = {**push_data, "type": "chat_mention"}
+                    full_mentioned = [r for r in full_recipients if r in mentioned]
+                    quiet_mentioned = [r for r in quiet_recipients if r in mentioned]
+                    if full_mentioned:
+                        sio.start_background_task(_push_chat_message, full_mentioned, mention_title, preview, mention_data)
+                    if quiet_mentioned:
+                        sio.start_background_task(
+                            _push_chat_message, quiet_mentioned, mention_title,
+                            "Nauja žinutė", {**mention_data, "preview": "hidden"},
+                        )
+                    full_recipients = [r for r in full_recipients if r not in mentioned]
+                    quiet_recipients = [r for r in quiet_recipients if r not in mentioned]
                 if full_recipients:
                     sio.start_background_task(
                         _push_chat_message, full_recipients, push_title, preview, push_data

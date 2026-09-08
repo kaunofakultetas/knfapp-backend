@@ -25,6 +25,9 @@ python-engineio==4.13.1
 # stripped, pixels capped, canonical format chosen (musllinux
 # wheels install on Alpine, no compiler needed)
 pillow==12.3.0
+# wayfind/stitch.py composes captured frames into an
+# equirectangular panorama (musllinux wheels install on Alpine)
+numpy==2.5.2
 requests==2.32.3
 beautifulsoup4==4.13.4
 lxml==5.4.0

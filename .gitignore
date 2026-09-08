@@ -3,3 +3,13 @@
 /docker-compose.yml
 /.claude
 
+
+
+
+
+
+#### Common ignored files ###
+# Byte-compiled / optimized python files
+__pycache__/
+*.py[cod]
+*$py.class

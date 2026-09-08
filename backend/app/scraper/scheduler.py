@@ -243,6 +243,30 @@ def start_scraper_scheduler(app):
             except Exception:
                 logger.exception("Push-token prune failed")
 
+    # Disappearing messages: rooms sweep themselves on activity, so
+    # a room nobody reopens would keep its expired rows AND files.
+    # This backstop finds every room holding an overdue row and
+    # runs the same sweep the routes run
+    def run_ttl_sweep():
+        with app.app_context():
+            try:
+                from app.chat.routes import _sweep_expired
+                db = get_db()
+                try:
+                    now = utc_now_iso()
+                    rooms = db.execute(
+                        "SELECT DISTINCT conversation_id FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?",
+                        (now,),
+                    ).fetchall()
+                    for room in rooms:
+                        _sweep_expired(db, room["conversation_id"])
+                    if rooms:
+                        logger.info("Expiry sweep cleared %d idle room(s)", len(rooms))
+                finally:
+                    db.close()
+            except Exception:
+                logger.exception("Expiry sweep failed")
+
     def run_maintenance():
         with app.app_context():
             try:
@@ -271,6 +295,8 @@ def start_scraper_scheduler(app):
                        max_instances=1, misfire_grace_time=MISFIRE_GRACE_SECONDS)
     # housekeeping: rows nothing else ever deletes
     _scheduler.add_job(run_session_sweep, "interval", hours=24, id="session_sweep",
+                       max_instances=1, misfire_grace_time=MISFIRE_GRACE_SECONDS)
+    _scheduler.add_job(run_ttl_sweep, "interval", hours=1, id="ttl_sweep",
                        max_instances=1, misfire_grace_time=MISFIRE_GRACE_SECONDS)
     _scheduler.add_job(run_push_token_prune, "interval", hours=24, id="push_token_prune",
                        max_instances=1, misfire_grace_time=MISFIRE_GRACE_SECONDS)
@@ -313,7 +339,7 @@ def start_scraper_scheduler(app):
             _startup_timers.append(timer)
 
     logger.info("Scraper scheduler started (news: 20min, schedule: 6h, info: 24h, "
-                "receipts: 15min, session sweep + token prune + run reconcile: 24h)")
+                "receipts: 15min, expiry sweep: 1h, session sweep + token prune + run reconcile: 24h)")
 
     return True
 
