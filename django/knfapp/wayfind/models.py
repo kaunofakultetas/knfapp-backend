@@ -2,17 +2,26 @@
 #  [*] wayfind — the indoor-map tables
 #
 #  Eight tables matching the production database
-#  byte-for-byte. The draft is one row per entity
-#  (wf_entities, composite PK over building/kind/id) with a
-#  tombstone flag so a `since` delta can carry deletions;
-#  wf_ops is the idempotency log (rows keyed
-#  '<building>:<op id>'); wf_versions holds each published
-#  document verbatim — its text IS what the ETag hashes.
-#  Panoramas and plans are content-addressed (the row id is
-#  the sha256 of the stored bytes). Captures live scoped
-#  like ops ('<building>:<client id>'), their frames named
-#  by ROLE (one row per target, replaced on re-shoot).
-#  Shape policy as in users/models.py.
+#  byte-for-byte. Two id schemes worth knowing before the
+#  banners below: panoramas and plans are content-addressed
+#  (the row id IS the sha256 of the stored bytes), while
+#  ops and captures carry client-minted ids scoped
+#  '<building>:<client id>' so idempotency holds per
+#  building. Shape policy as in users/models.py.
+#
+#  Models:
+#    - WfBuilding     — one building, draft + published revs
+#    - WfEntity       — the draft, one row per map entity
+#    - WfOp           — the edit-batch idempotency log
+#    - WfVersion      — published documents, verbatim
+#    - WfPanorama     — content-addressed 360° images
+#    - WfPlan         — content-addressed floor-plan SVGs
+#    - WfCapture      — phone capture sessions
+#    - WfCaptureFrame — one frame per capture target
+#
+#  Changes to these models require running:
+#    python3 manage.py makemigrations
+#    python3 manage.py migrate
 ############################################################
 
 
@@ -24,7 +33,27 @@ CAPTURE_MODES = ("full", "walls")
 CAPTURE_STATUSES = ("uploading", "queued", "stitching", "done", "failed")
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# WfBuilding
+# -----------------------------------------------------------
+#
+# The root row everything else hangs off: the permanent
+# slug id, the display name, the plan's rotation against
+# true north, and the two revision counters — the draft's
+# (bumped by every applied op batch) and the published
+# one (set by a publish).
+#
+# Table: wf_buildings
+# -----------------------------------------------------------
+
 class WfBuilding(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     name = models.TextField()
     north_deg = models.FloatField(null=True, blank=True)
@@ -34,11 +63,32 @@ class WfBuilding(models.Model):
     created_at = models.TextField()
     updated_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "wf_buildings"
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# WfEntity
+# -----------------------------------------------------------
+#
+# The draft: one row per map entity (level/node/edge/room),
+# composite PK over building/kind/id, the entity's JSON in
+# `data`. `deleted` is a tombstone flag so a `since` delta
+# can carry deletions; `revision` stamps the draft revision
+# that last touched the row.
+#
+# Table: wf_entities
+# -----------------------------------------------------------
+
 class WfEntity(models.Model):
+    # Columns
     pk = models.CompositePrimaryKey("building_id", "kind", "id")
     building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE,
                                  db_column="building_id", related_name="entities")
@@ -50,6 +100,7 @@ class WfEntity(models.Model):
     updated_by = models.TextField(null=True, blank=True)
     deleted = models.IntegerField(default=0)
 
+    # Table metadata
     class Meta:
         db_table = "wf_entities"
         constraints = [
@@ -61,7 +112,26 @@ class WfEntity(models.Model):
         ]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# WfOp
+# -----------------------------------------------------------
+#
+# The edit-batch idempotency log: rows keyed
+# '<building>:<op id>' so a retried batch answers its
+# recorded verdicts (applied/rejected + reason) instead of
+# re-applying. The op's JSON rides in `op` verbatim.
+#
+# Table: wf_ops
+# -----------------------------------------------------------
+
 class WfOp(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE,
                                  db_column="building_id", related_name="ops")
@@ -72,6 +142,7 @@ class WfOp(models.Model):
     status = models.TextField()
     reason = models.TextField(null=True, blank=True)
 
+    # Table metadata
     class Meta:
         db_table = "wf_ops"
         constraints = [
@@ -83,7 +154,26 @@ class WfOp(models.Model):
         ]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# WfVersion
+# -----------------------------------------------------------
+#
+# One row per publish, composite PK over building/revision.
+# `document` holds the published map verbatim — its TEXT is
+# byte-for-byte what the graph endpoint serves and what the
+# ETag hashes, which is why it is stored, never re-derived.
+#
+# Table: wf_versions
+# -----------------------------------------------------------
+
 class WfVersion(models.Model):
+    # Columns
     pk = models.CompositePrimaryKey("building_id", "revision")
     building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE,
                                  db_column="building_id", related_name="versions")
@@ -94,11 +184,32 @@ class WfVersion(models.Model):
     published_by = models.TextField(null=True, blank=True)
     published_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "wf_versions"
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# WfPanorama
+# -----------------------------------------------------------
+#
+# One row per stored 360° image, content-addressed: the id
+# IS the sha256 of the JPEG bytes, so a re-upload of the
+# same picture lands on the same row and the serving URL is
+# immutable forever. The geometry columns carry what the
+# viewer needs (fov, raw heading and where it came from).
+#
+# Table: wf_panoramas
+# -----------------------------------------------------------
+
 class WfPanorama(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE,
                                  db_column="building_id", related_name="panoramas")
@@ -113,11 +224,30 @@ class WfPanorama(models.Model):
     uploaded_by = models.TextField(null=True, blank=True)
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "wf_panoramas"
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# WfPlan
+# -----------------------------------------------------------
+#
+# One row per stored floor-plan SVG, content-addressed like
+# the panoramas — the id is the sha256 of the SANITISED
+# bytes (scripts and handlers are stripped before hashing).
+#
+# Table: wf_plans
+# -----------------------------------------------------------
+
 class WfPlan(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE,
                                  db_column="building_id", related_name="plans")
@@ -126,11 +256,33 @@ class WfPlan(models.Model):
     uploaded_by = models.TextField(null=True, blank=True)
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "wf_plans"
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# WfCapture
+# -----------------------------------------------------------
+#
+# A phone capture session: ids scoped '<building>:<client
+# id>' like the ops, the shot list as JSON in `targets`,
+# and the uploading → queued → stitching → done/failed
+# lifecycle the stitch worker walks. `pano_id` points at
+# the finished panorama once stitching succeeds — loose on
+# purpose, the capture record outlives a purged panorama.
+#
+# Table: wf_captures
+# -----------------------------------------------------------
+
 class WfCapture(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE,
                                  db_column="building_id", related_name="captures")
@@ -147,6 +299,7 @@ class WfCapture(models.Model):
     created_at = models.TextField()
     updated_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "wf_captures"
         constraints = [
@@ -160,7 +313,27 @@ class WfCapture(models.Model):
         ]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# WfCaptureFrame
+# -----------------------------------------------------------
+#
+# One frame per capture target — named by ROLE (the target
+# id from the capture's shot list), composite PK, so a
+# re-shoot of the same target REPLACES the row instead of
+# accumulating takes. Pose angles ride with the frame; the
+# JPEG bytes live on disk next to the capture.
+#
+# Table: wf_capture_frames
+# -----------------------------------------------------------
+
 class WfCaptureFrame(models.Model):
+    # Columns
     pk = models.CompositePrimaryKey("capture_id", "target_id")
     capture = models.ForeignKey(WfCapture, on_delete=models.CASCADE,
                                 db_column="capture_id", related_name="frames")
@@ -173,5 +346,6 @@ class WfCaptureFrame(models.Model):
     height = models.IntegerField()
     updated_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "wf_capture_frames"

@@ -1,14 +1,14 @@
 ############################################################
 #  [*] memes — the shared library's ledger
 #
-#  One row per library file: the stored name, the title and
-#  tags people search by, and the folded `search` haystack
-#  (lowercase, Lithuanian diacritics to base letters —
-#  SQLite's lower() folds ASCII only, so 'ačiū' typed
-#  against 'AČIŪ' finds nothing without it). Files live in
-#  MEMES_DIR, a SEPARATE tree from the per-user uploads:
-#  shared lifecycle, no per-user quota, never touched by an
-#  unsend. Shape policy as in users/models.py.
+#  Shape policy as in users/models.py.
+#
+#  Models:
+#    - Meme — one row per shared library file
+#
+#  Changes to these models require running:
+#    python3 manage.py makemigrations
+#    python3 manage.py migrate
 ############################################################
 
 
@@ -18,7 +18,30 @@ from django.db import models
 from knfapp.users.models import User
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# Meme
+# -----------------------------------------------------------
+#
+# One row per library file: the stored name, the title and
+# tags people search by, and the folded `search` haystack
+# (lowercase, Lithuanian diacritics to base letters —
+# SQLite's lower() folds ASCII only, so 'ačiū' typed
+# against 'AČIŪ' finds nothing without it). Files live in
+# MEMES_DIR, a SEPARATE tree from the per-user uploads:
+# shared lifecycle, no per-user quota, never touched by an
+# unsend.
+#
+# Table: memes
+# -----------------------------------------------------------
+
 class Meme(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     filename = models.TextField(unique=True)
     title = models.TextField()
@@ -32,6 +55,7 @@ class Meme(models.Model):
     search = models.TextField(null=True, blank=True)
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "memes"
         indexes = [

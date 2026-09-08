@@ -1,12 +1,14 @@
 ############################################################
 #  [*] scraper — the run ledger
 #
-#  One row per scrape (running → completed/failed), the
-#  table GET /api/scraper/status reads and the conditional
-#  INSERT in common.open_run leans on as the cross-process
-#  run lock. The counts keep the news scraper's column
-#  names whatever the source counts (lessons, sections).
 #  Shape policy as in users/models.py.
+#
+#  Models:
+#    - ScraperRun — one row per scrape, doubling as the lock
+#
+#  Changes to these models require running:
+#    python3 manage.py makemigrations
+#    python3 manage.py migrate
 ############################################################
 
 
@@ -16,7 +18,29 @@ from django.db import models
 RUN_STATUSES = ("running", "completed", "failed")
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# ScraperRun
+# -----------------------------------------------------------
+#
+# One row per scrape (running → completed/failed), the
+# table GET /api/scraper/status reads and the conditional
+# INSERT in common.open_run leans on as the cross-process
+# run lock: a live 'running' row younger than the source's
+# budget blocks a second start. The counts keep the news
+# scraper's column names whatever the source counts
+# (lessons, sections).
+#
+# Table: scraper_runs
+# -----------------------------------------------------------
+
 class ScraperRun(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     source = models.TextField()
     status = models.TextField(default="running")
@@ -26,6 +50,7 @@ class ScraperRun(models.Model):
     started_at = models.TextField()
     finished_at = models.TextField(null=True, blank=True)
 
+    # Table metadata
     class Meta:
         db_table = "scraper_runs"
         constraints = [

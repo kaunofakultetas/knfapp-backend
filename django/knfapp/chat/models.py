@@ -1,19 +1,24 @@
 ############################################################
 #  [*] chat — the messaging tables
 #
-#  Five tables mirroring the live schema byte-for-byte:
-#  conversations (direct/group + the disappearing-messages
-#  TTL), the membership rows (composite PK, per-user pin +
-#  last_read_at watermark), messages (soft-deleted by
-#  deleted_at; client_msg_id is the idempotency nonce under
-#  its unique index; kind/attachment_*/gallery/
-#  link_preview carry the richer message shapes), and the
-#  two composite-PK side tables: read receipts and
-#  reactions. The messages_fts FTS5 shadow table is NOT a
-#  model — it rides migration 0002 with a probe-create, so
-#  an SQLite built without FTS5 degrades the in-room search
-#  to its LIKE fallback instead of failing the migrate.
-#  Shape policy as in users/models.py.
+#  Five tables mirroring the live schema byte-for-byte. The
+#  messages_fts FTS5 shadow table is NOT a model — it rides
+#  migration 0002 with a probe-create, so an SQLite built
+#  without FTS5 degrades the in-room search to its LIKE
+#  fallback instead of failing the migrate. Chat stamps are
+#  NAIVE-UTC isoformat text (no offset), compared as
+#  strings. Shape policy as in users/models.py.
+#
+#  Models:
+#    - Conversation            — direct/group rooms + the TTL
+#    - ConversationParticipant — membership, pin, watermark
+#    - Message                 — the message rows, all kinds
+#    - MessageRead             — per-message read receipts
+#    - MessageReaction         — one emoji per (message, user)
+#
+#  Changes to these models require running:
+#    python3 manage.py makemigrations
+#    python3 manage.py migrate
 ############################################################
 
 
@@ -26,7 +31,26 @@ from knfapp.users.models import User
 CONVERSATION_TYPES = ("direct", "group")
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# Conversation
+# -----------------------------------------------------------
+#
+# One room per row: 'direct' pairs (title NULL — the peer's
+# name is the title) and 'group' rooms with their own title
+# and emoji avatar. `message_ttl_seconds` is the
+# disappearing-messages setting new sends inherit.
+#
+# Table: conversations
+# -----------------------------------------------------------
+
 class Conversation(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     type = models.TextField(default="direct")
     title = models.TextField(null=True, blank=True)
@@ -38,6 +62,7 @@ class Conversation(models.Model):
     created_at = models.TextField()
     updated_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "conversations"
         constraints = [
@@ -49,7 +74,27 @@ class Conversation(models.Model):
         ]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# ConversationParticipant
+# -----------------------------------------------------------
+#
+# The membership rows every chat read is scoped by:
+# composite PK over the pair, a per-user pin flag, and
+# `last_read_at` — the watermark the unread counts compare
+# message stamps against (chat's read model number one; the
+# per-message receipts below are number two).
+#
+# Table: conversation_participants
+# -----------------------------------------------------------
+
 class ConversationParticipant(models.Model):
+    # Columns
     pk = models.CompositePrimaryKey("conversation_id", "user_id")
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE,
                                      db_column="conversation_id", related_name="participants")
@@ -59,6 +104,7 @@ class ConversationParticipant(models.Model):
     last_read_at = models.TextField(null=True, blank=True)
     joined_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "conversation_participants"
         indexes = [
@@ -66,7 +112,29 @@ class ConversationParticipant(models.Model):
         ]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# Message
+# -----------------------------------------------------------
+#
+# The message rows, every kind in one table: text, image,
+# attachment (the attachment_* columns), gallery and link
+# previews as JSON text. Soft-deleted by `deleted_at` (an
+# unsend keeps the row, blanks the content at read time);
+# `client_msg_id` is the idempotency nonce under its unique
+# index; `expires_at` is set on send in TTL rooms and swept
+# by the disappearing-messages pass.
+#
+# Table: messages
+# -----------------------------------------------------------
+
 class Message(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE,
                                      db_column="conversation_id", related_name="messages")
@@ -93,6 +161,7 @@ class Message(models.Model):
     expires_at = models.TextField(null=True, blank=True)
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "messages"
         constraints = [
@@ -114,7 +183,26 @@ class Message(models.Model):
         ]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# MessageRead
+# -----------------------------------------------------------
+#
+# Per-message read receipts (chat's read model number two —
+# the membership watermark above is number one): one row
+# per (message, user), written when a reader confirms a
+# specific message.
+#
+# Table: message_reads
+# -----------------------------------------------------------
+
 class MessageRead(models.Model):
+    # Columns
     pk = models.CompositePrimaryKey("message_id", "user_id")
     message = models.ForeignKey(Message, on_delete=models.CASCADE,
                                 db_column="message_id", related_name="reads")
@@ -122,6 +210,7 @@ class MessageRead(models.Model):
                              db_column="user_id", related_name="message_reads")
     read_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "message_reads"
         indexes = [
@@ -129,7 +218,25 @@ class MessageRead(models.Model):
         ]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# MessageReaction
+# -----------------------------------------------------------
+#
+# One emoji per (message, user) — the composite PK enforces
+# it; changing the emoji rewrites the row rather than
+# adding a second.
+#
+# Table: message_reactions
+# -----------------------------------------------------------
+
 class MessageReaction(models.Model):
+    # Columns
     pk = models.CompositePrimaryKey("message_id", "user_id")
     message = models.ForeignKey(Message, on_delete=models.CASCADE,
                                 db_column="message_id", related_name="reactions")
@@ -138,6 +245,7 @@ class MessageReaction(models.Model):
     emoji = models.TextField()
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "message_reactions"
         indexes = [

@@ -1,14 +1,14 @@
 ############################################################
 #  [*] admin — the audit trail
 #
-#  One row per privileged mutation (mint/revoke a code,
-#  role/active change, erasure, broadcast): who, what,
-#  which target, and the action's context as JSON text.
-#  Written INSIDE the mutating request's transaction, so
-#  the trail cannot record an action that rolled back nor
-#  miss one that committed. SET_NULL on the actor — the
-#  trail outlives an erased admin account. Shape policy as
-#  in users/models.py.
+#  Shape policy as in users/models.py.
+#
+#  Models:
+#    - AdminAudit — one row per privileged mutation
+#
+#  Changes to these models require running:
+#    python3 manage.py makemigrations
+#    python3 manage.py migrate
 ############################################################
 
 
@@ -18,7 +18,31 @@ from django.db import models
 from knfapp.users.models import User
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# AdminAudit
+# -----------------------------------------------------------
+#
+# One row per privileged mutation (mint/revoke a code,
+# role/active change, erasure, broadcast, report decision,
+# tombstone restore): who, what, which target, and the
+# action's context as JSON text. Written INSIDE the
+# mutating request's transaction, so the trail cannot
+# record an action that rolled back nor miss one that
+# committed. SET_NULL on the actor — the trail outlives an
+# erased admin account. Read over HTTP by GET
+# /api/admin/audit.
+#
+# Table: admin_audit
+# -----------------------------------------------------------
+
 class AdminAudit(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     actor = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL,
                               db_column="actor_id", related_name="admin_actions")
@@ -27,6 +51,7 @@ class AdminAudit(models.Model):
     payload = models.TextField(null=True, blank=True)
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "admin_audit"
         indexes = [

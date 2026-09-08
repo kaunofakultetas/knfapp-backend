@@ -15,9 +15,14 @@
 #      Meta.constraints so the database itself enforces the
 #      enums
 #
-#  sessions.token stores the sha256 HEX of the bearer, never
-#  the raw token — a DB or backup leak yields nothing usable
-#  (users/auth.py owns the hashing).
+#  Models:
+#    - User            — the account row every table points at
+#    - InvitationCode  — registration codes with a use budget
+#    - Session         — bearer sessions (sha256 of the token)
+#
+#  Changes to these models require running:
+#    python3 manage.py makemigrations
+#    python3 manage.py migrate
 ############################################################
 
 
@@ -28,7 +33,28 @@ ROLES = ("student", "teacher", "admin", "curator")
 PRIVILEGED_ROLES = ("admin", "curator")
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# User
+# -----------------------------------------------------------
+#
+# One row per account. `active` is the kill switch every
+# authenticated request re-checks; `invited` records whether
+# a code was burned at registration; the student_* trio is
+# the optional student card. Erasure anonymises this row in
+# place — it is never hard-deleted, so foreign keys to it
+# cannot dangle.
+#
+# Table: users
+# -----------------------------------------------------------
+
 class User(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     username = models.TextField(unique=True)
     email = models.TextField(unique=True)
@@ -45,6 +71,7 @@ class User(models.Model):
     created_at = models.TextField()
     updated_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "users"
         constraints = [
@@ -52,7 +79,27 @@ class User(models.Model):
         ]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# InvitationCode
+# -----------------------------------------------------------
+#
+# A registration code with a use budget: `use_count` climbs
+# toward `max_uses` under an atomic conditional UPDATE (the
+# burn), and the expiry is compared at read time — nothing
+# sweeps expired rows. SET_NULL on the minter: revoking an
+# admin account must not revoke the codes it handed out.
+#
+# Table: invitation_codes
+# -----------------------------------------------------------
+
 class InvitationCode(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     code = models.TextField(unique=True)
     role = models.TextField(default="student")
@@ -65,6 +112,7 @@ class InvitationCode(models.Model):
     expires_at = models.TextField()
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "invitation_codes"
         constraints = [
@@ -72,12 +120,33 @@ class InvitationCode(models.Model):
         ]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# Session
+# -----------------------------------------------------------
+#
+# One row per bearer session. `token` stores the sha256 HEX
+# of the bearer, never the raw token — a DB or backup leak
+# yields nothing usable (users/auth.py owns the hashing).
+# Thirty days a row, newest ten per account; the pruning
+# rides the auth reads, not a sweeper.
+#
+# Table: sessions
+# -----------------------------------------------------------
+
 class Session(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id", related_name="sessions")
     token = models.TextField(unique=True)
     created_at = models.TextField()
     expires_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "sessions"

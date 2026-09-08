@@ -1,27 +1,23 @@
 ############################################################
-#  [*] social — friendships and the activity list (models
-#      first)
+#  [*] social — friendships, requests, blocks, activity,
+#      reports
 #
-#  The two tables the news feed's contract already depends
-#  on: friendships gate a private wall post's visibility
-#  (written in BOTH directions on accept, so one direction
-#  is enough to check), and activity is the "X liked your
-#  post" list a like or comment writes into.
-#
-#  friend_requests is the handshake (pending →
-#  accepted/rejected; an accept DELETES the row — the two
-#  friendships rows are the state of record, and 'rejected'
-#  rows live only as long as the re-ask cooldown), guarded
-#  by the partial unique index on the pending pair so a
-#  mutual-send race settles as a 409, never two rows.
-#  user_blocks is one row blocker→blocked, bidirectional in
-#  effect at every enforcement site. reports is the
-#  complaint ledger the admin panel reads.
-#
-#  friendships/user_blocks keep their composite primary
+#  friendships and user_blocks keep their composite primary
 #  keys (Django 5.2 CompositePrimaryKey — the live tables
 #  have no surrogate id and the cutover is a row copy).
 #  Shape policy as in users/models.py.
+#
+#  Models:
+#    - Friendship    — accepted pairs, one row per direction
+#    - Activity      — the "X liked your post" list
+#    - FriendRequest — the pending → accepted/rejected
+#                      handshake
+#    - UserBlock     — one row blocker→blocked
+#    - Report        — the complaint ledger
+#
+#  Changes to these models require running:
+#    python3 manage.py makemigrations
+#    python3 manage.py migrate
 ############################################################
 
 
@@ -34,17 +30,57 @@ from knfapp.users.models import User
 ACTIVITY_KINDS = ("like", "comment", "connect_request", "connect_accept")
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# Friendship
+# -----------------------------------------------------------
+#
+# The table the news feed's visibility contract depends on:
+# a private wall post shows to friends only. Written in
+# BOTH directions on accept, so one direction is enough to
+# check anywhere.
+#
+# Table: friendships
+# -----------------------------------------------------------
+
 class Friendship(models.Model):
+    # Columns
     pk = models.CompositePrimaryKey("user_id", "friend_id")
     user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id", related_name="friendships")
     friend = models.ForeignKey(User, on_delete=models.CASCADE, db_column="friend_id", related_name="friend_of")
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "friendships"
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# Activity
+# -----------------------------------------------------------
+#
+# The per-user notification list a like, comment or friend
+# event writes into. The unique row over (user, kind,
+# actor, subject) makes the writers idempotent — un-like
+# and re-like is one notification, not two. `read` drives
+# the tab badge.
+#
+# Table: activity
+# -----------------------------------------------------------
+
 class Activity(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id", related_name="activity")
     kind = models.TextField()
@@ -54,6 +90,7 @@ class Activity(models.Model):
     created_at = models.TextField()
     read = models.IntegerField(default=0)
 
+    # Table metadata
     class Meta:
         db_table = "activity"
         constraints = [
@@ -73,7 +110,27 @@ REPORT_TARGET_TYPES = ("user", "post", "message")
 REPORT_STATUSES = ("open", "resolved")
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# FriendRequest
+# -----------------------------------------------------------
+#
+# The handshake (pending → accepted/rejected). An accept
+# DELETES the row — the two friendships rows are the state
+# of record — and 'rejected' rows live only as long as the
+# re-ask cooldown. The partial unique index on the pending
+# pair settles a mutual-send race as a 409, never two rows.
+#
+# Table: friend_requests
+# -----------------------------------------------------------
+
 class FriendRequest(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     from_user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="from_user_id",
                                   related_name="sent_friend_requests")
@@ -83,6 +140,7 @@ class FriendRequest(models.Model):
     created_at = models.TextField()
     updated_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "friend_requests"
         constraints = [
@@ -100,7 +158,26 @@ class FriendRequest(models.Model):
         ]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# UserBlock
+# -----------------------------------------------------------
+#
+# One row blocker→blocked, bidirectional in EFFECT at every
+# enforcement site (either direction hides both parties
+# from each other). Blocking severs the friendship and any
+# pending requests in the same transaction.
+#
+# Table: user_blocks
+# -----------------------------------------------------------
+
 class UserBlock(models.Model):
+    # Columns
     pk = models.CompositePrimaryKey("blocker_id", "blocked_id")
     blocker = models.ForeignKey(User, on_delete=models.CASCADE, db_column="blocker_id",
                                 related_name="blocks_made")
@@ -108,12 +185,33 @@ class UserBlock(models.Model):
                                 related_name="blocks_received")
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "user_blocks"
         indexes = [models.Index(fields=["blocked"], name="idx_user_blocks_blocked")]
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# Report
+# -----------------------------------------------------------
+#
+# The complaint ledger the admin queue reads: a polymorphic
+# target (`target_type` names the table, `target_id` is a
+# loose reference on purpose — a deleted target must not
+# take the complaint down with it), the reporter's words,
+# and the open/resolved state the moderators flip.
+#
+# Table: reports
+# -----------------------------------------------------------
+
 class Report(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     reporter = models.ForeignKey(User, on_delete=models.CASCADE, db_column="reporter_id",
                                  related_name="reports")
@@ -123,6 +221,7 @@ class Report(models.Model):
     status = models.TextField(default="open")
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "reports"
         constraints = [

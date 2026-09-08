@@ -1,19 +1,41 @@
 ############################################################
 #  [*] schedule — the scraped lecture timetable
 #
-#  Read-only from the API's side: the timetable scraper
-#  (scraper/schedule_scraper.py) is the only writer. Times are
-#  "HH:MM" wall-clock text, day_of_week 0=Monday..6=Sunday
-#  (the CHECK), semester labels the scraper's "YYYY-P"
-#  (spring) / "YYYY-R" (autumn). Shape policy as in
-#  users/models.py.
+#  Shape policy as in users/models.py.
+#
+#  Models:
+#    - ScheduleLesson — one timetable slot per natural key
+#
+#  Changes to these models require running:
+#    python3 manage.py makemigrations
+#    python3 manage.py migrate
 ############################################################
 
 
 from django.db import models
 
 
+
+
+
+
+
+
+# -----------------------------------------------------------
+# ScheduleLesson
+# -----------------------------------------------------------
+#
+# Read-only from the API's side: the timetable scraper
+# (scraper/schedule_scraper.py) is the only writer. Times
+# are "HH:MM" wall-clock text, day_of_week 0=Monday..6=
+# Sunday (the CHECK), semester labels the scraper's
+# "YYYY-P" (spring) / "YYYY-R" (autumn).
+#
+# Table: schedule_lessons
+# -----------------------------------------------------------
+
 class ScheduleLesson(models.Model):
+    # Columns
     id = models.TextField(primary_key=True)
     title = models.TextField()
     teacher = models.TextField(null=True, blank=True)
@@ -25,6 +47,7 @@ class ScheduleLesson(models.Model):
     semester = models.TextField(null=True, blank=True)
     created_at = models.TextField()
 
+    # Table metadata
     class Meta:
         db_table = "schedule_lessons"
         constraints = [
