@@ -1,0 +1,25 @@
+{
+  "TITLE": "Account",
+  "ROLES": {
+    "student": "Student",
+    "teacher": "Teacher",
+    "curator": "Curator",
+    "admin": "Administrator"
+  },
+  "PASSWORD": {
+    "title": "Change password",
+    "sessions_note": "Changing the password logs every other session (other devices) out.",
+    "old": "Current password",
+    "new": "New password",
+    "repeat": "Repeat the new password",
+    "mismatch": "Passwords do not match",
+    "submit": "Change",
+    "changed_toast": "Password changed"
+  },
+  "LOGOUT_ALL": {
+    "title": "Log out everywhere",
+    "note": "Ends every session of this account on every device (this one included).",
+    "button": "LOG OUT EVERYWHERE",
+    "uncompleted_toast": "Hold the button to log out everywhere"
+  }
+}

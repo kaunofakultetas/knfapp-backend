@@ -1,0 +1,18 @@
+{
+  "TITLE": "Push messages",
+  "audience_warning": "The message reaches EVERY device that has not disabled the administration channel — effectively every user of the app.",
+  "FIELDS": {
+    "title": "Title",
+    "body": "Body"
+  },
+  "send": "Send",
+  "queued_toast": "Message accepted for delivery",
+  "job_lost": "The delivery job is no longer tracked (server restarted or the job aged out).",
+  "job_result": "Sent to devices: {sent} · failed: {failed} · users: {users}",
+  "JOB": {
+    "queued": "Queued",
+    "running": "Sending",
+    "done": "Sent",
+    "failed": "Failed"
+  }
+}

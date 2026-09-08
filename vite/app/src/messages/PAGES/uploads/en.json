@@ -1,0 +1,16 @@
+{
+  "TITLE": "Files",
+  "COLUMNS": {
+    "filename": "File",
+    "owner": "Owner",
+    "size": "Size",
+    "createdAt": "Uploaded"
+  },
+  "ownerless": "(no owner)",
+  "open_file": "Open the file",
+  "DELETE": {
+    "button": "DELETE FILE",
+    "completed_toast": "File deleted",
+    "uncompleted_toast": "Hold the button to delete"
+  }
+}

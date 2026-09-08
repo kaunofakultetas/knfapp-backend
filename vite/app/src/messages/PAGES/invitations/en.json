@@ -1,0 +1,39 @@
+{
+  "TITLE": "Invitations",
+  "new_invitation": "New invitation",
+  "COLUMNS": {
+    "code": "Code",
+    "role": "Role",
+    "uses": "Uses",
+    "state": "State",
+    "expiresAt": "Valid until",
+    "createdAt": "Created",
+    "maxUses": "Use limit",
+    "expiresHours": "Validity (hours)"
+  },
+  "ROLES": {
+    "student": "Student",
+    "teacher": "Teacher",
+    "curator": "Curator",
+    "admin": "Administrator"
+  },
+  "STATE": {
+    "active": "Active",
+    "used": "Used up",
+    "expired": "Expired"
+  },
+  "mint": "Create",
+  "created_title": "Invitation created",
+  "created_hint": "Role: {role}. Hand the code to the invited person — it is entered while registering in the app.",
+  "copy_code": "Copy code",
+  "copied_toast": "Copied",
+  "privileged_uses_hint": "An administrator/curator code is always single-use",
+  "privileged_expiry_hint": "An administrator/curator code is valid for at most {hours} hours",
+  "expiry_hint": "1–8760 hours (default one week)",
+  "details_title": "Invitation details",
+  "REVOKE": {
+    "button": "REVOKE INVITATION",
+    "completed_toast": "Invitation revoked",
+    "uncompleted_toast": "Hold the button to revoke"
+  }
+}

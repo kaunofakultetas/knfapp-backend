@@ -1,0 +1,23 @@
+{
+  "TITLE": "Moderacija",
+  "show_resolved": "Rodyti išnagrinėtus",
+  "COLUMNS": {
+    "createdAt": "Gauta",
+    "reporter": "Pranešė",
+    "targetType": "Objektas",
+    "targetUser": "Naudotojas",
+    "reason": "Priežastis"
+  },
+  "TARGETS": {
+    "user": "Naudotojas",
+    "post": "Įrašas",
+    "message": "Žinutė"
+  },
+  "details_title": "Pranešimo informacija",
+  "target_id": "Objekto ID",
+  "target_gone": "Objekto nebėra — jis jau ištrintas arba paslėptas.",
+  "message_unsent": "ATŠAUKTA ŽINUTĖ",
+  "status_saved_toast": "Būsena pakeista",
+  "resolve": "PAŽYMĖTI IŠNAGRINĖTU",
+  "reopen": "ATIDARYTI IŠ NAUJO"
+}

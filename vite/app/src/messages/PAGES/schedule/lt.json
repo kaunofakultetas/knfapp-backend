@@ -1,0 +1,26 @@
+{
+  "TITLE": "Tvarkaraštis",
+  "COLUMNS": {
+    "day": "Diena",
+    "time": "Laikas",
+    "title": "Paskaita",
+    "teacher": "Dėstytojas",
+    "room": "Auditorija",
+    "group": "Grupė"
+  },
+  "DAYS": {
+    "0": "Pirmadienis",
+    "1": "Antradienis",
+    "2": "Trečiadienis",
+    "3": "Ketvirtadienis",
+    "4": "Penktadienis",
+    "5": "Šeštadienis",
+    "6": "Sekmadienis"
+  },
+  "FILTERS": {
+    "semester": "Semestras",
+    "group": "Grupė",
+    "newest": "Naujausias",
+    "all_groups": "Visos grupės"
+  }
+}

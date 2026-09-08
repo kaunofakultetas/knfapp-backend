@@ -1,0 +1,31 @@
+{
+  "TITLE": "Users",
+  "COLUMNS": {
+    "username": "Username",
+    "displayName": "Display name",
+    "email": "Email",
+    "role": "Role",
+    "active": "State",
+    "createdAt": "Created"
+  },
+  "ROLES": {
+    "student": "Student",
+    "teacher": "Teacher",
+    "curator": "Curator",
+    "admin": "Administrator"
+  },
+  "STATE": {
+    "active": "Active",
+    "inactive": "Disabled"
+  },
+  "save": "Save",
+  "saved_toast": "Saved",
+  "deactivate_warning": "Deactivating an account kills all of its sessions and push devices immediately.",
+  "ERASE": {
+    "button": "ERASE ACCOUNT",
+    "tooltip": "Hold to confirm — the account is anonymised irreversibly",
+    "self_tooltip": "Your own account cannot be erased here",
+    "completed_toast": "Account erased",
+    "uncompleted_toast": "Hold the button to erase"
+  }
+}

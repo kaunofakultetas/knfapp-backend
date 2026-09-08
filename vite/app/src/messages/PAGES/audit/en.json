@@ -1,0 +1,11 @@
+{
+  "TITLE": "Action log",
+  "COLUMNS": {
+    "createdAt": "Time",
+    "actor": "Actor",
+    "action": "Action",
+    "target": "Target",
+    "payload": "Context"
+  },
+  "erased_actor": "(erased account)"
+}

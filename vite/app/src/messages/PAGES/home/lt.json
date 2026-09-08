@@ -1,0 +1,20 @@
+{
+  "WIDGETS": {
+    "users": "NAUDOTOJAI",
+    "posts": "ĮRAŠAI",
+    "posts_scraped": "iš jų surinkta: {count}",
+    "comments": "KOMENTARAI",
+    "invitations": "AKTYVŪS PAKVIETIMAI",
+    "reports": "NEIŠNAGRINĖTI PRANEŠIMAI"
+  },
+  "SCRAPERS": {
+    "title": "SCRAPERIŲ BŪKLĖ",
+    "never": "Nevykdyta",
+    "last_success": "Paskutinė sėkmė",
+    "STATUS": {
+      "completed": "Baigta",
+      "running": "Vykdoma",
+      "failed": "Nepavyko"
+    }
+  }
+}

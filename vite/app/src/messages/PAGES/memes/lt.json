@@ -1,0 +1,12 @@
+{
+  "TITLE": "Memai",
+  "search": "Ieškoti pagal pavadinimą ar žymas...",
+  "empty": "Memų nerasta.",
+  "load_more": "Rodyti daugiau",
+  "loading": "Kraunama...",
+  "DELETE": {
+    "button": "IŠTRINTI",
+    "completed_toast": "Memas ištrintas",
+    "uncompleted_toast": "Laikykite nuspaudę, kad ištrintumėte"
+  }
+}

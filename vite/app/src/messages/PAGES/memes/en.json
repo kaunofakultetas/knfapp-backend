@@ -1,0 +1,12 @@
+{
+  "TITLE": "Memes",
+  "search": "Search by title or tags...",
+  "empty": "No memes found.",
+  "load_more": "Show more",
+  "loading": "Loading...",
+  "DELETE": {
+    "button": "DELETE",
+    "completed_toast": "Meme deleted",
+    "uncompleted_toast": "Hold the button to delete"
+  }
+}

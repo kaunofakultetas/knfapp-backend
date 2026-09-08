@@ -1,0 +1,17 @@
+{
+  "title": "KNF programėlės administravimas",
+  "user": "Naudotojas",
+  "logout": "Atsijungti",
+  "lithuanian": "Lietuvių",
+  "english": "English",
+  "ROLES": {
+    "admin": "Administratorius",
+    "curator": "Kuratorius",
+    "teacher": "Dėstytojas",
+    "student": "Studentas"
+  },
+  "ERRORS": {
+    "REQUEST_FAILED": "Užklausa nepavyko ({status_code})",
+    "RETRY_AFTER": "bandykite po {seconds} s"
+  }
+}

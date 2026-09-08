@@ -1,0 +1,31 @@
+{
+  "TITLE": "Naudotojai",
+  "COLUMNS": {
+    "username": "Naudotojo vardas",
+    "displayName": "Rodomas vardas",
+    "email": "El. paštas",
+    "role": "Rolė",
+    "active": "Būsena",
+    "createdAt": "Sukurta"
+  },
+  "ROLES": {
+    "student": "Studentas",
+    "teacher": "Dėstytojas",
+    "curator": "Kuratorius",
+    "admin": "Administratorius"
+  },
+  "STATE": {
+    "active": "Aktyvus",
+    "inactive": "Išjungtas"
+  },
+  "save": "Išsaugoti",
+  "saved_toast": "Išsaugota",
+  "deactivate_warning": "Išjungus paskyrą visos jos sesijos ir push įrenginiai atjungiami iškart.",
+  "ERASE": {
+    "button": "IŠTRINTI PASKYRĄ",
+    "tooltip": "Laikykite nuspaudę — paskyra anonimizuojama negrįžtamai",
+    "self_tooltip": "Savo paskyros čia ištrinti negalima",
+    "completed_toast": "Paskyra ištrinta",
+    "uncompleted_toast": "Laikykite nuspaudę, kad ištrintumėte"
+  }
+}

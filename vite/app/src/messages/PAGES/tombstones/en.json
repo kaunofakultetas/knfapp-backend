@@ -1,0 +1,12 @@
+{
+  "TITLE": "Deleted sources",
+  "COLUMNS": {
+    "sourceUrl": "Source link",
+    "deletedBy": "Deleted by",
+    "deletedAt": "Deleted"
+  },
+  "restore_title": "Bring the article back?",
+  "restore": "Restore",
+  "restore_note": "The link is removed from the skip-list — the article returns on the next scrape if the site still carries it. Nothing is fetched immediately.",
+  "restored_toast": "Link restored"
+}

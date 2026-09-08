@@ -1,0 +1,20 @@
+{
+  "WIDGETS": {
+    "users": "USERS",
+    "posts": "POSTS",
+    "posts_scraped": "scraped: {count}",
+    "comments": "COMMENTS",
+    "invitations": "ACTIVE INVITATIONS",
+    "reports": "OPEN REPORTS"
+  },
+  "SCRAPERS": {
+    "title": "SCRAPER HEALTH",
+    "never": "Never ran",
+    "last_success": "Last success",
+    "STATUS": {
+      "completed": "Completed",
+      "running": "Running",
+      "failed": "Failed"
+    }
+  }
+}

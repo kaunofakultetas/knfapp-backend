@@ -1,0 +1,26 @@
+{
+  "TITLE": "Scrapers",
+  "TRIGGERS": {
+    "news": "Scrape news",
+    "schedule": "Scrape timetable",
+    "info": "Scrape information"
+  },
+  "trigger_done_toast": "Scrape finished",
+  "CHART": {
+    "new_articles": "New articles"
+  },
+  "COLUMNS": {
+    "startedAt": "Started",
+    "source": "Source",
+    "status": "Status",
+    "found": "Found",
+    "new": "New",
+    "finishedAt": "Finished",
+    "error": "Error"
+  },
+  "STATUS": {
+    "completed": "Completed",
+    "running": "Running",
+    "failed": "Failed"
+  }
+}

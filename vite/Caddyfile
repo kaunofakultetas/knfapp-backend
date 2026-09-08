@@ -1,0 +1,17 @@
+:80 {
+    # The SPA is built with base /adminpanel/ and the ingress
+    # forwards the full path — strip the prefix, serve the
+    # build, and send unknown paths to index.html so the
+    # client-side router can take over
+    handle_path /adminpanel/* {
+        root * /app/dist
+        try_files {path} /index.html
+        file_server
+    }
+
+    # Anything without the prefix (a bare container hit) is
+    # sent to the app's entry
+    handle {
+        redir * /adminpanel/ 308
+    }
+}

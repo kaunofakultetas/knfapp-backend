@@ -1,0 +1,41 @@
+{
+  "TITLE": "News",
+  "new_post": "New post",
+  "COLUMNS": {
+    "title": "Title",
+    "source": "Source",
+    "postType": "Type",
+    "author": "Author",
+    "likes": "Likes",
+    "comments": "Comments",
+    "visibility": "Visibility",
+    "date": "Published"
+  },
+  "TYPES": {
+    "announcement": "Announcement",
+    "article": "Article",
+    "link": "Link",
+    "social": "Social",
+    "poll": "Poll"
+  },
+  "VISIBILITY": {
+    "public": "Public",
+    "draft": "Draft"
+  },
+  "publish": "Publish",
+  "created_toast": "Post published",
+  "FIELDS": {
+    "title": "Title",
+    "content": "Body"
+  },
+  "untitled": "(no title)",
+  "counters": "Reactions",
+  "counters_line": "{likes} likes · {comments} comments · {shares} shares",
+  "source_url": "Source link",
+  "DELETE": {
+    "button": "DELETE POST",
+    "scraped_tooltip": "A scraped article deleted here will never be re-scraped",
+    "completed_toast": "Post deleted",
+    "uncompleted_toast": "Hold the button to delete"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "TITLE": "Push žinutės",
+  "audience_warning": "Žinutė pasieks VISUS įrenginius, kuriuose neišjungtas administracijos pranešimų kanalas — praktiškai visus programėlės naudotojus.",
+  "FIELDS": {
+    "title": "Antraštė",
+    "body": "Tekstas"
+  },
+  "send": "Siųsti",
+  "queued_toast": "Žinutė priimta siuntimui",
+  "job_lost": "Siuntimo būsena nebesekama (serveris buvo perkrautas arba užduotis pasenusi).",
+  "job_result": "Išsiųsta įrenginiams: {sent} · nepavyko: {failed} · naudotojų: {users}",
+  "JOB": {
+    "queued": "Eilėje",
+    "running": "Siunčiama",
+    "done": "Išsiųsta",
+    "failed": "Nepavyko"
+  }
+}

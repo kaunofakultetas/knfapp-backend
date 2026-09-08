@@ -1,0 +1,9 @@
+{
+  "title": "Administration panel",
+  "username": "Username or email",
+  "password": "Password",
+  "sign_in": "SIGN IN",
+  "please_wait": "PLEASE WAIT",
+  "copyright": "Copyright © | All Rights Reserved | VUKnF",
+  "not_staff": "This account is not an administrator or curator — the panel is not available to it."
+}

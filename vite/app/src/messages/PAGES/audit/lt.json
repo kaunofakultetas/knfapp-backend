@@ -1,0 +1,11 @@
+{
+  "TITLE": "Veiksmų žurnalas",
+  "COLUMNS": {
+    "createdAt": "Laikas",
+    "actor": "Atliko",
+    "action": "Veiksmas",
+    "target": "Objektas",
+    "payload": "Kontekstas"
+  },
+  "erased_actor": "(ištrinta paskyra)"
+}

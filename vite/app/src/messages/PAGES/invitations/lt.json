@@ -1,0 +1,39 @@
+{
+  "TITLE": "Pakvietimai",
+  "new_invitation": "Naujas pakvietimas",
+  "COLUMNS": {
+    "code": "Kodas",
+    "role": "Rolė",
+    "uses": "Panaudojimai",
+    "state": "Būsena",
+    "expiresAt": "Galioja iki",
+    "createdAt": "Sukurta",
+    "maxUses": "Panaudojimų limitas",
+    "expiresHours": "Galiojimas (val.)"
+  },
+  "ROLES": {
+    "student": "Studentas",
+    "teacher": "Dėstytojas",
+    "curator": "Kuratorius",
+    "admin": "Administratorius"
+  },
+  "STATE": {
+    "active": "Aktyvus",
+    "used": "Panaudotas",
+    "expired": "Pasibaigęs"
+  },
+  "mint": "Sukurti",
+  "created_title": "Pakvietimas sukurtas",
+  "created_hint": "Rolė: {role}. Perduokite kodą kviečiamam žmogui — jis įvedamas registruojantis programėlėje.",
+  "copy_code": "Kopijuoti kodą",
+  "copied_toast": "Nukopijuota",
+  "privileged_uses_hint": "Administratoriaus/kuratoriaus kodas visada vienkartinis",
+  "privileged_expiry_hint": "Administratoriaus/kuratoriaus kodas galioja daugiausia {hours} val.",
+  "expiry_hint": "1–8760 val. (numatytoji — savaitė)",
+  "details_title": "Pakvietimo informacija",
+  "REVOKE": {
+    "button": "ATŠAUKTI PAKVIETIMĄ",
+    "completed_toast": "Pakvietimas atšauktas",
+    "uncompleted_toast": "Laikykite nuspaudę, kad atšauktumėte"
+  }
+}

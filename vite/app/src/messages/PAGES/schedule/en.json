@@ -1,0 +1,26 @@
+{
+  "TITLE": "Timetable",
+  "COLUMNS": {
+    "day": "Day",
+    "time": "Time",
+    "title": "Lecture",
+    "teacher": "Teacher",
+    "room": "Room",
+    "group": "Group"
+  },
+  "DAYS": {
+    "0": "Monday",
+    "1": "Tuesday",
+    "2": "Wednesday",
+    "3": "Thursday",
+    "4": "Friday",
+    "5": "Saturday",
+    "6": "Sunday"
+  },
+  "FILTERS": {
+    "semester": "Semester",
+    "group": "Group",
+    "newest": "Newest",
+    "all_groups": "All groups"
+  }
+}

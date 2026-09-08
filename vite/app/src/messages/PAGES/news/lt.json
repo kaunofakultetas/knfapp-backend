@@ -1,0 +1,41 @@
+{
+  "TITLE": "Naujienos",
+  "new_post": "Naujas įrašas",
+  "COLUMNS": {
+    "title": "Antraštė",
+    "source": "Šaltinis",
+    "postType": "Tipas",
+    "author": "Autorius",
+    "likes": "Patiktukai",
+    "comments": "Komentarai",
+    "visibility": "Matomumas",
+    "date": "Paskelbta"
+  },
+  "TYPES": {
+    "announcement": "Skelbimas",
+    "article": "Straipsnis",
+    "link": "Nuoroda",
+    "social": "Socialinis",
+    "poll": "Apklausa"
+  },
+  "VISIBILITY": {
+    "public": "Vieša",
+    "draft": "Juodraštis"
+  },
+  "publish": "Paskelbti",
+  "created_toast": "Įrašas paskelbtas",
+  "FIELDS": {
+    "title": "Antraštė",
+    "content": "Tekstas"
+  },
+  "untitled": "(be antraštės)",
+  "counters": "Reakcijos",
+  "counters_line": "{likes} patiktukai · {comments} komentarai · {shares} pasidalinimai",
+  "source_url": "Šaltinio nuoroda",
+  "DELETE": {
+    "button": "IŠTRINTI ĮRAŠĄ",
+    "scraped_tooltip": "Surinktas straipsnis po ištrynimo nebebus renkamas iš naujo",
+    "completed_toast": "Įrašas ištrintas",
+    "uncompleted_toast": "Laikykite nuspaudę, kad ištrintumėte"
+  }
+}

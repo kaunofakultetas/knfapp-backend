@@ -1,0 +1,23 @@
+{
+  "TITLE": "Moderation",
+  "show_resolved": "Show resolved",
+  "COLUMNS": {
+    "createdAt": "Received",
+    "reporter": "Reporter",
+    "targetType": "Target",
+    "targetUser": "User",
+    "reason": "Reason"
+  },
+  "TARGETS": {
+    "user": "User",
+    "post": "Post",
+    "message": "Message"
+  },
+  "details_title": "Report details",
+  "target_id": "Target ID",
+  "target_gone": "The target is gone — already deleted or hidden.",
+  "message_unsent": "UNSENT MESSAGE",
+  "status_saved_toast": "Status changed",
+  "resolve": "MARK RESOLVED",
+  "reopen": "REOPEN"
+}

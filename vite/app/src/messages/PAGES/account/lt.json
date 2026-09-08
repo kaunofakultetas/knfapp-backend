@@ -1,0 +1,25 @@
+{
+  "TITLE": "Paskyra",
+  "ROLES": {
+    "student": "Studentas",
+    "teacher": "Dėstytojas",
+    "curator": "Kuratorius",
+    "admin": "Administratorius"
+  },
+  "PASSWORD": {
+    "title": "Slaptažodžio keitimas",
+    "sessions_note": "Pakeitus slaptažodį visos kitos sesijos (kituose įrenginiuose) atjungiamos.",
+    "old": "Dabartinis slaptažodis",
+    "new": "Naujas slaptažodis",
+    "repeat": "Pakartokite naują slaptažodį",
+    "mismatch": "Slaptažodžiai nesutampa",
+    "submit": "Pakeisti",
+    "changed_toast": "Slaptažodis pakeistas"
+  },
+  "LOGOUT_ALL": {
+    "title": "Atsijungti visur",
+    "note": "Atjungia visas šios paskyros sesijas visuose įrenginiuose (įskaitant šį).",
+    "button": "ATSIJUNGTI VISUR",
+    "uncompleted_toast": "Laikykite nuspaudę, kad atsijungtumėte visur"
+  }
+}

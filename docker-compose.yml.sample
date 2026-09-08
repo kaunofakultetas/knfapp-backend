@@ -114,6 +114,23 @@ services:
     restart: unless-stopped
 
 
+  knfapp-vite:
+    container_name: knfapp-vite
+    image: knfapp-vite
+    build:
+      context: ./vite
+      dockerfile: Dockerfile                                                # Prod
+      # dockerfile: Dockerfile.dev                                            # Dev
+    # user: 1000:1000
+    read_only: true
+    # volumes:                                                                # Dev
+    #   - ./vite/app:/app                                                     # Dev
+    networks:
+      - isolated
+      # - external                                                            # Dev
+    restart: unless-stopped
+
+
   knfapp-mobile:
     container_name: knfapp-mobile
     image: knfapp-mobile

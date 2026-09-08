@@ -4,11 +4,12 @@
 #  One :80 site behind the hosting proxy that terminates TLS.
 #  Everything the outside world reaches goes through here:
 #
-#    /api/*       → knfapp-backend:8000   (Flask REST)
-#    /socket.io/* → knfapp-backend:8000   (polling chat)
-#    /swagger*    → knfapp-swagger:8080   (published contract)
-#    /dbgate/*    → knfapp-dbgate:3000    (admin DB console)
-#    everything   → knfapp-mobile:8081    (Expo web app)
+#    /api/*        → knfapp-backend:8000   (Flask REST)
+#    /socket.io/*  → knfapp-backend:8000   (polling chat)
+#    /swagger*     → knfapp-swagger:8080   (published contract)
+#    /dbgate/*     → knfapp-dbgate:3000    (admin DB console)
+#    /adminpanel/* → knfapp-vite:80        (admin web panel)
+#    everything    → knfapp-mobile:8081    (Expo web app)
 #
 #  Trust model — X-Forwarded-For is NOT echoed from the client
 #  any more. Caddy appends the real peer address itself, so the
@@ -88,6 +89,22 @@
                 dbgate {$DBGATE_BASIC_AUTH_HASH:$2b$12$VXRCKp5Z4FWsJSAmbpjcXejgiRZoPoDT8GB3zqQdWaSsJeAinxJ5y}
             }
             reverse_proxy knfapp-dbgate:3000
+        }
+
+
+        # Admin panel — the administrators' web console (Vite
+        # SPA, static files only). The files themselves are
+        # public; every data call the panel makes goes through
+        # /api/* above, where the backend checks the bearer
+        # token and the admin/curator role per endpoint.
+        redir /adminpanel /adminpanel/
+        handle /adminpanel/* {
+            header {
+                X-Frame-Options "DENY"
+                X-Content-Type-Options "nosniff"
+                Referrer-Policy "strict-origin-when-cross-origin"
+            }
+            reverse_proxy knfapp-vite:80
         }
 
 

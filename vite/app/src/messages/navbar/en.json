@@ -1,0 +1,17 @@
+{
+  "title": "KNF app administration",
+  "user": "User",
+  "logout": "Log out",
+  "lithuanian": "Lietuvių",
+  "english": "English",
+  "ROLES": {
+    "admin": "Administrator",
+    "curator": "Curator",
+    "teacher": "Teacher",
+    "student": "Student"
+  },
+  "ERRORS": {
+    "REQUEST_FAILED": "Request failed ({status_code})",
+    "RETRY_AFTER": "retry in {seconds} s"
+  }
+}

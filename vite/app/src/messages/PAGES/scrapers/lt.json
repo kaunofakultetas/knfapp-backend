@@ -1,0 +1,26 @@
+{
+  "TITLE": "Scraperiai",
+  "TRIGGERS": {
+    "news": "Rinkti naujienas",
+    "schedule": "Rinkti tvarkaraštį",
+    "info": "Rinkti informaciją"
+  },
+  "trigger_done_toast": "Rinkimas baigtas",
+  "CHART": {
+    "new_articles": "Nauji straipsniai"
+  },
+  "COLUMNS": {
+    "startedAt": "Pradėta",
+    "source": "Šaltinis",
+    "status": "Būsena",
+    "found": "Rasta",
+    "new": "Nauji",
+    "finishedAt": "Baigta",
+    "error": "Klaida"
+  },
+  "STATUS": {
+    "completed": "Baigta",
+    "running": "Vykdoma",
+    "failed": "Nepavyko"
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "HOME": {
+    "TITLE": "PAGRINDINIS",
+    "home": "Pradžia"
+  },
+  "MANAGEMENT": {
+    "TITLE": "VALDYMAS",
+    "users": "Naudotojai",
+    "invitations": "Pakvietimai",
+    "reports": "Moderacija",
+    "broadcast": "Push žinutės",
+    "audit": "Veiksmų žurnalas"
+  },
+  "CONTENT": {
+    "TITLE": "TURINYS",
+    "news": "Naujienos",
+    "memes": "Memai",
+    "uploads": "Failai",
+    "tombstones": "Ištrintos nuorodos",
+    "schedule": "Tvarkaraštis",
+    "info": "Fakulteto informacija"
+  },
+  "OPERATIONS": {
+    "TITLE": "OPERACIJOS",
+    "scrapers": "Scraperiai",
+    "wayfind": "Navigacija pastate"
+  },
+  "SYSTEM": {
+    "TITLE": "SISTEMA",
+    "apidocs": "API dokumentacija",
+    "database": "Duomenų bazė",
+    "account": "Paskyra",
+    "logout": "Atsijungti"
+  }
+}

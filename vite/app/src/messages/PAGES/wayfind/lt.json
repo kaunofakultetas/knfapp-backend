@@ -1,0 +1,37 @@
+{
+  "TITLE": "Navigacija pastate",
+  "new_building": "Naujas pastatas",
+  "COLUMNS": {
+    "id": "ID",
+    "name": "Pavadinimas",
+    "published": "Paskelbta",
+    "draft": "Juodraštis",
+    "pending": "Pakeitimai",
+    "publishedAt": "Paskelbimo laikas"
+  },
+  "STATE": {
+    "unpublished": "Nepaskelbta",
+    "pending_changes": "Laukia paskelbimo",
+    "up_to_date": "Atnaujinta"
+  },
+  "created_toast": "Pastatas sukurtas",
+  "create": "Sukurti",
+  "FIELDS": {
+    "id": "ID (nuolatinis)",
+    "id_hint": "Mažosios raidės, skaičiai ir brūkšneliai; vėliau nekeičiamas",
+    "name": "Pavadinimas",
+    "north": "Šiaurės kryptis (°)",
+    "north_hint": "Neprivaloma — plano pasukimas šiaurės atžvilgiu"
+  },
+  "PUBLISH": {
+    "button": "PASKELBTI JUODRAŠTĮ",
+    "nothing": "NĖRA KĄ PASKELBTI",
+    "refused": "Juodraštis turi klaidų — paskelbimas atmestas:",
+    "done_toast": "Paskelbta versija v{revision}"
+  },
+  "open_graph": "Atidaryti paskelbtą žemėlapio dokumentą",
+  "VERSIONS": {
+    "title": "Versijų istorija",
+    "none": "Versijų dar nėra"
+  }
+}

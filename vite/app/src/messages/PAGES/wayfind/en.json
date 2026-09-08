@@ -1,0 +1,37 @@
+{
+  "TITLE": "Indoor navigation",
+  "new_building": "New building",
+  "COLUMNS": {
+    "id": "ID",
+    "name": "Name",
+    "published": "Published",
+    "draft": "Draft",
+    "pending": "Changes",
+    "publishedAt": "Published at"
+  },
+  "STATE": {
+    "unpublished": "Unpublished",
+    "pending_changes": "Awaiting publish",
+    "up_to_date": "Up to date"
+  },
+  "created_toast": "Building created",
+  "create": "Create",
+  "FIELDS": {
+    "id": "ID (permanent)",
+    "id_hint": "Lowercase letters, digits and dashes; cannot be changed later",
+    "name": "Name",
+    "north": "North direction (°)",
+    "north_hint": "Optional — the plan's rotation against true north"
+  },
+  "PUBLISH": {
+    "button": "PUBLISH DRAFT",
+    "nothing": "NOTHING TO PUBLISH",
+    "refused": "The draft has errors — publish refused:",
+    "done_toast": "Published revision v{revision}"
+  },
+  "open_graph": "Open the published map document",
+  "VERSIONS": {
+    "title": "Version history",
+    "none": "No versions yet"
+  }
+}

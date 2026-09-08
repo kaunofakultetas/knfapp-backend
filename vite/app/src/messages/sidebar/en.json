@@ -1,0 +1,35 @@
+{
+  "HOME": {
+    "TITLE": "MAIN",
+    "home": "Home"
+  },
+  "MANAGEMENT": {
+    "TITLE": "MANAGEMENT",
+    "users": "Users",
+    "invitations": "Invitations",
+    "reports": "Moderation",
+    "broadcast": "Push messages",
+    "audit": "Action log"
+  },
+  "CONTENT": {
+    "TITLE": "CONTENT",
+    "news": "News",
+    "memes": "Memes",
+    "uploads": "Files",
+    "tombstones": "Deleted sources",
+    "schedule": "Timetable",
+    "info": "Faculty information"
+  },
+  "OPERATIONS": {
+    "TITLE": "OPERATIONS",
+    "scrapers": "Scrapers",
+    "wayfind": "Indoor navigation"
+  },
+  "SYSTEM": {
+    "TITLE": "SYSTEM",
+    "apidocs": "API documentation",
+    "database": "Database",
+    "account": "Account",
+    "logout": "Log out"
+  }
+}

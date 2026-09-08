@@ -1,0 +1,16 @@
+{
+  "TITLE": "Failai",
+  "COLUMNS": {
+    "filename": "Failas",
+    "owner": "Savininkas",
+    "size": "Dydis",
+    "createdAt": "Įkelta"
+  },
+  "ownerless": "(be savininko)",
+  "open_file": "Atidaryti failą",
+  "DELETE": {
+    "button": "IŠTRINTI FAILĄ",
+    "completed_toast": "Failas ištrintas",
+    "uncompleted_toast": "Laikykite nuspaudę, kad ištrintumėte"
+  }
+}

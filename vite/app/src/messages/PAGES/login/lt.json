@@ -1,0 +1,9 @@
+{
+  "title": "Administravimo pultas",
+  "username": "Naudotojo vardas arba el. paštas",
+  "password": "Slaptažodis",
+  "sign_in": "PRISIJUNGTI",
+  "please_wait": "PALAUKITE",
+  "copyright": "Copyright © | All Rights Reserved | VUKnF",
+  "not_staff": "Ši paskyra nėra administratoriaus ar kuratoriaus — pultas jai neprieinamas."
+}

@@ -1,0 +1,43 @@
+/* -----------------------------------------------------------
+   [*] Global styles — Tailwind setup + theme bridge
+
+   Theming: MUI owns the palette (src/theme.js, light-only)
+   and emits every value as a --mui-* CSS variable
+   (cssVariables: true).
+
+   @theme inline exposes those variables as semantic Tailwind
+   utilities, so both styling systems share one source of
+   truth:
+
+     text-primary / bg-primary / border-primary   VU burgundy
+     bg-primary-dark                              hover shade
+     bg-canvas                                    page background
+     bg-surface                                   card / paper background
+     text-content                                 default text
+     text-muted                                   secondary text
+     border-edge                                  dividers and borders
+     shadow-card                                  content-card shadow
+
+   Prefer these tokens over raw arbitrary values
+   (bg-[#7B003F], bg-(--mui-palette-primary-main), ...).
+----------------------------------------------------------- */
+
+@layer theme, base, mui, components, utilities;
+@import "tailwindcss";
+
+@theme inline {
+  --color-primary: var(--mui-palette-primary-main);
+  --color-primary-dark: var(--mui-palette-primary-dark);
+  --color-canvas: var(--mui-palette-background-default);
+  --color-surface: var(--mui-palette-background-paper);
+  --color-content: var(--mui-palette-text-primary);
+  --color-muted: var(--mui-palette-text-secondary);
+  --color-edge: var(--mui-palette-divider);
+}
+
+/* Static tokens (no MUI variable behind them) */
+@theme {
+  /* The house content-card shadow — soft grey. Every shadowed
+     card uses this one value. */
+  --shadow-card: 2px 4px 10px 1px rgba(201, 201, 201, 0.47);
+}

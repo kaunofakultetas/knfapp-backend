@@ -1,0 +1,12 @@
+{
+  "TITLE": "Ištrintos nuorodos",
+  "COLUMNS": {
+    "sourceUrl": "Šaltinio nuoroda",
+    "deletedBy": "Ištrynė",
+    "deletedAt": "Ištrinta"
+  },
+  "restore_title": "Grąžinti straipsnį?",
+  "restore": "Grąžinti",
+  "restore_note": "Nuoroda pašalinama iš praleidimo sąrašo — straipsnis grįš per artimiausią rinkimą, jei svetainė jį vis dar rodo. Niekas nesiunčiama iš karto.",
+  "restored_toast": "Nuoroda grąžinta"
+}
