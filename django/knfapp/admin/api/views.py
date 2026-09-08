@@ -17,6 +17,10 @@
 #    admin_stats
 #    send_admin_notification / broadcast_job_status
 #    list_reports / resolve_report
+#    list_audit
+#    list_uploads
+#    get_reported_message
+#    list_tombstones / restore_tombstone
 ############################################################
 
 
@@ -34,12 +38,15 @@ from django.db.models import Count
 
 
 from knfapp.admin.audit import write_audit
+from knfapp.admin.models import AdminAudit
+from knfapp.chat.models import Message
 from knfapp.common import ratelimit
 from knfapp.common.http import get_json_object, json_error, json_response
 from knfapp.common.timestamps import parse_stored, utc_now_iso
-from knfapp.news.models import NewsComment, NewsPost
+from knfapp.news.models import DeletedSourceUrl, NewsComment, NewsPost
 from knfapp.notifications.models import PushToken
 from knfapp.social.models import Report
+from knfapp.uploads.models import Upload
 from knfapp.users.auth import require_role
 from knfapp.users.erasure import erase_user_account
 from knfapp.users.models import ROLES, PRIVILEGED_ROLES, InvitationCode, Session, User
@@ -933,3 +940,236 @@ def resolve_report(request, report_id):
                 {"from": row["status"], "to": new_status})
 
     return json_response({"status": new_status})
+
+
+
+
+
+
+
+
+############################################################
+# list_audit
+############################################################
+#
+# GET /api/admin/audit
+#
+# The trail every mutating handler here writes, newest
+# first, admin-only — this is the record of who wielded the
+# console, so curators reading it would see admin actions
+# they cannot see the subjects of. Same optional
+# ?limit/?offset pair as the sibling listings. The payload
+# column holds the JSON write_audit serialised; it comes
+# back parsed, and a hand-edited unparsable row falls back
+# to the raw string rather than 500ing the listing. Reading
+# the trail deliberately leaves no trail of its own.
+#
+# Used by:
+#   - the admin panel's audit view
+############################################################
+
+@require_role("admin")
+def list_audit(request):
+    limit, offset, error = _pagination_clause(request)
+    if error:
+        return json_error(error, 400)
+
+    rows = _page(
+        AdminAudit.objects.select_related("actor").order_by("-created_at"),
+        limit, offset,
+    )
+
+    def _payload(raw):
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw
+
+    return json_response({
+        "audit": [
+            {
+                "id": r.id,
+                "actorId": r.actor_id,
+                "actorName": r.actor.display_name if r.actor else None,
+                "action": r.action,
+                "target": r.target,
+                "payload": _payload(r.payload),
+                "createdAt": r.created_at,
+            }
+            for r in rows
+        ]
+    })
+
+
+
+
+
+
+
+
+############################################################
+# list_uploads
+############################################################
+#
+# GET /api/admin/uploads
+#
+# The whole ownership ledger, newest first, admin-only: one
+# row per stored file with its owner's name (None for the
+# ownerless rows an erasure leaves behind — exactly the
+# files an admin wants to find and sweep). The url field is
+# ready to open (the file GET is public), and the existing
+# owner-or-admin DELETE /api/uploads/<filename> removes a
+# row from here. Same optional ?limit/?offset pair as the
+# sibling listings.
+#
+# Used by:
+#   - the admin panel's stored-files view
+############################################################
+
+@require_role("admin")
+def list_uploads(request):
+    limit, offset, error = _pagination_clause(request)
+    if error:
+        return json_error(error, 400)
+
+    rows = _page(
+        Upload.objects.select_related("user").order_by("-created_at"),
+        limit, offset,
+    )
+
+    return json_response({
+        "uploads": [
+            {
+                "id": r.id,
+                "filename": r.filename,
+                "url": f"/api/uploads/{r.filename}",
+                "userId": r.user_id,
+                "userName": r.user.display_name if r.user else None,
+                "size": r.byte_size,
+                "createdAt": r.created_at,
+            }
+            for r in rows
+        ]
+    })
+
+
+
+
+
+
+
+
+############################################################
+# get_reported_message
+############################################################
+#
+# GET /api/admin/messages/<message_id>
+#
+# The moderation window into chat: every other message read
+# is membership-scoped, so a report against a message used
+# to hand the queue nothing but an id. Admin AND curator —
+# the same pair that reads the report queue — may fetch the
+# reported message itself: sender, room, text and the
+# attachment facts, with deleted/edited stamps included (an
+# unsent message is often exactly what was reported). A
+# soft-deleted row still answers here on purpose. Reads are
+# not audited anywhere in this module; this one is no
+# exception.
+#
+# Used by:
+#   - the admin panel's report details view
+############################################################
+
+@require_role("admin", "curator")
+def get_reported_message(request, message_id):
+    row = (
+        Message.objects.select_related("sender", "conversation")
+        .filter(id=message_id)
+        .first()
+    )
+    if row is None:
+        return json_error("Message not found", 404)
+
+    return json_response({
+        "id": row.id,
+        "conversationId": row.conversation_id,
+        "conversationType": row.conversation.type,
+        "senderId": row.sender_id,
+        "senderName": row.sender.display_name,
+        "text": row.text,
+        "kind": row.kind,
+        "imageUrl": row.image_url,
+        "attachmentName": row.attachment_name,
+        "deletedAt": row.deleted_at,
+        "editedAt": row.edited_at,
+        "createdAt": row.created_at,
+    })
+
+
+
+
+
+
+
+
+############################################################
+# list_tombstones / restore_tombstone
+############################################################
+#
+# GET  /api/admin/tombstones
+# POST /api/admin/tombstones/restore
+#
+# The scraper skip-list: deleting a scraped post tombstones
+# its source_url so the next run cannot resurrect it — and
+# until now the only way to SEE or undo that was SQL. The
+# listing is the table verbatim (admin-only, newest first,
+# the sibling ?limit/?offset pair). The restore lifts one
+# tombstone by exact source_url — the article returns on
+# the scraper's next pass over a page that still carries it;
+# nothing is re-fetched eagerly. Restoring is a privileged
+# write, so it is audited; a url that is not tombstoned is
+# a 404, and restoring twice answers exactly that.
+#
+# Used by:
+#   - the admin panel's deleted-sources view
+############################################################
+
+@require_role("admin")
+def list_tombstones(request):
+    limit, offset, error = _pagination_clause(request)
+    if error:
+        return json_error(error, 400)
+
+    rows = _page(
+        DeletedSourceUrl.objects.select_related("deleted_by").order_by("-deleted_at"),
+        limit, offset,
+    )
+
+    return json_response({
+        "tombstones": [
+            {
+                "sourceUrl": r.source_url,
+                "deletedAt": r.deleted_at,
+                "deletedById": r.deleted_by_id,
+                "deletedByName": r.deleted_by.display_name if r.deleted_by else None,
+            }
+            for r in rows
+        ]
+    })
+
+
+@require_role("admin")
+def restore_tombstone(request):
+    data = get_json_object(request)
+    source_url = data.get("source_url") if data else None
+    if not isinstance(source_url, str) or not source_url.strip():
+        return json_error("source_url is required", 400)
+
+    deleted, _ = DeletedSourceUrl.objects.filter(source_url=source_url).delete()
+    if deleted == 0:
+        return json_error("Tombstone not found", 404)
+
+    write_audit(request.user["id"], "tombstone.restore", source_url)
+    return json_response({"status": "restored"})

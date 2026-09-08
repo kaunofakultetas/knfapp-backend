@@ -3307,6 +3307,220 @@ paths:
         "404":
           description: Report not found
 
+  /admin/audit:
+    get:
+      tags: [admin]
+      summary: Read the audit trail (admin only)
+      description: >
+        Every privileged mutation writes one admin_audit row (invitation
+        mint/revoke, role/active change, erasure, broadcast, report status,
+        tombstone restore); this lists them newest first with the actor's
+        display name (null once the actor account was erased). Reading the
+        trail is not itself audited.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Optional page size 1..500; omit both params to get every row
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Audit entries, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  audit:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AdminAuditEntry"
+        "400":
+          description: limit/offset out of range
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+        "403":
+          description: Not an admin
+
+  /admin/uploads:
+    get:
+      tags: [admin]
+      summary: List every stored file (admin only)
+      description: >
+        The ownership ledger behind /uploads, newest first: one row per
+        stored file with its owner's display name (null for the ownerless
+        rows an account erasure leaves behind). Deleting goes through the
+        existing owner-or-admin DELETE /uploads/{filename}.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Optional page size 1..500; omit both params to get every row
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Stored files, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uploads:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AdminUpload"
+        "400":
+          description: limit/offset out of range
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+        "403":
+          description: Not an admin
+
+  /admin/messages/{messageId}:
+    get:
+      tags: [admin]
+      summary: Fetch a reported chat message (admin or curator)
+      description: >
+        The moderation window into chat — every other message read is
+        membership-scoped, so the report queue's message targets would
+        otherwise be bare ids. Soft-deleted (unsent) messages still answer
+        here on purpose, with their deletedAt stamp.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: messageId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The message with its sender and room facts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminMessage"
+        "401":
+          description: Authentication required
+        "403":
+          description: Not an admin or curator
+        "404":
+          description: Message not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /admin/tombstones:
+    get:
+      tags: [admin]
+      summary: List the scraper skip-list (admin only)
+      description: >
+        The deleted_source_urls tombstones — one row per scraped article an
+        admin deleted, keeping the scrapers from resurrecting it. Newest
+        first.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Optional page size 1..500; omit both params to get every row
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Tombstones, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tombstones:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AdminTombstone"
+        "400":
+          description: limit/offset out of range
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+        "403":
+          description: Not an admin
+
+  /admin/tombstones/restore:
+    post:
+      tags: [admin]
+      summary: Lift one tombstone (admin only; audited)
+      description: >
+        Removes the exact source_url from the skip-list, so the article may
+        return on the scraper's next pass over a page that still carries it
+        — nothing is re-fetched eagerly. Restoring twice answers the same
+        404 as a url that was never tombstoned.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_url]
+              properties:
+                source_url:
+                  type: string
+      responses:
+        "200":
+          description: '{"status": "restored"}'
+        "400":
+          description: source_url missing or blank
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Authentication required
+        "403":
+          description: Not an admin
+        "404":
+          description: That url is not tombstoned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   # ── Scraper ───────────────────────────────────────────────────────────────
 
   /scraper/status:
@@ -4720,6 +4934,102 @@ components:
         activeInvitations:
           type: integer
           description: Codes with uses left that have not expired
+
+    AdminAuditEntry:
+      type: object
+      properties:
+        id:
+          type: string
+        actorId:
+          type: string
+          nullable: true
+          description: Null once the acting account was erased
+        actorName:
+          type: string
+          nullable: true
+        action:
+          type: string
+          description: >
+            One of invitation.create, invitation.revoke, user.role,
+            user.active, user.delete, notification.broadcast, report.status,
+            tombstone.restore
+        target:
+          type: string
+          nullable: true
+        payload:
+          nullable: true
+          description: The action's context as written (parsed JSON, usually an object)
+        createdAt:
+          type: string
+
+    AdminUpload:
+      type: object
+      properties:
+        id:
+          type: string
+        filename:
+          type: string
+        url:
+          type: string
+          description: Ready to open — the file GET is public
+        userId:
+          type: string
+          nullable: true
+          description: Null for ownerless files left behind by an erasure
+        userName:
+          type: string
+          nullable: true
+        size:
+          type: integer
+        createdAt:
+          type: string
+
+    AdminMessage:
+      type: object
+      properties:
+        id:
+          type: string
+        conversationId:
+          type: string
+        conversationType:
+          type: string
+        senderId:
+          type: string
+        senderName:
+          type: string
+        text:
+          type: string
+        kind:
+          type: string
+        imageUrl:
+          type: string
+          nullable: true
+        attachmentName:
+          type: string
+          nullable: true
+        deletedAt:
+          type: string
+          nullable: true
+          description: Set when the message was unsent — still served here
+        editedAt:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+
+    AdminTombstone:
+      type: object
+      properties:
+        sourceUrl:
+          type: string
+        deletedAt:
+          type: string
+        deletedById:
+          type: string
+          nullable: true
+        deletedByName:
+          type: string
+          nullable: true
 
     User:
       type: object

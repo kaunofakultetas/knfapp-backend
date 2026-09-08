@@ -335,9 +335,12 @@ urlpatterns += [
 # Invitation codes (curators scoped to their own mintable-
 # role ones), the user directory with the continuity-guarded
 # role/active editor and the GDPR erasure, the dashboard
-# counters, the broadcast job pair, and the complaint queue.
-# Every route is role-gated in the views; every mutation
-# writes an admin_audit row.
+# counters, the broadcast job pair, the complaint queue, and
+# the oversight reads the web panel runs on: the audit
+# trail, the stored-file ledger, the reported-message
+# window, and the scraper skip-list with its restore. Every
+# route is role-gated in the views; every mutation writes an
+# admin_audit row.
 ############################################################
 
 from knfapp.admin.api.views import (
@@ -346,10 +349,15 @@ from knfapp.admin.api.views import (
     create_invitation,
     delete_invitation,
     delete_user,
+    get_reported_message,
+    list_audit,
     list_invitations,
     list_reports,
+    list_tombstones,
+    list_uploads,
     list_users,
     resolve_report,
+    restore_tombstone,
     send_admin_notification,
     update_user,
 )
@@ -373,6 +381,11 @@ urlpatterns += [
     path("api/admin/notifications/<str:job_id>", broadcast_job_status),# GET — the job record, or 404
     path("api/admin/reports", list_reports),                           # GET — the complaint queue
     path("api/admin/reports/<str:report_id>", resolve_report),         # PUT — open <-> resolved
+    path("api/admin/audit", list_audit),                               # GET — the audit trail, admin-only
+    path("api/admin/uploads", list_uploads),                           # GET — the stored-file ledger
+    path("api/admin/messages/<str:message_id>", get_reported_message), # GET — a reported message, any room
+    path("api/admin/tombstones", list_tombstones),                     # GET — the scraper skip-list
+    path("api/admin/tombstones/restore", restore_tombstone),           # POST — lift one tombstone
 ]
 
 
@@ -551,4 +564,28 @@ urlpatterns += [
     path("api/wayfind/captures/<str:capture_id>/frames/<str:target_id>", upload_capture_frame),  # PUT — one frame + pose
     path("api/wayfind/captures/<str:capture_id>/finish", finish_capture),           # POST — queue the stitch
     path("api/wayfind/captures/<str:capture_id>", get_capture),                     # GET — status / report / pano
+]
+
+
+
+
+
+
+
+
+############################################################
+# Ops — the readiness probe
+############################################################
+#
+# The one unauthenticated operational route: database
+# answering, uploads writable. Described in swagger and
+# meant for a manual curl after a deploy (nothing polls it).
+#
+# View lives in knfapp/ops/api/.
+############################################################
+
+from knfapp.ops.api.views import health
+
+urlpatterns += [
+    path("api/health", health),                            # GET — 200 ok / 503 with the first reason
 ]
