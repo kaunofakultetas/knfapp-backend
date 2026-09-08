@@ -1,0 +1,147 @@
+############################################################
+#  [*] Regression tests — self-service erasure and export
+#
+#  DELETE /api/auth/me is password-confirmed on the change-
+#  password failure budget, refuses to take the last active
+#  admin down, and runs the shared erasure: the users row
+#  survives anonymised (bcrypt-shaped unreachable hash, the
+#  Lithuanian marker), authored posts tombstone, fed
+#  counters decrement while the rows still exist, uploads
+#  leave the disk, comments stay (they pick the marker up
+#  at read time). The export answers every stored section,
+#  an empty one as [] — never a 500.
+############################################################
+
+
+import json
+import os
+import shutil
+import tempfile
+import uuid
+
+
+from django.test import Client, TestCase
+
+
+from knfapp.common import ratelimit
+from knfapp.common.timestamps import utc_now_iso
+from knfapp.news.models import NewsComment, NewsLike, NewsPost
+from knfapp.social.models import Friendship
+from knfapp.uploads import storage
+from knfapp.uploads.models import Upload
+from knfapp.users import auth
+from knfapp.users.models import Session, User
+from .utils import PASSWORD, bearer, befriend, create_post, create_user
+
+
+class DeleteMeTests(TestCase):
+
+    def setUp(self):
+        ratelimit.reset()
+        self.user = create_user(username="tomas")
+        self.token = auth.mint_session(self.user.id)
+        self.client = Client()
+
+    def _delete(self, password=PASSWORD, token=None):
+        return bearer(self.client.delete, "/api/auth/me", token or self.token,
+                      data=json.dumps({"password": password}), content_type="application/json")
+
+    def test_a_wrong_password_spends_the_change_password_budget(self):
+        response = self._delete(password="neteisingas")
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(json.loads(response.content)["code"], "invalid_credentials")
+        self.assertTrue(User.objects.get(id=self.user.id).active)
+        # Same bucket as change-password: the failures pool
+        for _ in range(9):
+            self._delete(password="neteisingas")
+        self.assertEqual(self._delete().status_code, 429)
+
+    def test_the_erasure_inventory(self):
+        tmp = tempfile.mkdtemp(prefix="knfapp-erasure-")
+        storage._upload_dir = tmp
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        self.addCleanup(lambda: setattr(storage, "_upload_dir", None))
+
+        # A file on disk, a tombstonable post, a like feeding a
+        # counter, a comment that must SURVIVE, a friendship
+        filename = f"{uuid.uuid4().hex}.jpg"  # the shape storage writes — the RE gate admits no other
+        open(os.path.join(tmp, filename), "wb").write(b"bytes")
+        Upload.objects.create(id=str(uuid.uuid4()), filename=filename, user_id=self.user.id,
+                              byte_size=5, created_at=utc_now_iso())
+        own_post = create_post(author=self.user, source="user", post_type="social",
+                               image_url=f"/api/uploads/{filename}")
+        other = create_user(username="kitas")
+        their_post = create_post(author=other, source="user", post_type="social", likes_count=1)
+        NewsLike.objects.create(post_id=their_post.id, user_id=self.user.id, created_at=utc_now_iso())
+        NewsComment.objects.create(id=str(uuid.uuid4()), post_id=their_post.id, user_id=self.user.id,
+                                   text="Sveikinu", created_at=utc_now_iso())
+        befriend(self.user, other)
+
+        self.assertEqual(self._delete().status_code, 200)
+
+        row = User.objects.get(id=self.user.id)
+        self.assertEqual(row.display_name, "Ištrintas naudotojas")
+        self.assertEqual(row.username, f"deleted-{self.user.id}")
+        self.assertEqual(row.active, 0)
+        self.assertTrue(row.password_hash.startswith("$2"))  # bcrypt-shaped, never '!'
+        self.assertIsNone(row.avatar_url)
+
+        self.assertFalse(os.path.exists(os.path.join(tmp, filename)))
+        own_post.refresh_from_db()
+        self.assertIsNone(own_post.image_url)
+        self.assertEqual(own_post.author_name, "Ištrintas naudotojas")
+
+        their_post.refresh_from_db()
+        self.assertEqual(their_post.likes_count, 0)
+        self.assertEqual(NewsLike.objects.filter(user_id=self.user.id).count(), 0)
+        self.assertEqual(NewsComment.objects.filter(user_id=self.user.id).count(), 1)
+        self.assertEqual(Friendship.objects.count(), 0)
+        self.assertEqual(Session.objects.filter(user_id=self.user.id).count(), 0)
+        self.assertEqual(bearer(self.client.get, "/api/auth/me", self.token).status_code, 401)
+
+    def test_the_last_active_admin_cannot_delete_themselves(self):
+        admin = create_user(username="vadovas", role="admin")
+        token = auth.mint_session(admin.id)
+        response = self._delete(token=token)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("last active admin", json.loads(response.content)["error"])
+        # A second active admin unblocks the same request
+        create_user(username="pavaduotojas", role="admin")
+        self.assertEqual(self._delete(token=token).status_code, 200)
+
+
+class ExportMeTests(TestCase):
+
+    def setUp(self):
+        ratelimit.reset()
+        self.user = create_user(username="tomas")
+        self.token = auth.mint_session(self.user.id)
+        self.client = Client()
+
+    def _export(self):
+        return bearer(self.client.get, "/api/auth/me/export", self.token)
+
+    def test_the_export_carries_every_section_and_no_hash(self):
+        create_post(author=self.user, source="user", post_type="social")
+        response = self._export()
+        self.assertEqual(response.status_code, 200)
+        payload = json.loads(response.content)
+
+        for section in ("profile", "posts", "comments", "messages", "conversations", "likes",
+                        "pollVotes", "friends", "friendRequests", "blocks", "reports",
+                        "notificationChannels", "uploads"):
+            self.assertIn(section, payload)
+
+        self.assertEqual(payload["profile"]["username"], "tomas")
+        self.assertNotIn("password_hash", payload["profile"])
+        self.assertEqual(len(payload["posts"]), 1)
+        # A user with no chat rows gets empty sections, not nulls
+        self.assertEqual(payload["messages"], [])
+        self.assertEqual(payload["conversations"], [])
+
+    def test_the_export_budget_is_five_per_window(self):
+        for _ in range(5):
+            self.assertEqual(self._export().status_code, 200)
+        response = self._export()
+        self.assertEqual(response.status_code, 429)
+        self.assertTrue(response.headers["Retry-After"])

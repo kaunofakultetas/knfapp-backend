@@ -1,0 +1,11 @@
+# The scheduled ticks (the container runs on host time — see
+# /etc/localtime in the compose file): news every 20 min,
+# timetables every 6 h, faculty info and housekeeping daily at
+# night. There is no startup one-shot: cron fires on schedule
+# whatever the containers did, so a restart storm never hammers
+# the source sites. Push receipts need no line — the watcher
+# thread lives in the process that sends (notifications/push.py).
+*/20 * * * *  docker exec knfapp-django python3 manage.py scrape_news
+15 */6 * * *  docker exec knfapp-django python3 manage.py scrape_schedule
+40 3 * * *    docker exec knfapp-django python3 manage.py scrape_info
+20 4 * * *    docker exec knfapp-django python3 manage.py maintenance

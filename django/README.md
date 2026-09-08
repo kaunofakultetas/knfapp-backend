@@ -1,0 +1,127 @@
+# knfapp — Django backend
+
+The faculty app's API service: **no admin site, no contrib.auth, no
+cookies**. The API authenticates with opaque bearer tokens against
+its own tables, all configuration arrives through env variables,
+and the whole URL surface reads as one table of contents in
+`knfapp/urls.py`. The wire contract is `swagger/swagger.yaml` — the
+mobile app translates machine `code` slugs and never parses the
+English `error` prose.
+
+Not wired into docker-compose yet: this image (plus the stack-level
+`cron/` container) joins the compose file at cutover.
+
+## Layout
+
+```
+manage.py                 Django entry point
+knfapp/settings.py        the whole configuration (env-driven)
+knfapp/urls.py            every /api/* route, grouped by app
+knfapp/wsgi.py            gunicorn entry: socket.io wrapping Django,
+                          and the wayfind stitch worker's start
+knfapp/common/            http/json helpers, timestamps, rate limits,
+                          raw-SQL dict-row helpers
+knfapp/users/             accounts, invitation codes, bearer sessions,
+                          the GDPR erasure and export
+knfapp/uploads/           stored files: byte gates, atomic store, serve
+knfapp/news/              the ranked feed, posts, likes, comments, polls
+knfapp/social/            profiles, friendships, walls, blocks, reports,
+                          activity
+knfapp/notifications/     push-token registry, channel switches, the
+                          Expo sender (push.py)
+knfapp/chat/              conversations/messages REST + the socket.io
+                          layer (socket.py, events.py), link unfurling
+knfapp/schedule/          the scraped lecture timetable (read side)
+knfapp/info/              the bilingual faculty handbook + scraped
+                          overlay
+knfapp/memes/             the shared meme library
+knfapp/admin/             invitation codes, user management, stats,
+                          broadcast, reports — plus the audit trail
+knfapp/scraper/           the four site scrapers, their run ledger and
+                          admin trigger routes, management commands
+knfapp/wayfind/           the indoor map: building graph drafts and
+                          publishes, panoramas/plans, guided captures,
+                          the stitch worker
+knfapp/tests/             the regression suite (see below)
+schema.dbml               the database diagram (paste into dbdiagram.io)
+```
+
+## Authentication
+
+Opaque bearer sessions (`knfapp/users/auth.py`): register/login mint
+a uuid4 token, the DB stores its **sha256**, expiry is 30 days with
+a lazy purge that takes the owner's push tokens with it, deactivated
+accounts are locked out on live sessions, and login is
+timing-equalized with a dummy bcrypt check. `@require_auth` /
+`@require_role` attach the resolved user to `request.user`.
+
+## Serving
+
+One gunicorn **gthread worker with many threads** — not a worker
+pool: chat presence, the socket.io rooms and the per-event socket
+rate limiter are in-process state (`chat/socket.py`). The socket
+transport is polling only; `/socket.io/*` and `/api/*` are served by
+the same container behind Caddy. A `DJANGO_DEBUG` runserver serves
+REST only (no socket layer, no stitch worker — both start from
+`knfapp/wsgi.py`).
+
+Scheduled work lives in the stack-level `cron/` container (busybox
+crond + docker CLI) exec-ing the management commands:
+`scrape_news` (20 min), `scrape_schedule` (6 h), `scrape_info`
+(daily) and `maintenance` (daily: expired sessions, orphaned push
+tokens, abandoned scraper runs, the disappearing-messages backstop
+sweep). Its compose block:
+
+```yaml
+  knfapp-cron:
+    container_name: knfapp-cron
+    image: knfapp-cron
+    build: ./cron
+    user: root
+    read_only: true
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: none
+    restart: unless-stopped
+```
+
+## Tests
+
+Smart regression pins, not input-permutation sweeps: every case
+protects one decision a rewrite must not lose (the sessions table's
+contents, the invitation-code rejection order, the feed's two score
+formulas, the chat paging cursor's stamp tie-break, the wayfind op
+log's idempotency, the stitcher's centre-column contract, …). Run
+them with `./runTests.sh` — it builds the image and runs the suite
+in a throwaway container on in-memory SQLite, with
+`makemigrations --check` guarding the migrations against model
+drift.
+
+## Data
+
+The models keep the production database's table/column names, TEXT
+uuid keys and ISO-8601 text stamps, so the cutover is a row copy —
+never a schema rewrite. The copy is a command:
+
+```
+python3 manage.py migrate --noinput
+python3 manage.py copy_production_data --source /data/live.sqlite3
+```
+
+It pre-flight-validates the source (enum values against the CHECK
+constraints, NULLs in required columns — bad data aborts with a
+report, nothing is silently dropped), copies in one transaction,
+and heals the known quirks on the way: dangling message quote
+references are NULLed, timetable NULL-teacher duplicates collapse,
+`poll_options.position` is numbered from the stored order, the
+denormalised counters are recomputed from child rows, and the
+message search shadow is rebuilt. A post-flight pass compares row
+counts and runs `foreign_key_check`.
+
+SQLite serves with WAL, a 5 s busy timeout and NORMAL synchronous
+(set per connection from settings). Raw SQL keeps SQLite spellings
+where they earn their keep (the feed scoring's julianday,
+`INSERT OR IGNORE`, the FTS5 search, the admin stats GLOB) —
+flagged in place for a later postgres move, which is otherwise a
+`DATABASE_URL` change.

@@ -2,7 +2,7 @@
 .env
 /docker-compose.yml
 /.claude
-
+/_DEFECTS_*
 
 
 
