@@ -35,17 +35,17 @@ import { useTranslations } from '@/i18n';
 import KeyboardDoubleArrowLeftIcon from '@mui/icons-material/KeyboardDoubleArrowLeft';
 import KeyboardDoubleArrowRightIcon from '@mui/icons-material/KeyboardDoubleArrowRight';
 
-// Pagrindinis
+// HOME
 import DashboardIcon from "@mui/icons-material/Dashboard";
 
-// Valdymas
+// MANAGEMENT
 import PersonOutlineIcon from "@mui/icons-material/PersonOutline";
 import VpnKeyOutlinedIcon from '@mui/icons-material/VpnKeyOutlined';
 import FlagOutlinedIcon from '@mui/icons-material/FlagOutlined';
 import CampaignOutlinedIcon from '@mui/icons-material/CampaignOutlined';
 import HistoryOutlinedIcon from '@mui/icons-material/HistoryOutlined';
 
-// Turinys
+// CONTENT
 import ArticleOutlinedIcon from '@mui/icons-material/ArticleOutlined';
 import CalendarMonthOutlinedIcon from '@mui/icons-material/CalendarMonthOutlined';
 import MenuBookOutlinedIcon from '@mui/icons-material/MenuBookOutlined';
@@ -53,11 +53,11 @@ import ImageOutlinedIcon from '@mui/icons-material/ImageOutlined';
 import FolderOutlinedIcon from '@mui/icons-material/FolderOutlined';
 import LinkOffOutlinedIcon from '@mui/icons-material/LinkOffOutlined';
 
-// Operacijos
+// OPERATIONS
 import CloudSyncOutlinedIcon from '@mui/icons-material/CloudSyncOutlined';
 import MapOutlinedIcon from '@mui/icons-material/MapOutlined';
 
-// Sistema
+// SYSTEM
 import ApiIcon from '@mui/icons-material/Api';
 import StorageIcon from '@mui/icons-material/Storage';
 import PersonIcon from '@mui/icons-material/Person';

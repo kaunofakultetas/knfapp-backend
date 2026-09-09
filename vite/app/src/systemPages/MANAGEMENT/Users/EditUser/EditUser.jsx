@@ -145,7 +145,7 @@ export default function EditUser({ row, authData, onClose }) {
 
   return (
     <UniversalModal
-      open={true}   // always open — the parent mounts/unmounts this component instead
+      open={true}   // the parent mounts/unmounts instead of toggling
       onClose={onClose}
       title={row.displayName || row.username}
       description={`${row.username} · ${row.email}`}

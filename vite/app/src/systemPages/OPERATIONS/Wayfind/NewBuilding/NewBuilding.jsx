@@ -62,7 +62,7 @@ export default function NewBuilding({ onClose }) {
 
   return (
     <UniversalModal
-      open={true}   // always open — the parent mounts/unmounts this component instead
+      open={true}   // the parent mounts/unmounts instead of toggling
       onClose={onClose}
       title={t("new_building")}
       maxWidth={420}

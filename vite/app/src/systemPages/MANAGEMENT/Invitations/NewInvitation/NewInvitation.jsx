@@ -130,7 +130,7 @@ export default function NewInvitation({ authData, onClose }) {
 
   return (
     <UniversalModal
-      open={true}   // always open — the parent mounts/unmounts this component instead
+      open={true}   // the parent mounts/unmounts instead of toggling
       onClose={onClose}
       title={created ? t("created_title") : t("new_invitation")}
       variant={created ? "success" : "default"}
@@ -147,8 +147,6 @@ export default function NewInvitation({ authData, onClose }) {
         <CreatedView invitation={created} t={t} />
       ) : (
         <div className="flex flex-col gap-4 pt-1">
-
-          {/* Role */}
           <TextField
             select
             label={t("COLUMNS.role")}

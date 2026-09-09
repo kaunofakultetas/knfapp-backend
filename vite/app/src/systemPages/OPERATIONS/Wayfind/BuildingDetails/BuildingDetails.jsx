@@ -102,8 +102,8 @@ function IssueList({ issues, t }) {
 // VersionHistory
 // -----------------------------------------------------------
 //
-// Every published revision, newest first: number, note,
-// publisher, time, size.
+// Every published revision, newest first: number, note and
+// publish time.
 //
 // Used by:
 //   - BuildingDetails (below)
@@ -185,7 +185,7 @@ export default function BuildingDetails({ row, authData, onClose }) {
 
   return (
     <UniversalModal
-      open={true}   // always open — the parent mounts/unmounts this component instead
+      open={true}   // the parent mounts/unmounts instead of toggling
       onClose={onClose}
       title={row.name}
       description={row.id}

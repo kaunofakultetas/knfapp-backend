@@ -89,7 +89,7 @@ export default function InvitationDetails({ row, onClose }) {
 
   return (
     <UniversalModal
-      open={true}   // always open — the parent mounts/unmounts this component instead
+      open={true}   // the parent mounts/unmounts instead of toggling
       onClose={onClose}
       title={t("details_title")}
       maxWidth={420}
