@@ -41,7 +41,6 @@
 ############################################################
 
 
-import json
 import logging
 import re
 import threading
@@ -49,8 +48,10 @@ import uuid
 
 from bs4 import BeautifulSoup
 
-from django.db import connection, transaction
+from django.db import transaction
 
+from knfapp.common.timestamps import utc_now
+from knfapp.info.models import FacultyInfo
 from knfapp.scraper.common import (
     KNF_HOSTS,
     close_run,
@@ -60,7 +61,6 @@ from knfapp.scraper.common import (
     open_run,
     prune_scraper_runs,
     run_deadline,
-    utc_now_naive,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,7 +93,7 @@ RUN_BUDGET_SECONDS = 300
 _RUN_LOCK = threading.Lock()
 
 # Academic title prefixes marking a staff entry. Matched
-# with a word boundary so "dr." no longer fires inside
+# with a word boundary so "dr." cannot fire inside
 # "adr."; "vedėj-" carries no dot of its own
 _STAFF_TITLE_RE = re.compile(r"\b(?:prof|doc|dr|lekt|asist)\.|\bvedėj", re.IGNORECASE)
 
@@ -165,7 +165,7 @@ def _fetch_page(url: str) -> BeautifulSoup | None:
 # domain class eats a sentence-ending dot ("rašykite
 # knf@knf.vu.lt." captures the stop as well), so trailing
 # dots are trimmed back off — a mailto: built from the raw
-# match was not a deliverable address.
+# match would not be a deliverable address.
 #
 # Used by:
 #   - _scrape_contacts (below) — paragraph and table-row
@@ -267,7 +267,7 @@ def _faculty_phone(phone: str | None) -> str | None:
 # characters: a number split across elements
 # ("<span>+370</span> <span>37 422 523</span>") reaches the
 # unstripped front-page text with " \n " in the gap, and a
-# one-character class silently dropped the switchboard
+# one-character class would silently drop the switchboard
 # number the whole general_contact block hangs on.
 #
 # Used by:
@@ -303,9 +303,9 @@ def _extract_phone(text: str) -> str | None:
 #
 # _extract_phone answers the first number and nothing else,
 # so a footer listing the university's Vilnius switchboard
-# above the faculty's Kaunas landline lost the landline
-# entirely and general_contact fell back to a hardcoded
-# default. Only the general-contact block needs this — the
+# above the faculty's Kaunas landline would lose the
+# landline entirely and fall back to a hardcoded default.
+# Only the general-contact block needs this — the
 # contacts and staff walks read one entry's own line, where
 # there is nothing to look past.
 #
@@ -515,7 +515,7 @@ def _scrape_contacts(soup: BeautifulSoup | None) -> list[dict]:
 # anchor whose href mentions /studij or /program with more
 # than 8 chars of text, minus "daugiau" ("more") links.
 #
-# The heading/list fallback is per PAGE now: a master page
+# The heading/list fallback is per PAGE: a master page
 # that lists no program links still gets its fallback even
 # when the bachelor page yielded plenty. seen_names, by
 # contrast, is shared across both pages, so a program listed
@@ -586,8 +586,8 @@ def _scrape_programs(bachelor_soup: BeautifulSoup | None,
 
         # STEP 3: fallback to headings/list items mentioning
         # "studij" — gated on THIS page's result, so one page
-        # yielding links no longer silences the other's fallback
-        # ======================================================
+        # yielding links cannot silence the other's fallback
+        # ===================================================
         if not from_this_page:
             for el in content_el.find_all(_FALLBACK_TAGS):
                 name = _fallback_programme(el)
@@ -596,7 +596,7 @@ def _scrape_programs(bachelor_soup: BeautifulSoup | None,
 
                 # An element wrapping another programme label is
                 # the listing around it, not an entry of its own:
-                # a <li> holding a <strong> published the same
+                # a <li> holding a <strong> would publish the same
                 # programme twice, the outer copy with its words
                 # glued together
                 if any(_fallback_programme(inner) for inner in el.find_all(_FALLBACK_TAGS)):
@@ -630,7 +630,7 @@ def _scrape_programs(bachelor_soup: BeautifulSoup | None,
 #
 # Flattened with a space separator, so a card written as
 # "<li><strong>Informatikos studijų programa</strong>
-# nuolatinės</li>" no longer glues its words together.
+# nuolatinės</li>" does not glue its words together.
 #
 # Used by:
 #   - _scrape_programs (above) — the heading/list fallback,
@@ -751,12 +751,11 @@ def _program_entry(name: str, page_degree: str, card_text: str) -> dict:
 # chars and either carries an institutional email or has a
 # Lithuanian academic title (prof., doc., dr., lekt.,
 # asist., vedėj-) AND reads like a person's name. The title
-# is matched on a word boundary, so "dr." no longer fires
+# is matched on a word boundary, so "dr." cannot fire
 # inside "adr.", and a line that merely mentions a title
 # without a name-shaped token is not filed as a person.
-# Only LEAF candidates are read — a <p> inside an <li> used
-# to be visited twice, once through each — and "a" is no
-# longer walked (it never had a branch).
+# Only LEAF candidates are read — a <p> inside an <li> is
+# one entry, not two.
 #
 # name is the text up to the first comma, academic title
 # INCLUDED ("Prof. dr. Jonas Jonaitis"). position is what
@@ -767,7 +766,7 @@ def _program_entry(name: str, page_degree: str, card_text: str) -> dict:
 # or a phone number standing there is contact detail and is
 # dropped, mobile numbers included (see _contact_detail).
 # The text is flattened with a space separator, so
-# "<strong>Prof. dr.</strong>Jonas" no longer glues.
+# "<strong>Prof. dr.</strong>Jonas" does not glue.
 #
 # Departments with no staff are dropped; None or a page
 # without a known content container yields [].
@@ -907,10 +906,11 @@ def _name_shaped(text: str) -> bool:
 #
 # The digit test is the point. _faculty_phone refuses to put
 # a lecturer's mobile in the `phone` field because it is
-# personal data, and the position slot was republishing the
-# very same number verbatim on the unauthenticated
-# /api/info. A room ("302 kab.") or a year stays a position:
-# three or four digits are not a phone number.
+# personal data, and without this test the position slot
+# would republish the very same number verbatim on the
+# unauthenticated /api/info. A room ("302 kab.") or a year
+# stays a position: three or four digits are not a phone
+# number.
 #
 # Used by:
 #   - _scrape_staff (above) — the position guard
@@ -944,8 +944,8 @@ def _contact_detail(part: str) -> bool:
 # that merely ENDS in the mailbox name
 # ("administracija-knf@knf.vu.lt") is that department's own
 # address and not the general one — publishing the truncated
-# "knf@knf.vu.lt" put an address on /api/info that the page
-# never stated.
+# "knf@knf.vu.lt" would put an address on /api/info that the
+# page never stated.
 #
 # Used by:
 #   - _scrape_general_contact (below) — the contact block
@@ -977,14 +977,14 @@ def _general_mailbox(text: str) -> str | None:
 # actually yielded — {} when the page failed to fetch or
 # nothing matched. That is what lets the caller's "non-empty
 # sections only" rule protect general_contact the way it
-# already protects contacts and programs: a bad scrape no
-# longer overwrites good stored values with hardcoded
-# defaults (the caller fills the gaps from the stored blob
-# and GENERAL_CONTACT_DEFAULTS).
+# protects contacts and programs: a bad scrape cannot
+# overwrite good stored values with hardcoded defaults
+# (the caller fills the gaps from the stored blob and
+# GENERAL_CONTACT_DEFAULTS).
 #
 # The phone is searched in the footer / contact block only,
 # not the whole front page, and has to be a faculty landline
-# — the first number anywhere on the page was routinely
+# — the first number anywhere on the page is routinely
 # something else entirely. Every number in that block is
 # tried, not just the first: the university's Vilnius
 # switchboard is often written above the faculty's own.
@@ -1029,7 +1029,7 @@ def _scrape_general_contact(main_soup: BeautifulSoup | None) -> dict:
 
     # STEP 3: the switchboard number, from the contact block
     # only — the first number the faculty gate ACCEPTS, so a
-    # Vilnius number written above it no longer hides it
+    # Vilnius number written above it cannot hide it
     # ======================================================
     phone = _faculty_phone_in(contact_text)
     if phone:
@@ -1061,9 +1061,8 @@ def _scrape_general_contact(main_soup: BeautifulSoup | None) -> dict:
 # Runs one extractor and answers (value, error message).
 # A section that throws is logged with its traceback and
 # reported as an error string instead of taking the whole
-# run down with it — before this a single dead page (the
-# contacts one) failed 62 runs out of 62 and cost the
-# programs and general contact fetched alongside it.
+# run down with it — a dead page costs its own section,
+# never the ones fetched alongside it.
 #
 # Used by:
 #   - scrape_faculty_info (above) — once per section
@@ -1107,8 +1106,9 @@ def _extract_section(name: str, extractor, *args):
 # extractors are None-safe, so a page that did not download
 # simply costs its own section.
 #
-# scraped_at is a NAIVE UTC ISO string with a 'T', matching
-# the house shape the info views' staleness check parses.
+# scraped_at is stamped once for the whole run — the aware
+# UTC instant the info views' staleness check measures
+# against its freshness window.
 #
 # Used by:
 #   - management/commands/scrape_info.py — every 24 h
@@ -1209,7 +1209,7 @@ def _run(run_id, deadline):
         # laid over the stored blob, which is itself laid over
         # the hardcoded defaults
         # ====================================================
-        now = utc_now_naive().isoformat()
+        now = utc_now()
 
         scraped_data_lt = {}
         if contacts:
@@ -1267,30 +1267,23 @@ def _run(run_id, deadline):
 # _stored_section
 ############################################################
 #
-# The blob a previous run stored for one (lang, section), as
-# a dict — {} when there is none or it does not decode. Used
-# to keep a good general_contact field alive through a run
-# that only matched some of them.
+# The blob a previous run stored for one (lang, section),
+# as a dict — {} when there is none or it is not a dict
+# (data_json is a JSON column, so the ORM hands the stored
+# structure back directly). Used to keep a good
+# general_contact field alive through a run that only
+# matched some of them.
 #
 # Used by:
 #   - scrape_faculty_info (above) — the general_contact merge
 ############################################################
 
 def _stored_section(lang: str, section: str) -> dict:
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT data_json FROM faculty_info WHERE lang = %s AND section = %s",
-            (lang, section),
-        )
-        row = cursor.fetchone()
-    if not row:
-        return {}
-
-    try:
-        stored = json.loads(row[0])
-    except (ValueError, TypeError):
-        return {}
-
+    stored = (
+        FacultyInfo.objects.filter(lang=lang, section=section)
+        .values_list("data_json", flat=True)
+        .first()
+    )
     return stored if isinstance(stored, dict) else {}
 
 
@@ -1308,47 +1301,42 @@ def _stored_section(lang: str, section: str) -> dict:
 # how many sections actually CHANGED — the number
 # scrape_faculty_info reports as articles_new, which is the
 # only figure that means anything for this source. The blob
-# is compared with the stored one before writing; an
-# unchanged section still has its scraped_at refreshed (the
-# info views drop sections they consider stale), it just
-# does not count as new.
+# is compared with the stored one before writing —
+# structural equality on the JSON column's value, so key
+# order cannot fake a change; an unchanged section still
+# has its scraped_at refreshed (the info views drop
+# sections they consider stale), it just does not count as
+# new.
 #
-# Per section: SELECT the (lang, section) row, UPDATE it in
-# place (its id survives re-scrapes) or INSERT a fresh uuid4
+# Per section: read the (lang, section) row, update it in
+# place (its id survives re-scrapes) or insert a fresh uuid4
 # row. One transaction.atomic() covers every section, so a
 # mid-loop failure rolls back wholesale.
-# ensure_ascii=False keeps Lithuanian letters readable in
-# DbGate instead of \uXXXX escapes.
 #
 # Used by:
 #   - scrape_faculty_info (above) — once per run, lang "lt"
 ############################################################
 
-def _store_info(lang: str, data: dict, scraped_at: str) -> int:
+def _store_info(lang: str, data: dict, scraped_at) -> int:
     changed = 0
 
     with transaction.atomic():
-        with connection.cursor() as cursor:
-            for section, section_data in data.items():
-                data_json = json.dumps(section_data, ensure_ascii=False)
-                cursor.execute(
-                    "SELECT id, data_json FROM faculty_info WHERE lang = %s AND section = %s",
-                    (lang, section),
-                )
-                existing = cursor.fetchone()
+        for section, section_data in data.items():
+            existing = (
+                FacultyInfo.objects.filter(lang=lang, section=section)
+                .values("id", "data_json")
+                .first()
+            )
 
-                if existing:
-                    if existing[1] != data_json:
-                        changed += 1
-                    cursor.execute(
-                        "UPDATE faculty_info SET data_json = %s, scraped_at = %s WHERE id = %s",
-                        (data_json, scraped_at, existing[0]),
-                    )
-                else:
+            if existing:
+                if existing["data_json"] != section_data:
                     changed += 1
-                    cursor.execute(
-                        "INSERT INTO faculty_info (id, lang, section, data_json, scraped_at) VALUES (%s, %s, %s, %s, %s)",
-                        (str(uuid.uuid4()), lang, section, data_json, scraped_at),
-                    )
+                FacultyInfo.objects.filter(id=existing["id"]).update(
+                    data_json=section_data, scraped_at=scraped_at,
+                )
+            else:
+                changed += 1
+                FacultyInfo.objects.create(id=str(uuid.uuid4()), lang=lang, section=section,
+                                           data_json=section_data, scraped_at=scraped_at)
 
     return changed

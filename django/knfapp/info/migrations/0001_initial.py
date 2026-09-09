@@ -1,9 +1,13 @@
 ############################################################
-#  [*] info 0001 — the handbook overlay rows
+#  [*] info 0001 — the scraped faculty handbook overlay
 #
-#  Generated from models.py and committed; the suite's
-#  `makemigrations --check` fails on drift, never a deploy.
+#  One table: a JSON blob per (lang, section), UNIQUE on the
+#  pair.
+#
+#  Head of its app's chain; the suite runs `makemigrations
+#  --check`, so drift against models.py fails the tests.
 ############################################################
+
 
 
 from django.db import migrations, models
@@ -23,8 +27,8 @@ class Migration(migrations.Migration):
                 ('id', models.TextField(primary_key=True, serialize=False)),
                 ('lang', models.TextField(default='lt')),
                 ('section', models.TextField()),
-                ('data_json', models.TextField()),
-                ('scraped_at', models.TextField()),
+                ('data_json', models.JSONField()),
+                ('scraped_at', models.DateTimeField()),
             ],
             options={
                 'db_table': 'faculty_info',

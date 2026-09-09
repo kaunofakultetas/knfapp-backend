@@ -5,9 +5,9 @@
 #  hands out, the forced type marker no custom payload may
 #  drop, the byte bound Expo would refuse anyway, the
 #  fan-out finishing even with nobody to send to, and the
-#  registry's eviction discipline — a
-#  job the LRU dropped mid-flight must stay forgotten, not
-#  come back as a half-built record.
+#  registry's eviction discipline — a job the LRU dropped
+#  mid-flight must stay forgotten, not come back as a
+#  half-built record.
 ############################################################
 
 

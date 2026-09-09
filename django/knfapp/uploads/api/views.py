@@ -4,10 +4,9 @@
 #  One POST that accepts a photo (re-encoded), a document,
 #  a video or a voice note; a public GET serving the flat
 #  directory with browser-only caching; an owner-or-admin
-#  DELETE.
-#  Every rejection carries the machine `code` beside the
-#  human `error`, exactly the slugs the mobile app
-#  translates.
+#  DELETE. Every rejection carries the machine `code`
+#  beside the human `error`, exactly the slugs the mobile
+#  app translates.
 #
 #  Split into:
 #
@@ -33,7 +32,7 @@ from django.views.decorators.http import require_POST
 
 from knfapp.common import ratelimit
 from knfapp.common.http import json_error, json_response
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now
 from knfapp.uploads import gates
 from knfapp.uploads.models import Upload
 from knfapp.uploads.storage import (
@@ -165,7 +164,7 @@ def upload_file(request):
 
     Upload.objects.create(
         id=str(uuid.uuid4()), filename=stored_name, user_id=user_id,
-        byte_size=len(blob), created_at=utc_now_iso(),
+        byte_size=len(blob), created_at=utc_now(),
     )
 
     return json_response({
@@ -194,12 +193,13 @@ def upload_file(request):
 ############################################################
 #
 # DELETE /api/uploads/<filename> — the uploader or an admin
-# drops a stored file. An unknown name and someone else's
-# ownerless pre-migration file look the same from outside
-# (404). An already-missing file is still a 200 — the row
-# goes and the caller got what it asked for — but a file
-# that SURVIVES the unlink answers 500 delete_failed rather
-# than lying: this is the erasure and moderation path.
+# drops a stored file. A name with no ownership row is a
+# 404 for everyone but an admin — an unknown name and an
+# orphaned file look the same from outside. An already-
+# missing file is still a 200 — the row goes and the
+# caller got what it asked for — but a file that SURVIVES
+# the unlink answers 500 delete_failed rather than lying:
+# this is the erasure and moderation path.
 #
 # Used by:
 #   - admin/moderation tooling and manual erasure requests
@@ -226,7 +226,7 @@ def delete_file(request, filename):
     except OSError:
         survived = True
     if survived:
-        logger.error("Delete left %s on disk; the sweep will have to collect it", safe_name)
+        logger.error("Delete left %s on disk — there is no sweep, collect it by hand", safe_name)
         return json_error("The file could not be removed, try again later", 500, code="delete_failed")
 
     return json_response({"ok": True})

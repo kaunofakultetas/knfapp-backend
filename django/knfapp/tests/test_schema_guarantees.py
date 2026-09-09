@@ -19,11 +19,13 @@ from django.test import TestCase
 EXPECTED_INDEXES = {
     "push_tokens": {"idx_push_tokens_active"},
     "news_posts": {"idx_news_posts_published", "idx_news_posts_source"},
-    "activity": {"idx_activity_unread", "idx_activity_user"},
+    "activity": {"idx_activity_unread", "idx_activity_user", "activity_unique_null_subject"},
     "reports": {"idx_reports_status"},
     "memes": {"idx_memes_created"},
     "messages": {"idx_messages_expires", "idx_messages_conversation"},
     "schedule_lessons": {"idx_schedule_lessons_filter"},
+    "uploads": {"idx_uploads_user", "idx_uploads_created"},
+    "users": {"users_username_ci", "users_email_ci"},
 }
 
 # Uniques declared as table CONSTRAINTs are backed by

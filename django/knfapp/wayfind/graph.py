@@ -50,7 +50,7 @@ COLLECTION = {"level": "levels", "node": "nodes", "edge": "edges", "room": "room
 # — the published ETag is the sha256 of exactly this text.
 #
 # Used by:
-#   - routes.py get_draft / publish_building
+#   - api/views.py get_draft / publish_building
 ############################################################
 
 def compile_document(building, rows):
@@ -70,10 +70,7 @@ def compile_document(building, rows):
     for row in rows:
         if row["deleted"]:
             continue
-        try:
-            data = json.loads(row["data"])
-        except (TypeError, ValueError):
-            continue
+        data = row["data"]
         if not isinstance(data, dict):
             continue
         data["id"] = row["id"]
@@ -102,7 +99,7 @@ def compile_document(building, rows):
 # ETag of the bytes it holds.
 #
 # Used by:
-#   - routes.py get_graph / publish_building
+#   - api/views.py get_graph / publish_building
 ############################################################
 
 def document_text(document) -> str:
@@ -134,8 +131,8 @@ def document_etag(text: str) -> str:
 # publishable.
 #
 # Used by:
-#   - routes.py publish_building — refuses with the list
-#   - routes.py get_draft — advice beside the draft
+#   - api/views.py publish_building — refuses with the list
+#   - api/views.py get_draft — advice beside the draft
 ############################################################
 
 def validate_document(document):
@@ -224,7 +221,7 @@ def validate_document(document):
 # does not yet hang together. Answers None or the reason.
 #
 # Used by:
-#   - routes.py post_ops
+#   - api/views.py post_ops
 ############################################################
 
 def entity_shape_error(kind, data):

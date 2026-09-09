@@ -5,10 +5,10 @@
 #  revoking invitation codes (curators only their own
 #  student/teacher ones), the user list with role/active
 #  editing under the two continuity guards, the GDPR
-#  erasure path, the cached
-#  dashboard counters, the background broadcast job, and the
-#  complaint queue. Every mutating handler writes one audit
-#  row inside its own transaction.
+#  erasure path, the cached dashboard counters, the
+#  background broadcast job, and the complaint queue. Every
+#  mutating handler writes one audit row inside its own
+#  transaction.
 #
 #  Split into:
 #
@@ -33,8 +33,8 @@ from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 
-from django.db import connection, transaction
-from django.db.models import Count
+from django.db import transaction
+from django.db.models import Count, F
 
 
 from knfapp.admin.audit import write_audit
@@ -42,7 +42,7 @@ from knfapp.admin.models import AdminAudit
 from knfapp.chat.models import Message
 from knfapp.common import ratelimit
 from knfapp.common.http import get_json_object, json_error, json_response
-from knfapp.common.timestamps import parse_stored, utc_now_iso
+from knfapp.common.timestamps import parse_stored, utc_now, utc_now_iso
 from knfapp.news.models import DeletedSourceUrl, NewsComment, NewsPost
 from knfapp.notifications.models import PushToken
 from knfapp.social.models import Report
@@ -258,13 +258,13 @@ def create_invitation(request):
     # ====================================================
     code_id = str(uuid.uuid4())
     code = uuid.uuid4().hex[:12].upper()
-    created_at = utc_now_iso()
-    expires_at = (datetime.now(timezone.utc) + timedelta(hours=expires_hours)).isoformat()
+    created_at = utc_now()
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_hours)
 
     InvitationCode.objects.create(id=code_id, code=code, role=role, created_by_id=request.user["id"],
                                   max_uses=max_uses, use_count=0, expires_at=expires_at, created_at=created_at)
     write_audit(request.user["id"], "invitation.create", code_id,
-                {"role": role, "maxUses": max_uses, "expiresAt": expires_at})
+                {"role": role, "maxUses": max_uses, "expiresAt": expires_at.isoformat()})
 
     return json_response({
         "id": code_id, "code": code, "role": role, "maxUses": max_uses, "useCount": 0,
@@ -372,8 +372,8 @@ _USER_FIELDS = ("id", "username", "email", "display_name", "role", "active", "cr
 # and kicks their sockets — the flag alone already locks
 # them out (get_current_user refuses inactive users), the
 # purge makes it immediate and stops message previews on the
-# signed-out device. Documented gotcha kept: a bare role
-# DEMOTION leaves existing sessions alive until they expire.
+# signed-out device. Gotcha: a bare role DEMOTION leaves
+# existing sessions alive until they expire.
 #
 # The DELETE is the admin's GDPR erasure path — the same
 # erase_user_account routine the self-service DELETE
@@ -452,7 +452,7 @@ def update_user(request, user_id):
     # STEP 4: apply each field on its own, audit both, and
     # purge the sessions and push tokens on deactivation
     # ====================================================
-    now = utc_now_iso()
+    now = utc_now()
 
     if new_role is not None:
         User.objects.filter(id=user_id).update(role=new_role, updated_at=now)
@@ -461,7 +461,7 @@ def update_user(request, user_id):
     if active is not None:
         # The write alone already locks the user out — login() and
         # get_current_user() both enforce the flag
-        User.objects.filter(id=user_id).update(active=1 if active else 0, updated_at=now)
+        User.objects.filter(id=user_id).update(active=active, updated_at=now)
         write_audit(request.user["id"], "user.active", user_id, {"active": active})
 
         # Drop live sessions too — makes the logout immediate even if
@@ -536,35 +536,13 @@ def delete_user(request, user_id):
 # — the admin screen refetches on every focus and these five
 # counts would otherwise be five table scans each time.
 #
-# activeInvitations compares dates as strings on purpose.
-# expires_at is Python isoformat — 'T' separator, "+00:00"
-# suffix — while SQLite's datetime('now') prints a space.
-# Compared raw, 'T' sorts after ' ', so a same-day code that
-# had already expired would still count as active. Both
-# sides are therefore cut to the 19-char YYYY-MM-DDTHH:MM:SS
-# shape (strftime with a literal T), the stored separator
-# normalised first so a hand-edited space-form row reaches
-# the same verdict as the listing's parse_stored flag. A
-# string comparison only means anything on a string that IS
-# a date: 'netrukus' sorts above every timestamp the clock
-# can print and would be COUNTED as active, so a GLOB on
-# the first ten characters throws out anything that does not
-# open with YYYY-MM-DD (an unparsable or NULL expires_at is
-# not active here either). Raw SQL because GLOB and strftime
-# are SQLite spellings — this rewrites alongside the feed
-# scoring when DATABASE_URL moves to postgres.
+# activeInvitations is a typed comparison: expires_at is a
+# real datetime column, so "not yet expired" is one __gt
+# against the current instant.
 #
 # Used by:
 #   - services/api/admin.ts — the dashboard tiles
 ############################################################
-
-_ACTIVE_INVITATIONS_SQL = """
-    SELECT COUNT(*) AS c FROM invitation_codes
-    WHERE use_count < max_uses
-      AND substr(replace(expires_at, ' ', 'T'), 1, 10) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
-      AND substr(replace(expires_at, ' ', 'T'), 1, 19) > strftime('%Y-%m-%dT%H:%M:%S', 'now')
-"""
-
 
 @require_role("admin")
 def admin_stats(request):
@@ -591,9 +569,11 @@ def admin_stats(request):
 
     comment_count = NewsComment.objects.count()
 
-    with connection.cursor() as cursor:
-        cursor.execute(_ACTIVE_INVITATIONS_SQL)
-        active_invitations = cursor.fetchone()[0]
+    active_invitations = (
+        InvitationCode.objects
+        .filter(use_count__lt=F("max_uses"), expires_at__gt=datetime.now(timezone.utc))
+        .count()
+    )
 
 
     # STEP 3: publish the snapshot and answer it
@@ -690,11 +670,12 @@ def _fanout_counts(result):
 #
 # The fan-out itself, on a plain daemon thread: one Expo
 # POST per 100 device tokens, each with a 30 s timeout,
-# which is exactly why it never runs inside the request. Failures are recorded on the job
-# and logged, never raised — there is no caller left to
-# receive them, and that covers a result shape
-# _fanout_counts refuses as well: it marks the job failed
-# instead of leaving it "running" for good.
+# which is exactly why it never runs inside the request.
+# Failures are recorded on the job and logged, never
+# raised — there is no caller left to receive them, and
+# that covers a result shape _fanout_counts refuses as
+# well: it marks the job failed instead of leaving it
+# "running" for good.
 #
 # The notify_channel import rides INSIDE the try, so ANY
 # failure — an import problem included — lands the job
@@ -768,9 +749,8 @@ def _spawn_broadcast(job_id, title, body_text, extra_data):
 # `data` object rides along as the push payload. The answer
 # is 202 with a job id — the fan-out is a background thread,
 # because a faculty-wide broadcast would hold a worker
-# open for minutes. `sent` keeps its name but never meant
-# delivered devices: it counts tickets Expo ACCEPTED, which
-# is why the finished message says so.
+# open for minutes. `sent` counts tickets Expo ACCEPTED,
+# never delivered devices — the finished message says so.
 #
 # The caller's `data` is merged UNDER the type marker and
 # "type" is then forced back to "admin_announcement" — the
@@ -875,8 +855,8 @@ def broadcast_job_status(request, job_id):
 # first, with the reporter's display name — and, for 'user'
 # targets, the target's name too (one bulk fetch), so the
 # row renders without a second lookup. No status filter
-# means open only: the panel's
-# job is the queue, the archive is opt-in. Capped at 200.
+# means open only: the panel's job is the queue, the
+# archive is opt-in. Capped at 200.
 # The PUT moves a report between 'open' and 'resolved' —
 # reopening is allowed, a resolve tapped by mistake must be
 # reversible. Audited like every other privileged write.
@@ -959,10 +939,10 @@ def resolve_report(request, report_id):
 # console, so curators reading it would see admin actions
 # they cannot see the subjects of. Same optional
 # ?limit/?offset pair as the sibling listings. The payload
-# column holds the JSON write_audit serialised; it comes
-# back parsed, and a hand-edited unparsable row falls back
-# to the raw string rather than 500ing the listing. Reading
-# the trail deliberately leaves no trail of its own.
+# is a JSON column, so it arrives from the ORM as the
+# structure write_audit stored (or None) and is served
+# directly. Reading the trail deliberately leaves no trail
+# of its own.
 #
 # Used by:
 #   - the admin panel's audit view
@@ -979,14 +959,6 @@ def list_audit(request):
         limit, offset,
     )
 
-    def _payload(raw):
-        if raw is None:
-            return None
-        try:
-            return json.loads(raw)
-        except ValueError:
-            return raw
-
     return json_response({
         "audit": [
             {
@@ -995,7 +967,7 @@ def list_audit(request):
                 "actorName": r.actor.display_name if r.actor else None,
                 "action": r.action,
                 "target": r.target,
-                "payload": _payload(r.payload),
+                "payload": r.payload,
                 "createdAt": r.created_at,
             }
             for r in rows
@@ -1067,9 +1039,9 @@ def list_uploads(request):
 #
 # GET /api/admin/messages/<message_id>
 #
-# The moderation window into chat: every other message read
-# is membership-scoped, so a report against a message used
-# to hand the queue nothing but an id. Admin AND curator —
+# The moderation window into chat: every other message
+# read is membership-scoped, so without this route a report
+# would hand the queue nothing but an id. Admin AND curator —
 # the same pair that reads the report queue — may fetch the
 # reported message itself: sender, room, text and the
 # attachment facts, with deleted/edited stamps included (an
@@ -1122,8 +1094,7 @@ def get_reported_message(request, message_id):
 # POST /api/admin/tombstones/restore
 #
 # The scraper skip-list: deleting a scraped post tombstones
-# its source_url so the next run cannot resurrect it — and
-# until now the only way to SEE or undo that was SQL. The
+# its source_url so the next run cannot resurrect it. The
 # listing is the table verbatim (admin-only, newest first,
 # the sibling ?limit/?offset pair). The restore lifts one
 # tombstone by exact source_url — the article returns on

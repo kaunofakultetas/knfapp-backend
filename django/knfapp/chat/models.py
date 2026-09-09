@@ -1,13 +1,11 @@
 ############################################################
 #  [*] chat — the messaging tables
 #
-#  Five tables mirroring the live schema byte-for-byte. The
-#  messages_fts FTS5 shadow table is NOT a model — it rides
-#  migration 0002 with a probe-create, so an SQLite built
-#  without FTS5 degrades the in-room search to its LIKE
-#  fallback instead of failing the migrate. Chat stamps are
-#  NAIVE-UTC isoformat text (no offset), compared as
-#  strings. Shape policy as in users/models.py.
+#  The five messaging tables. Wire stamps are naive UTC —
+#  the encoder opted into by api/views.py decides that (see
+#  common/http.py), not these columns. In-room search is one
+#  case-insensitive substring match — the same query on
+#  either engine. Shape policy as in users/models.py.
 #
 #  Models:
 #    - Conversation            — direct/group rooms + the TTL
@@ -29,6 +27,7 @@ from knfapp.users.models import User
 
 
 CONVERSATION_TYPES = ("direct", "group")
+MESSAGE_KINDS = ("text", "image", "file", "video", "audio", "system")
 
 
 
@@ -56,11 +55,18 @@ class Conversation(models.Model):
     title = models.TextField(null=True, blank=True)
     avatar_emoji = models.TextField(null=True, blank=True)
     message_ttl_seconds = models.IntegerField(null=True, blank=True)
+    # Sorted "id|id" of a direct chat's two members, NULL for
+    # groups — the DATABASE settles a racing double-create on
+    # both engines; a row loses its key when a member leaves,
+    # so a recreate inserts fresh
+    direct_key = models.TextField(null=True, blank=True, unique=True)
+    # db_index=False on purpose — idx_conversations_created_by
+    # below is the same index; the FK default would double it
     created_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.DO_NOTHING,
-                                   db_column="created_by", db_constraint=True,
+                                   db_column="created_by", db_constraint=True, db_index=False,
                                    related_name="created_conversations")
-    created_at = models.TextField()
-    updated_at = models.TextField()
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -94,15 +100,16 @@ class Conversation(models.Model):
 # -----------------------------------------------------------
 
 class ConversationParticipant(models.Model):
-    # Columns
+    # Columns — both FKs carry db_index=False: conversation_id
+    # leads the composite PK, user_id has the hand index below
     pk = models.CompositePrimaryKey("conversation_id", "user_id")
-    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE,
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, db_index=False,
                                      db_column="conversation_id", related_name="participants")
-    user = models.ForeignKey(User, on_delete=models.CASCADE,
+    user = models.ForeignKey(User, on_delete=models.CASCADE, db_index=False,
                              db_column="user_id", related_name="conversation_memberships")
     pinned = models.IntegerField(default=0)
-    last_read_at = models.TextField(null=True, blank=True)
-    joined_at = models.TextField()
+    last_read_at = models.DateTimeField(null=True, blank=True)
+    joined_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -127,39 +134,48 @@ class ConversationParticipant(models.Model):
 # previews as JSON text. Soft-deleted by `deleted_at` (an
 # unsend keeps the row, blanks the content at read time);
 # `client_msg_id` is the idempotency nonce under its unique
-# index; `expires_at` is set on send in TTL rooms and swept
-# by the disappearing-messages pass.
+# index; `kind` is server-computed and CHECK-enforced — the
+# constraint is the only validation layer for it;
+# `expires_at` is set on send in TTL rooms and swept by the
+# disappearing-messages pass. `reply_to` is a LOOSE
+# reference on purpose (db_constraint=False): the TTL sweep
+# hard-deletes quoted messages under live replies — a real
+# FK would fail that commit — and the read path already
+# shapes a dangling ref as the deleted ghost quote.
 #
 # Table: messages
 # -----------------------------------------------------------
 
 class Message(models.Model):
-    # Columns
+    # Columns — the FK db_index=False flags drop Django's
+    # auto-indexes where a hand index below already leads
+    # with the same column
     id = models.TextField(primary_key=True)
-    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE,
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, db_index=False,
                                      db_column="conversation_id", related_name="messages")
-    sender = models.ForeignKey(User, on_delete=models.CASCADE,
+    sender = models.ForeignKey(User, on_delete=models.CASCADE, db_index=False,
                                db_column="sender_id", related_name="sent_messages")
     text = models.TextField(default="")
     image_url = models.TextField(null=True, blank=True)
     reply_to = models.ForeignKey("self", null=True, blank=True, on_delete=models.SET_NULL,
-                                 db_column="reply_to_id", related_name="replies")
-    deleted_at = models.TextField(null=True, blank=True)
+                                 db_column="reply_to_id", related_name="replies",
+                                 db_constraint=False, db_index=False)
+    deleted_at = models.DateTimeField(null=True, blank=True)
     client_msg_id = models.TextField(null=True, blank=True)
     kind = models.TextField(default="text")
-    edited_at = models.TextField(null=True, blank=True)
+    edited_at = models.DateTimeField(null=True, blank=True)
     attachment_url = models.TextField(null=True, blank=True)
     attachment_name = models.TextField(null=True, blank=True)
     attachment_size = models.IntegerField(null=True, blank=True)
     attachment_mime = models.TextField(null=True, blank=True)
-    attachment_meta = models.TextField(null=True, blank=True)
-    link_preview = models.TextField(null=True, blank=True)
-    gallery = models.TextField(null=True, blank=True)
-    pinned_at = models.TextField(null=True, blank=True)
+    attachment_meta = models.JSONField(null=True, blank=True)
+    link_preview = models.JSONField(null=True, blank=True)
+    gallery = models.JSONField(null=True, blank=True)
+    pinned_at = models.DateTimeField(null=True, blank=True)
     pinned_by = models.TextField(null=True, blank=True)
-    forwarded = models.IntegerField(default=0)
-    expires_at = models.TextField(null=True, blank=True)
-    created_at = models.TextField()
+    forwarded = models.BooleanField(default=False)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -169,16 +185,24 @@ class Message(models.Model):
             # loses here and is answered with the committed twin
             models.UniqueConstraint(fields=["conversation", "sender", "client_msg_id"],
                                     name="idx_messages_client_msg"),
+            models.CheckConstraint(condition=models.Q(kind__in=MESSAGE_KINDS),
+                                   name="messages_kind_check"),
         ]
         indexes = [
-            models.Index(fields=["conversation", "-created_at"], name="idx_messages_conversation"),
+            # The paging index carries the FULL page order —
+            # (created_at, id) — so a page is a pure index walk
+            # with no sorter, and the per-room last-message
+            # probe is one descending seek
+            models.Index(fields=["conversation", "-created_at", "-id"], name="idx_messages_conversation"),
             models.Index(fields=["sender"], name="idx_messages_sender"),
             models.Index(fields=["reply_to"], name="idx_messages_reply_to"),
-            # Disappearing messages: the sweeps ask for overdue
-            # rows across ALL conversations — partial, so the
-            # index holds only the tiny expiring minority and
-            # ordinary messages pay nothing on write
-            models.Index(fields=["expires_at"], name="idx_messages_expires",
+            # Disappearing messages: the hot sweep asks per
+            # room (conversation_id equality + overdue range —
+            # instantly empty for non-TTL rooms) and the daily
+            # cross-room DISTINCT covers off the same partial;
+            # only the expiring minority is indexed, so
+            # ordinary sends pay nothing on write
+            models.Index(fields=["conversation", "expires_at"], name="idx_messages_expires",
                          condition=models.Q(expires_at__isnull=False)),
         ]
 
@@ -202,13 +226,14 @@ class Message(models.Model):
 # -----------------------------------------------------------
 
 class MessageRead(models.Model):
-    # Columns
+    # Columns — both FKs carry db_index=False: message_id
+    # leads the composite PK, user_id has the hand index below
     pk = models.CompositePrimaryKey("message_id", "user_id")
-    message = models.ForeignKey(Message, on_delete=models.CASCADE,
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, db_index=False,
                                 db_column="message_id", related_name="reads")
-    user = models.ForeignKey(User, on_delete=models.CASCADE,
+    user = models.ForeignKey(User, on_delete=models.CASCADE, db_index=False,
                              db_column="user_id", related_name="message_reads")
-    read_at = models.TextField()
+    read_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -236,14 +261,15 @@ class MessageRead(models.Model):
 # -----------------------------------------------------------
 
 class MessageReaction(models.Model):
-    # Columns
+    # Columns — both FKs carry db_index=False: message_id
+    # leads the composite PK, user_id has the hand index below
     pk = models.CompositePrimaryKey("message_id", "user_id")
-    message = models.ForeignKey(Message, on_delete=models.CASCADE,
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, db_index=False,
                                 db_column="message_id", related_name="reactions")
-    user = models.ForeignKey(User, on_delete=models.CASCADE,
+    user = models.ForeignKey(User, on_delete=models.CASCADE, db_index=False,
                              db_column="user_id", related_name="message_reactions")
     emoji = models.TextField()
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:

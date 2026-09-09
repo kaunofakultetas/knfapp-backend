@@ -15,10 +15,12 @@ FROM python:3.13-slim
 WORKDIR /app
 
 
-# Django + configuration
+# Django + configuration + the postgres driver (the engine
+# is a DATABASE_URL choice — the image carries both)
 RUN pip install --no-cache-dir                  \
     django==5.2.15                              \
-    django-environ==0.13.0
+    django-environ==0.13.0                      \
+    "psycopg[binary]==3.3.5"
 
 # Auth + serving + the image re-encode gate
 RUN pip install --no-cache-dir                  \

@@ -81,7 +81,7 @@ class RegisterTokenTests(TestCase):
         own = bearer(self.client.delete, "/api/notifications/register", self.token,
                      data={"token": _token()}, content_type="application/json")
         self.assertEqual(own.status_code, 200)
-        # No grammar gate on the way out — a legacy row of any
+        # No grammar gate on the way out — a stored row of any
         # shape must be removable by its owner
         PushToken.objects.create(id=str(uuid.uuid4()), user=self.user, token="senas-formatas",
                                  created_at=utc_now_iso(), updated_at=utc_now_iso())

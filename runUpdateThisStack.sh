@@ -32,7 +32,7 @@ DB_PATH="$DATA_DIR/backend/knfapp.db"
 
 # STEP 1: the data tree, owned by the uid every container runs as
 # ===============================================================
-sudo mkdir -p "$DATA_DIR/backend/uploads" "$BACKUP_DIR"
+sudo mkdir -p "$DATA_DIR/backend/uploads" "$DATA_DIR/django" "$BACKUP_DIR"
 sudo chown -R 1000:1000 "$DATA_DIR"
 
 
@@ -65,6 +65,28 @@ if [ -f "$DB_PATH" ]; then
         echo "Pre-deploy snapshot: $SNAPSHOT.gz"
     else
         echo "WARNING: sqlite3 not installed — skipping the pre-deploy snapshot"
+    fi
+fi
+
+
+# STEP 3b: the same WAL-safe snapshot for the Django database
+# once it exists — via python3's sqlite3 module (same .backup
+# semantics, no dependency on a host sqlite3 CLI), and warn-
+# don't-stop like STEP 3: a deploy without a snapshot beats no
+# deploy, but says so out loud
+# ===========================================================
+DJANGO_DB_PATH="$DATA_DIR/django/knfapp.sqlite3"
+if [ -f "$DJANGO_DB_PATH" ]; then
+    SNAPSHOT="$BACKUP_DIR/pre-deploy-django-$(date -u '+%Y%m%d-%H%M%S').db"
+    if sudo python3 -c "import sqlite3, sys
+src = sqlite3.connect(sys.argv[1]); dst = sqlite3.connect(sys.argv[2])
+src.backup(dst); dst.close(); src.close()" "$DJANGO_DB_PATH" "$SNAPSHOT"; then
+        sudo gzip -f "$SNAPSHOT"
+        sudo chown 1000:1000 "$SNAPSHOT.gz"
+        sudo chmod 600 "$SNAPSHOT.gz"
+        echo "Pre-deploy Django snapshot: $SNAPSHOT.gz"
+    else
+        echo "WARNING: Django snapshot failed — deploy proceeds unprotected"
     fi
 fi
 

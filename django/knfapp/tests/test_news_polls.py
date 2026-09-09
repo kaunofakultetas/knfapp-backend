@@ -12,6 +12,8 @@
 from datetime import datetime, timedelta, timezone
 
 
+from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.test import Client, TestCase
 
 
@@ -108,8 +110,12 @@ class PollVoteTests(TestCase):
         Poll.objects.update(end_date=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat())
         self.assertEqual(self._vote(self.options[0]).status_code, 400)
 
-    def test_an_unparseable_end_date_means_open(self):
-        Poll.objects.update(end_date="rytoj po pietų")
+    def test_an_unparseable_end_date_cannot_be_stored(self):
+        # The typed column refuses garbage outright; a NULL
+        # end_date stays the "never closes" state
+        with self.assertRaises(ValidationError), transaction.atomic():
+            Poll.objects.update(end_date="rytoj po pietų")
+        Poll.objects.update(end_date=None)
         self.assertEqual(self._vote(self.options[0]).status_code, 200)
 
 

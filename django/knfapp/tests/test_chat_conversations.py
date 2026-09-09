@@ -81,6 +81,20 @@ class CreateConversationTests(ChatTestCase):
         self.assertEqual(again.status_code, 200)
         self.assertEqual(json.loads(again.content)["conversationId"], conv_id)
 
+    def test_a_left_dm_is_never_reused_by_a_recreate(self):
+        first = self._post("/api/chat/conversations", self.tomas_token,
+                           {"participantIds": [self.ona.id]})
+        conv_id = json.loads(first.content)["conversationId"]
+        bearer(self.client.delete, f"/api/chat/conversations/{conv_id}", self.ona_token)
+
+        # The abandoned room dropped its pair claim — either
+        # member's recreate starts a FRESH room, never a 200
+        # onto a conversation the leaver already walked out of
+        again = self._post("/api/chat/conversations", self.ona_token,
+                           {"participantIds": [self.tomas.id]})
+        self.assertEqual(again.status_code, 201)
+        self.assertNotEqual(json.loads(again.content)["conversationId"], conv_id)
+
     def test_a_planted_multi_member_direct_is_never_reused_as_a_dm(self):
         third = create_user(username="trecias")
         planted = create_room([self.tomas, self.ona, third], conv_type="direct")

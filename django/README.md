@@ -100,28 +100,31 @@ drift.
 
 ## Data
 
-The models keep the production database's table/column names, TEXT
-uuid keys and ISO-8601 text stamps, so the cutover is a row copy —
-never a schema rewrite. The copy is a command:
+The production database starts EMPTY by decision — nothing is
+imported from any earlier system. First boot is:
 
 ```
 python3 manage.py migrate --noinput
-python3 manage.py copy_production_data --source /data/live.sqlite3
+python3 manage.py grant_role <username> admin
 ```
 
-It pre-flight-validates the source (enum values against the CHECK
-constraints, NULLs in required columns — bad data aborts with a
-report, nothing is silently dropped), copies in one transaction,
-and heals the known quirks on the way: dangling message quote
-references are NULLed, timetable NULL-teacher duplicates collapse,
-`poll_options.position` is numbered from the stored order, the
-denormalised counters are recomputed from child rows, and the
-message search shadow is rebuilt. A post-flight pass compares row
-counts and runs `foreign_key_check`.
+(register the first account through the app as usual, then grant
+it the admin role with the bootstrap command — registration alone
+can only mint students, and every admin surface requires an
+existing admin, so the command is the one sanctioned way in).
 
 SQLite serves with WAL, a 5 s busy timeout and NORMAL synchronous
-(set per connection from settings). Raw SQL keeps SQLite spellings
-where they earn their keep (the feed scoring's julianday,
-`INSERT OR IGNORE`, the FTS5 search, the admin stats GLOB) —
-flagged in place for a later postgres move, which is otherwise a
-`DATABASE_URL` change.
+(set per connection from settings).
+
+The ENGINE is a `DATABASE_URL` choice, not a commitment: the image
+carries the postgres driver, row traffic (upserts included, via
+the ORM's ON CONFLICT rendering) rides the ORM, the raw SQL that
+remains is deliberate and portable (the scraper's one-statement
+run lock, the chat last-message seek and unread aggregates,
+no-cascade purges), the feed scoring rides one vendor-split
+expression module (common/expressions.py — the only place
+dialects are allowed to differ), and the one SQLite-only
+mechanism degrades by design: the chat write-lock helper issues
+`BEGIN IMMEDIATE` only where SQLite needs it. A
+postgres deployment is the URL flip plus a database service in
+compose; the suite itself runs on SQLite.

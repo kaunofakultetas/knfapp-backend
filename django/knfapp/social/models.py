@@ -2,10 +2,9 @@
 #  [*] social — friendships, requests, blocks, activity,
 #      reports
 #
-#  friendships and user_blocks keep their composite primary
-#  keys (Django 5.2 CompositePrimaryKey — the live tables
-#  have no surrogate id and the cutover is a row copy).
-#  Shape policy as in users/models.py.
+#  friendships and user_blocks carry composite primary keys
+#  (Django 5.2 CompositePrimaryKey — the live tables have
+#  no surrogate id). Shape policy as in users/models.py.
 #
 #  Models:
 #    - Friendship    — accepted pairs, one row per direction
@@ -49,15 +48,24 @@ ACTIVITY_KINDS = ("like", "comment", "connect_request", "connect_accept")
 # -----------------------------------------------------------
 
 class Friendship(models.Model):
-    # Columns
+    # Columns — user_id leads the composite PK, so its FK
+    # auto-index would be a duplicate; friend_id keeps its
+    # index for the reverse-direction lookups
     pk = models.CompositePrimaryKey("user_id", "friend_id")
-    user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id", related_name="friendships")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id",
+                             db_index=False, related_name="friendships")
     friend = models.ForeignKey(User, on_delete=models.CASCADE, db_column="friend_id", related_name="friend_of")
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
         db_table = "friendships"
+        constraints = [
+            # Self-friendship is refused in the views; the CHECK
+            # makes it impossible for any writer
+            models.CheckConstraint(condition=~models.Q(user=models.F("friend")),
+                                   name="friendships_not_self_check"),
+        ]
 
 
 
@@ -80,15 +88,18 @@ class Friendship(models.Model):
 # -----------------------------------------------------------
 
 class Activity(models.Model):
-    # Columns
+    # Columns — user_id's FK auto-index would duplicate the
+    # two hand indexes below; actor_id keeps its own (the
+    # erasure delete and nothing else lead with it)
     id = models.TextField(primary_key=True)
-    user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id", related_name="activity")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id",
+                             db_index=False, related_name="activity")
     kind = models.TextField()
     actor = models.ForeignKey(User, on_delete=models.CASCADE, db_column="actor_id", related_name="acted_activity")
     subject_id = models.TextField(null=True, blank=True)
     subject_preview = models.TextField(null=True, blank=True)
-    created_at = models.TextField()
-    read = models.IntegerField(default=0)
+    created_at = models.DateTimeField()
+    read = models.BooleanField(default=False)
 
     # Table metadata
     class Meta:
@@ -96,6 +107,12 @@ class Activity(models.Model):
         constraints = [
             models.CheckConstraint(condition=models.Q(kind__in=ACTIVITY_KINDS), name="activity_kind_check"),
             models.UniqueConstraint(fields=["user", "kind", "actor", "subject_id"], name="activity_unique_row"),
+            # NULLs are distinct to SQLite, so the quadruple
+            # unique above cannot bind the subject-less rows
+            # (connect_accept) — this partial index does
+            models.UniqueConstraint(fields=["user", "kind", "actor"],
+                                    condition=models.Q(subject_id__isnull=True),
+                                    name="activity_unique_null_subject"),
         ]
         indexes = [
             models.Index(fields=["user", "-created_at", "-id"], name="idx_activity_user"),
@@ -130,15 +147,16 @@ REPORT_STATUSES = ("open", "resolved")
 # -----------------------------------------------------------
 
 class FriendRequest(models.Model):
-    # Columns
+    # Columns — both FK auto-indexes would duplicate the two
+    # hand composites below, which lead with the same columns
     id = models.TextField(primary_key=True)
     from_user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="from_user_id",
-                                  related_name="sent_friend_requests")
+                                  db_index=False, related_name="sent_friend_requests")
     to_user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="to_user_id",
-                                related_name="received_friend_requests")
+                                db_index=False, related_name="received_friend_requests")
     status = models.TextField(default="pending")
-    created_at = models.TextField()
-    updated_at = models.TextField()
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -146,6 +164,10 @@ class FriendRequest(models.Model):
         constraints = [
             models.CheckConstraint(condition=models.Q(status__in=REQUEST_STATUSES),
                                    name="friend_requests_status_check"),
+            # Self-requests are refused in the views; the CHECK
+            # makes them impossible for any writer
+            models.CheckConstraint(condition=~models.Q(from_user=models.F("to_user")),
+                                   name="friend_requests_not_self_check"),
             # The partial unique index: ONE pending row per
             # directed pair — the guard that settles a lost race
             models.UniqueConstraint(fields=["from_user", "to_user"],
@@ -177,17 +199,25 @@ class FriendRequest(models.Model):
 # -----------------------------------------------------------
 
 class UserBlock(models.Model):
-    # Columns
+    # Columns — blocker_id leads the composite PK and
+    # blocked_id has the hand index below, so both FK
+    # auto-indexes would be duplicates
     pk = models.CompositePrimaryKey("blocker_id", "blocked_id")
     blocker = models.ForeignKey(User, on_delete=models.CASCADE, db_column="blocker_id",
-                                related_name="blocks_made")
+                                db_index=False, related_name="blocks_made")
     blocked = models.ForeignKey(User, on_delete=models.CASCADE, db_column="blocked_id",
-                                related_name="blocks_received")
-    created_at = models.TextField()
+                                db_index=False, related_name="blocks_received")
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
         db_table = "user_blocks"
+        constraints = [
+            # Self-blocks are refused in the views; the CHECK
+            # makes them impossible for any writer
+            models.CheckConstraint(condition=~models.Q(blocker=models.F("blocked")),
+                                   name="user_blocks_not_self_check"),
+        ]
         indexes = [models.Index(fields=["blocked"], name="idx_user_blocks_blocked")]
 
 
@@ -219,7 +249,7 @@ class Report(models.Model):
     target_id = models.TextField()
     reason = models.TextField()
     status = models.TextField(default="open")
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:

@@ -93,7 +93,7 @@ services:
       WEB_ROOT: /dbgate
 
       LOGINS: admin
-      # ":?" — an unset variable used to fail OPEN here, publishing
+      # ":?" — without it an unset variable fails OPEN, publishing
       # the admin console on the public origin with a blank password
       LOGIN_PASSWORD_admin: ${DBGATE_PASSWORD:?must be set}
 
@@ -101,6 +101,16 @@ services:
       LABEL_con1: KNFAPP SQLite
       FILE_con1: /data/knfapp.db
       ENGINE_con1: sqlite@dbgate-plugin-sqlite
+
+      # At cutover, point at the Django file instead (and add
+      # ./_DATA/django:/data-django:ro to the volumes). A WAL
+      # database on a :ro mount is browsable while the backend
+      # holds it open; after a clean backend stop it needs the
+      # backend running again first.
+      # CONNECTIONS: con1,con2
+      # LABEL_con2: KNFAPP Django SQLite
+      # FILE_con2: /data-django/knfapp.sqlite3
+      # ENGINE_con2: sqlite@dbgate-plugin-sqlite
     volumes:
       # Read-only: DbGate is a console for LOOKING at production
       # data. WAL caveat — SQLite needs the -wal/-shm siblings

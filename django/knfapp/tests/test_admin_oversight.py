@@ -2,14 +2,15 @@
 #  [*] Regression tests — the admin oversight reads
 #
 #  The four windows the web panel runs on: the audit trail
-#  (admin-only, actor names joined, payload parsed back from
-#  its stored JSON), the stored-file ledger (ownerless rows
-#  answer a null owner, not a 500), the reported-message
-#  window (admin AND curator — the report-queue pair — and
-#  an unsent message still answers, stamp included), and the
-#  tombstone list with its audited restore (second restore =
-#  the same 404 as never-tombstoned). Role gates pinned
-#  throughout: 403 for the wrong role, never an empty 200.
+#  (admin-only, actor names joined, payload served as the
+#  structure it was written with), the stored-file ledger
+#  (ownerless rows answer a null owner, not a 500), the
+#  reported-message window (admin AND curator — the report-
+#  queue pair — and an unsent message still answers, stamp
+#  included), and the tombstone list with its audited
+#  restore (second restore = the same 404 as never-
+#  tombstoned). Role gates pinned throughout: 403 for the
+#  wrong role, never an empty 200.
 ############################################################
 
 
@@ -20,6 +21,7 @@ import uuid
 from django.test import Client, TestCase
 
 
+from knfapp.admin.audit import write_audit
 from knfapp.admin.models import AdminAudit
 from knfapp.common.timestamps import utc_now_iso
 from knfapp.news.models import DeletedSourceUrl
@@ -63,15 +65,28 @@ class AuditTrailTests(TestCase):
         bearer(self.client.get, "/api/admin/audit", self.admin_token)
         self.assertEqual(AdminAudit.objects.count(), before)
 
-    def test_limit_pages_and_garbage_payload_rows_do_not_500(self):
+    def test_limit_pages_the_trail(self):
         for n in range(3):
             AdminAudit.objects.create(id=str(uuid.uuid4()), actor=self.admin, action="user.role",
-                                      target=f"t{n}", payload="ne-json{", created_at=utc_now_iso())
+                                      target=f"t{n}", payload={"n": n}, created_at=utc_now_iso())
 
         listed = bearer(self.client.get, "/api/admin/audit?limit=2", self.admin_token)
         self.assertEqual(len(listed.json()["audit"]), 2)
-        # The unparsable payload comes back as the raw string
-        self.assertEqual(listed.json()["audit"][0]["payload"], "ne-json{")
+
+    def test_a_payload_row_round_trips_as_structured_data(self):
+        # The payload column is JSON-typed and write_audit passes
+        # the dict straight through, so a trail row can only hold
+        # structured data (or None) — an unparsable garbage string
+        # is not producible through any writer, and the listing
+        # serves the structure back untouched, Lithuanian letters
+        # and nesting included
+        payload = {"from": "student", "to": "curator", "žymės": ["ą", 7]}
+        write_audit(self.admin.id, "user.role", "t1", payload)
+
+        self.assertEqual(AdminAudit.objects.get(action="user.role").payload, payload)
+
+        listed = bearer(self.client.get, "/api/admin/audit", self.admin_token)
+        self.assertEqual(listed.json()["audit"][0]["payload"], payload)
 
 
 class UploadLedgerTests(TestCase):

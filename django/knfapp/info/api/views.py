@@ -75,9 +75,9 @@ FALLBACK_VERSION = hashlib.sha256(
 # The route is public and hot, and every condition warned
 # about here LASTS (an empty table, a stale blob) — one line
 # per process, said again after a restart. parse_timestamp
-# accepts the three stamp shapes the table has carried
-# (naive isoformat, aware T-form, the legacy space form);
-# naive reads as UTC.
+# answers an aware datetime for a datetime or an ISO-ish
+# string (space or 'T' separator, 'Z' accepted); naive
+# reads as UTC, garbage as None.
 #
 # Used by:
 #   - get_scraped_info, apply_scraped_overlay (below)
@@ -93,6 +93,8 @@ def warn_once(key, message, *args):
 def parse_timestamp(value):
     if not value:
         return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     try:
         parsed = datetime.fromisoformat(value.replace(" ", "T").replace("Z", "+00:00"))
     except (AttributeError, TypeError, ValueError):
@@ -113,14 +115,14 @@ def parse_timestamp(value):
 ############################################################
 #
 # The faculty_info rows for one language as
-# ({section: decoded blob}, newest raw stamp), or
-# (None, None) when nothing usable survives. "Newest" is
-# ranked on the PARSED instant while the raw string is what
-# the answer displays — the stored shapes do not sort
-# against each other. Dropped, each with one warning per
-# process: an empty table, a blob past the age cutoff, a
-# row whose JSON does not parse. A database-level failure
-# falls back to the curated handbook instead of 500ing it.
+# ({section: blob}, newest stamp), or (None, None) when
+# nothing usable survives. data_json is a JSON column, so
+# the ORM hands each blob back as the structure the scraper
+# stored. "Newest" is ranked on the PARSED instant; the
+# stored value itself is what the answer displays. Dropped,
+# each with one warning per process: an empty table, a blob
+# past the age cutoff. A database-level failure falls back
+# to the curated handbook instead of 500ing it.
 #
 # Used by:
 #   - get_faculty_info (below)
@@ -152,18 +154,10 @@ def get_scraped_info(lang):
                       lang, row["section"], row["scraped_at"], SCRAPED_MAX_AGE_DAYS)
             continue
 
-        try:
-            scraped[row["section"]] = json.loads(row["data_json"])
-        except (json.JSONDecodeError, TypeError):
-            warn_once(f"undecodable-{lang}-{row['section']}",
-                      "faculty_info '%s' section '%s' does not hold valid JSON — ignored",
-                      lang, row["section"])
-            continue
+        scraped[row["section"]] = row["data_json"]
 
-        # Ranked on the parsed instant, never the stored string —
-        # ' ' < 'T', so a legacy space-form stamp would lose to a
-        # T-form one from the same day. An unparseable stamp takes
-        # an empty slot but never beats a real one
+        # Ranked on the parsed instant — an unparseable stamp
+        # takes an empty slot but never beats a real one
         beats_newest = stamp is not None and (newest_at is None or stamp > newest_at)
         if row["scraped_at"] and (newest is None or beats_newest):
             newest = row["scraped_at"]
@@ -290,6 +284,8 @@ def get_faculty_info(request):
     payload = {section: data[section]} if section is not None else data
     payload["lang"] = lang
     if updated_at:
+        # The frozen wire shape here is naive UTC — the
+        # naive-stamp encoder below strips the offset
         payload["updatedAt"] = updated_at
 
 
@@ -300,7 +296,7 @@ def get_faculty_info(request):
     if if_none_match_contains(request.headers.get("If-None-Match"), tag):
         response = HttpResponse(status=304)
     else:
-        response = json_response(payload)
+        response = json_response(payload, naive_stamps=True)
     response["ETag"] = f'W/"{tag}"'
     response["Cache-Control"] = f"public, max-age={CACHE_MAX_AGE}"
     return response

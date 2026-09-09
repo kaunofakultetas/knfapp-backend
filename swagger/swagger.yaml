@@ -485,8 +485,11 @@ paths:
       description: >
         One document with the profile row, authored posts and comments, sent
         messages, conversation memberships, likes, poll votes, friendships and
-        requests, blocks, reports filed, notification preferences and the upload
-        inventory. Tightly rate limited (5 per 5 minutes).
+        requests, blocks, reports filed, notification preferences, the upload
+        inventory, registered push devices (token given as an 8-hex digest —
+        the raw value is a live push credential), session timestamps, the
+        activity feed, message reactions and contributed memes. Tightly rate
+        limited (5 per 5 minutes).
       security:
         - bearerAuth: []
       responses:

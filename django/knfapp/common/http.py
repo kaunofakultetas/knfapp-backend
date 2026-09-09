@@ -7,8 +7,18 @@
 #      for anything else (bad JSON, an array, a bare
 #      number). Handlers treat None as "body missing" and
 #      answer their usual 400 instead of crashing.
-#    json_response(payload, status) — JsonResponse without
-#      key sorting, so serializer dicts keep their shape.
+#    json_response(payload, status, naive_stamps=False) —
+#      JsonResponse without key sorting, so serializer
+#      dicts keep their shape, and with the app's own
+#      datetime encoding: plain isoformat(), so a stamp
+#      serialises with its "+00:00" (never rewritten to
+#      "Z" the way Django's stock encoder does). The
+#      surfaces whose frozen wire is NAIVE UTC (chat,
+#      scraper status, info) pass naive_stamps=True and
+#      the encoder drops the offset — code carries ONE
+#      stamp kind (aware UTC), the RESPONSE picks the
+#      shape. (The GDPR export is the lone mixed response;
+#      it shapes its chat sections per field.)
 #    json_error(message, status, code=None) — the app-wide
 #      error body {"error": prose, "code"?: slug}. Clients
 #      translate off the machine `code` and never show the
@@ -22,9 +32,31 @@
 
 import hashlib
 import json
+from datetime import date, datetime, timezone
 
 
 from django.http import JsonResponse
+
+
+# isoformat() verbatim — the aware wire shape ends "+00:00",
+# the naive one carries no offset; Django's stock encoder
+# would rewrite the former to "Z" and change response bytes
+class _StampEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, (datetime, date)):
+            return o.isoformat()
+        return super().default(o)
+
+
+# The naive-wire sibling: an aware stamp is moved onto UTC
+# and stripped of its offset before serialising, so the
+# chat/scraper/info surfaces keep their frozen no-offset
+# shape while the code above them carries aware datetimes
+class _NaiveStampEncoder(_StampEncoder):
+    def default(self, o):
+        if isinstance(o, datetime) and o.tzinfo is not None:
+            o = o.astimezone(timezone.utc).replace(tzinfo=None)
+        return super().default(o)
 
 
 def get_json_object(request):
@@ -35,8 +67,10 @@ def get_json_object(request):
     return data if isinstance(data, dict) else None
 
 
-def json_response(payload, status=200):
-    return JsonResponse(payload, status=status, json_dumps_params={"ensure_ascii": False})
+def json_response(payload, status=200, naive_stamps=False):
+    return JsonResponse(payload, status=status,
+                        encoder=_NaiveStampEncoder if naive_stamps else _StampEncoder,
+                        json_dumps_params={"ensure_ascii": False})
 
 
 def json_error(message, status, code=None):

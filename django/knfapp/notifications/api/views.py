@@ -18,14 +18,11 @@
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
-
-
-from django.db import connection
 
 
 from knfapp.common import ratelimit
 from knfapp.common.http import get_json_object, json_error, json_response
+from knfapp.common.timestamps import utc_now
 from knfapp.notifications.core import VALID_CHANNELS, token_digest
 from knfapp.notifications.models import NotificationChannel, PushToken
 from knfapp.users.auth import require_auth
@@ -44,12 +41,6 @@ TOKEN_RE = re.compile(r"ExponentPushToken\[[A-Za-z0-9_-]{10,64}\]")
 MAX_TOKENS_PER_USER = 10
 
 
-def _naive_utc_now():
-    # The table's stamps are naive-UTC T-form ("no offset") —
-    # what every writer of push_tokens has always used
-    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-
-
 
 
 
@@ -63,14 +54,16 @@ def _naive_utc_now():
 # POST body {"token", "platform"?, "language"?}: the full
 # Expo grammar or a 400; a platform outside the whitelist is
 # quietly stored 'unknown'; language falls back to 'lt'. One
-# atomic ON CONFLICT(token) upsert covers insert, reactivate
-# AND takeover (devices change hands — logged, never
-# silent); the caller's fleet is trimmed to the cap first.
+# atomic upsert on the token's unique column covers insert,
+# reactivate AND takeover (devices change hands — logged,
+# never silent); the caller's fleet is trimmed to the cap
+# first.
 # Both outcomes answer {"registered": true, "tokenId"} — 200
 # for a token the caller already held, 201 otherwise.
 # DELETE removes the caller's OWN row only (a moved token is
 # the same 404 as an unknown one), with no grammar check —
-# an owner must be able to name a legacy row of any shape.
+# an owner must be able to name any stored row, whatever
+# its shape.
 #
 # Used by:
 #   - the mobile engine's transport — register on login/
@@ -102,7 +95,7 @@ def register_token(request):
         language = "lt"
 
     user_id = request.user["id"]
-    now = _naive_utc_now()
+    now = utc_now()
 
 
     # STEP 2: who holds this token today — that decides 200 vs
@@ -128,25 +121,22 @@ def register_token(request):
 
 
     # STEP 4: one atomic upsert — insert, reactivate and reassign
-    # are the same statement, so nothing interleaves
+    # are the same statement, so nothing interleaves; a token
+    # collision rewrites owner, platform, language, active and
+    # updated_at while id and created_at stay the row's own
     # ===========================================================
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """INSERT INTO push_tokens (id, user_id, token, platform, language, created_at, updated_at, active)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
-               ON CONFLICT(token) DO UPDATE SET
-                   user_id = excluded.user_id,
-                   platform = excluded.platform,
-                   language = excluded.language,
-                   active = 1,
-                   updated_at = excluded.updated_at""",
-            (str(uuid.uuid4()), user_id, token, platform, language, now, now),
-        )
+    PushToken.objects.bulk_create(
+        [PushToken(id=str(uuid.uuid4()), user_id=user_id, token=token, platform=platform,
+                   language=language, created_at=now, updated_at=now, active=True)],
+        update_conflicts=True,
+        unique_fields=["token"],
+        update_fields=["user", "platform", "language", "active", "updated_at"],
+    )
 
 
-    # STEP 5: DO UPDATE keeps the original row id — it goes out
-    # of the TABLE, never out of the INSERT
-    # =========================================================
+    # STEP 5: the conflict path keeps the original row id — it
+    # goes out of the TABLE, never out of the fresh insert
+    # ========================================================
     row = PushToken.objects.filter(token=token).values("id").first()
     if not row:
         logger.error("Push token vanished during registration (token:%s)", token_digest(token))
@@ -164,8 +154,8 @@ def unregister_token(request):
     if not isinstance(data["token"], str):
         return json_error("Token must be a string", 400)
 
-    # No length or grammar cap here: a legacy row longer than the
-    # POST's rules would otherwise be unnameable by its owner
+    # No length or grammar cap here: a stored row outside the
+    # POST's rules must still be nameable by its owner
     token = data["token"].strip()
     deleted, _ = PushToken.objects.filter(user_id=request.user["id"], token=token).delete()
     if deleted == 0:
@@ -227,11 +217,11 @@ def update_channels(request):
     # STEP 2: upsert the listed rows — one transaction
     # (ATOMIC_REQUESTS), the composite PK deciding the conflict
     # =========================================================
-    now = _naive_utc_now()
+    now = utc_now()
     for channel, enabled in channels_input.items():
         NotificationChannel.objects.update_or_create(
             user_id=request.user["id"], channel=channel,
-            defaults={"enabled": 1 if enabled else 0, "updated_at": now},
+            defaults={"enabled": enabled, "updated_at": now},
         )
 
 
@@ -279,6 +269,6 @@ def update_chat_preview(request):
         return json_error("enabled must be a boolean", 400)
 
     User.objects.filter(id=request.user["id"]).update(
-        chat_push_preview=1 if data["enabled"] else 0,
+        chat_push_preview=data["enabled"],
     )
     return json_response({"enabled": data["enabled"]})

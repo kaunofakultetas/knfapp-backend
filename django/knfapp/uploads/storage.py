@@ -98,7 +98,7 @@ def atomic_write(name, blob):
 # upload (a scraped http(s) image url, a foreign path) or a
 # file already gone. Never raises on a filesystem error —
 # the caller is mid-delete/replace and must succeed
-# regardless; a survivor is the sweep's problem.
+# regardless; a survivor waits for the operator's hand.
 #
 # Used by:
 #   - api/views.py delete_file

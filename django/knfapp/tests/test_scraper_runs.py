@@ -180,7 +180,7 @@ class ScraperRouteTests(TestCase):
         info = next(s for s in body["sources"] if s["source"] == "knf.vu.lt/info")
         self.assertEqual(info["lastFailure"]["status"], "failed")
         self.assertIsNone(info["lastSuccess"])
-        # The neutral names carry the same numbers as the legacy ones
+        # Both wire spellings carry the same numbers
         run = body["runs"][0]
         self.assertEqual(run["itemsFound"], run["articlesFound"])
 

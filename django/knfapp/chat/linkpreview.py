@@ -40,7 +40,6 @@
 
 
 import ipaddress
-import json
 import logging
 import re
 import socket
@@ -51,6 +50,8 @@ import requests
 from bs4 import BeautifulSoup
 
 from django.db import connection
+
+from knfapp.chat.models import Message
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +245,7 @@ def _store_image(image_url, sender_id):
 
     from PIL import Image
 
-    from knfapp.common.timestamps import utc_now_iso
+    from knfapp.common.timestamps import utc_now
     from knfapp.uploads.gates import reencode_image
     from knfapp.uploads.models import Upload
     from knfapp.uploads.storage import atomic_write
@@ -278,7 +279,7 @@ def _store_image(image_url, sender_id):
 
     Upload.objects.create(
         id=str(uuid.uuid4()), filename=safe_name, user_id=sender_id,
-        byte_size=len(encoded), created_at=utc_now_iso(),
+        byte_size=len(encoded), created_at=utc_now(),
     )
     return f"/api/uploads/{safe_name}", tiny_preview
 
@@ -318,18 +319,14 @@ def unfurl_message(sio, conv_id, msg_id, url, sender_id):
         stored = _store_image(image_url, sender_id) if image_url else None
         preview["imageUrl"], preview["imagePreview"] = stored if stored else (None, None)
 
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT deleted_at FROM messages WHERE id = %s AND conversation_id = %s",
-                (msg_id, conv_id),
-            )
-            row = cursor.fetchone()
-            if not row or row[0] is not None:
-                return
-            cursor.execute(
-                "UPDATE messages SET link_preview = %s WHERE id = %s",
-                (json.dumps(preview), msg_id),
-            )
+        # One conditional UPDATE — the card lands only on a row
+        # that still exists and was not unsent meanwhile, with no
+        # check-then-write window between the two
+        changed = Message.objects.filter(
+            id=msg_id, conversation_id=conv_id, deleted_at__isnull=True,
+        ).update(link_preview=preview)
+        if not changed:
+            return
 
         from knfapp.chat.events import emit_message_updated
         emit_message_updated(sio, conv_id, msg_id, {"linkPreview": preview})

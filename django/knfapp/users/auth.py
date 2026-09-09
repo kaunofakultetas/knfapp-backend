@@ -40,7 +40,7 @@ from django.db import OperationalError
 
 
 from knfapp.common.http import json_error
-from knfapp.common.timestamps import parse_stored, utc_now_iso
+from knfapp.common.timestamps import parse_stored, utc_now
 from knfapp.notifications.models import PushToken
 from knfapp.users.models import Session, User
 
@@ -109,17 +109,16 @@ def bearer_token(request):
 ############################################################
 #
 # The one token → user lookup for BOTH transports — REST
-# here, and the socket handshake once the chat app lands —
-# so the two paths can never drift apart. Takes the RAW
-# token, looks up its sha256, and returns the user narrowed
-# to the public columns as a plain dict, or None for an
-# unknown/expired token or a deactivated account.
+# and the chat socket handshake — so the two paths can
+# never drift apart. Takes the RAW token, looks up its
+# sha256, and returns the user narrowed to the public
+# columns as a plain dict, or None for an unknown/expired
+# token or a deactivated account.
 #
-# Expiry is compared aware-to-aware (parse_stored assumes
-# UTC for naive legacy stamps; malformed counts as expired
-# — a 401, never a 500). An expired row is purged on the
-# spot together with the user's push_tokens rows (a device
-# that can no longer authenticate must not keep getting
+# Expiry is compared aware-to-aware (malformed counts as
+# expired — a 401, never a 500). An expired row is purged
+# on the spot together with the user's push_tokens rows (a
+# device without a live session must not keep getting
 # message previews); the purge is best-effort — a locked
 # database yields a clean None, not a 500.
 #
@@ -129,7 +128,7 @@ def bearer_token(request):
 #
 # Used by:
 #   - get_current_user (below)
-#   - the chat app's socket handshake, when it lands
+#   - chat/events.py — the socket handshake
 ############################################################
 
 _PUBLIC_FIELDS = (
@@ -153,8 +152,7 @@ def resolve_session_token(token):
     if expires is None or expires < datetime.now(timezone.utc):
         try:
             Session.objects.filter(token=hash_token(token)).delete()
-            # Push dies with the session — a device that can no
-            # longer authenticate must not keep getting previews
+            # Push dies with the session — reason in the banner
             PushToken.objects.filter(user_id=row["user_id"]).delete()
         except OperationalError:
             logger.warning("Expired-session purge skipped (database locked)")
@@ -188,7 +186,7 @@ def resolve_session_token(token):
 #
 # Used by:
 #   - require_auth / require_role (below)
-#   - news/social feed views (optional auth), when they land
+#   - news/social feed views — optional auth
 ############################################################
 
 def get_current_user(request):
@@ -223,7 +221,9 @@ def get_current_user(request):
 #
 # Used by:
 #   - api/auth_views.py — me, logout, logout_all
-#   - every protected route of the apps still to come
+#   - the protected routes across the apps (news, social,
+#     chat, uploads, wayfind, memes, notifications,
+#     scraper, admin)
 ############################################################
 
 def require_auth(view):
@@ -276,12 +276,12 @@ def require_role(*roles):
 
 def mint_session(user_id):
     token = str(uuid.uuid4())
-    expires_at = (datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)).isoformat()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
     Session.objects.create(
         id=str(uuid.uuid4()),
         user_id=user_id,
         token=hash_token(token),
-        created_at=utc_now_iso(),
+        created_at=utc_now(),
         expires_at=expires_at,
     )
 
@@ -308,10 +308,10 @@ def mint_session(user_id):
 # login and /me. It doubles as the whitelist —
 # password_hash, active and the timestamps never leave.
 # Tolerates a partial dict (register's hand-built one):
-# absent columns fall back to None, `invited` to 1.
+# absent columns fall back to None, `invited` to True.
 #
 # Used by:
-#   - api/auth_views.py — register, login, me
+#   - api/auth_views.py — register, login, me, update_me
 ############################################################
 
 def serialize_user(u):
@@ -322,7 +322,7 @@ def serialize_user(u):
         "displayName": u.get("display_name"),
         "role": u.get("role"),
         "avatarUrl": u.get("avatar_url"),
-        "invited": bool(u.get("invited", 1)),
+        "invited": bool(u.get("invited", True)),
         "studentNumber": u.get("student_number"),
         "studyGroup": u.get("study_group"),
         "studyProgram": u.get("study_program"),
@@ -339,7 +339,7 @@ def serialize_user(u):
 # validate_new_password
 ############################################################
 #
-# The one password policy, shared by register and (later)
+# The one password policy, shared by register and
 # change-password: 6 chars minimum, 72 BYTES maximum
 # (bcrypt truncates past 72, so a longer password would
 # equal its prefix), must not contain the username or the
@@ -350,14 +350,14 @@ def serialize_user(u):
 # — the slug the app translates.
 #
 # Used by:
-#   - api/auth_views.py — register
+#   - api/auth_views.py — register, change_password
 ############################################################
 
 def validate_new_password(password, username, email):
     if len(password) < 6:
         return "Password must be at least 6 characters"
     if len(password.encode("utf-8")) > PASSWORD_MAX_BYTES:
-        return "Password must be at most 72 characters"
+        return "Password must be at most 72 bytes"
 
     lowered = password.lower()
     if username and username.lower() in lowered:

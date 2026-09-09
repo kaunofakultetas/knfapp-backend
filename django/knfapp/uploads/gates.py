@@ -6,9 +6,9 @@
 #  disk, no database — so each rule pins down to a byte
 #  table in the tests. The rule of every gate: the client's
 #  filename only ever shapes an error message or a cheap
-#  pre-filter; what gets STORED is what
-#  the bytes prove (signatures for documents/videos/audio,
-#  the Pillow re-encode for images).
+#  pre-filter; what gets STORED is what the bytes prove
+#  (signatures for documents/videos/audio, the Pillow
+#  re-encode for images).
 #
 #  Split into:
 #
@@ -166,11 +166,11 @@ def accept_audio(filename, blob):
 # The name pre-filter exists only to phrase the rejection
 # when the bytes already failed to look like an image; a
 # name with NO extension passes (web pickers send blobs
-# called "blob"/"image" — rejecting those was the old
-# gate's real-world failure). sniff reads the first bytes
-# and answers the format they announce, or None; WebP keeps
-# its RIFF+WEBP double check. A CHEAP first opinion — the
-# re-encode decides what is stored.
+# called "blob"/"image"). sniff reads the first bytes and
+# answers the format they announce, or None; WebP takes a
+# RIFF+WEBP double check — RIFF alone is any container. A
+# CHEAP first opinion — the re-encode decides what is
+# stored.
 #
 # Used by:
 #   - api/views.py upload_file — the image branch

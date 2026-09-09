@@ -53,7 +53,7 @@ class Meme(models.Model):
     height = models.IntegerField(null=True, blank=True)
     preview = models.TextField(null=True, blank=True)
     search = models.TextField(null=True, blank=True)
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:

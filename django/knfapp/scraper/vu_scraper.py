@@ -18,7 +18,7 @@
 #  Dedup key and stored source_url are the canonical
 #  normalise_url form of the POST-REDIRECT URL, so one
 #  article behind two links (or a campaign-tagged one) is
-#  stored once; INSERT OR IGNORE is the backstop, and the
+#  stored once; ON CONFLICT DO NOTHING is the backstop, and the
 #  run lock is the same two layers as knf_scraper.py's — the
 #  module threading.Lock in-process, common.open_run across
 #  the gunicorn workers and the cron container.
@@ -31,9 +31,9 @@
 #  (declined via scraper/plurals.py) plus an English variant
 #  for devices registered with language 'en' — unless
 #  common.push_allowed calls it a backfill, a burst or an
-#  hourly repeat. published_at is naive UTC with the site's
-#  offset APPLIED and clamped to the last five years;
-#  created_at/updated_at are stamped in the house ISO-T form.
+#  hourly repeat. published_at is aware UTC (+00:00) with
+#  the site's offset APPLIED and clamped to the last five
+#  years; created_at/updated_at are stamped aware UTC too.
 ############################################################
 
 
@@ -47,7 +47,7 @@ from bs4 import BeautifulSoup
 
 from django.db import connection, transaction
 
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now
 from knfapp.news.models import NewsPost
 from knfapp.scraper.common import (
     MAX_CONTENT_LENGTH,
@@ -90,9 +90,9 @@ RUN_BUDGET_SECONDS = 600
 # segment: "/naujienos/kazkoks-straipsnis",
 # "/lt/visos-naujienos/tema/straipsnis". The category root
 # itself ("/naujienos/", "/lt/naujienos") has no segment after
-# it and is a LISTING page — storing one as an article is how
-# a category page ended up in the feed. Segments BEFORE the
-# category are free (a language prefix, a faculty section)
+# it and is a LISTING page — matching it would put a category
+# page in the feed. Segments BEFORE the category are free (a
+# language prefix, a faculty section)
 _ARTICLE_PATH_RE = re.compile(
     r"^(?:/[^/]+)*?/(?:visos-)?naujienos/(?:[^/]+/)*(?P<slug>[^/]+)/?$",
     re.IGNORECASE,
@@ -106,12 +106,14 @@ _NON_ARTICLE_SLUGS = frozenset({"naujienos", "visos-naujienos", "page", "puslapi
 _RUN_LOCK = threading.Lock()
 
 # Every NOT NULL column named — the Django-built table has no
-# DDL defaults (see knf_scraper._INSERT_SQL)
+# DDL defaults — and is_public bound as Python True so each
+# engine stores its native boolean (see knf_scraper._INSERT_SQL)
 _INSERT_SQL = """
-    INSERT OR IGNORE INTO news_posts
+    INSERT INTO news_posts
       (id, title, content, summary, image_url, author_name, source, source_url, post_type,
        is_public, likes_count, comments_count, shares_count, published_at, created_at, updated_at)
-    VALUES (%s, %s, %s, %s, %s, %s, 'vu.lt', %s, 'article', 1, 0, 0, 0, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, 'vu.lt', %s, 'article', %s, 0, 0, 0, %s, %s, %s)
+    ON CONFLICT (source_url) DO NOTHING
 """
 
 
@@ -134,14 +136,14 @@ _INSERT_SQL = """
 # fetch or anything else fails, and {"skipped": True} when
 # another run holds the source. `found` counts distinct
 # article links considered, stored or not; `new` counts rows
-# actually inserted (INSERT OR IGNORE rowcount).
+# actually inserted (the DO NOTHING insert's rowcount).
 #
 # `pages` is the MINIMUM number of listing pages walked:
 # paging continues past it while pages yield unseen articles
 # and stops on MAX_LISTING_PAGES, MAX_ARTICLE_FETCHES or the
 # wall-clock budget. A link is only marked seen once it has
 # a usable title, so a card whose image anchor precedes its
-# text anchor is no longer lost for the run.
+# text anchor is not lost for the run.
 #
 # A listing page that DOWNLOADED and yielded no article link
 # fails the run: the whole harvest is one anchor heuristic
@@ -287,9 +289,10 @@ def _run(run_id, pages, notify, deadline):
         articles_new = 0
         with transaction.atomic():
             for full_url, listing_title, article_data in pending:
-                # The article page's own <h1>, then the listing link
-                # text — storing an unparsable page as
-                # "Untitled" would keep every later run from revisiting it
+                # The article page's own <h1>, then the listing
+                # link text — storing an unparsable page as
+                # "Untitled" would keep every later run from
+                # revisiting it
                 title = (article_data["title"] or listing_title)[:MAX_TITLE_LENGTH]
 
                 # Nothing recognisable on the page at all: write NO
@@ -305,7 +308,7 @@ def _run(run_id, pages, notify, deadline):
                     logger.info("vu.lt article already stored under another URL: %s", title)
                     continue
 
-                now = utc_now_iso()
+                now = utc_now()
                 with connection.cursor() as cursor:
                     cursor.execute(_INSERT_SQL, (
                         str(uuid.uuid4()),
@@ -315,6 +318,7 @@ def _run(run_id, pages, notify, deadline):
                         article_data["image_url"],
                         article_data["author"],
                         full_url,
+                        True,  # is_public — a scraped article is guest-visible
                         article_data["date"],
                         now,
                         now,
@@ -384,7 +388,7 @@ def _run(run_id, pages, notify, deadline):
 # "title"}], in page order. An href qualifies only when its
 # PATH is article-shaped (_is_article_href): the news
 # category plus at least one more segment, so a category
-# root or a paging link can no longer be stored as a news
+# root or a paging link cannot be stored as a news
 # article. Counting slashes instead of matching the path
 # shape would let "/lt/naujienos/" through.
 #
@@ -397,8 +401,9 @@ def _run(run_id, pages, notify, deadline):
 # would drop every image-first card.
 #
 # The anchor text is joined with SPACES: a headline split
-# across <span>/<b> came out as one run-together word, and
-# that word is what a page with no <h1> stores as its title.
+# across <span>/<b> would otherwise harvest as one run-
+# together word — the very text a page with no <h1> stores
+# as its title.
 #
 # Used by:
 #   - scrape_vu_news (above) — once per listing page
@@ -511,18 +516,17 @@ def _is_article_href(href: str) -> bool:
 # store no row at all. "url" is the canonical POST-REDIRECT
 # URL — the key the caller stores and dedupes on. The image
 # candidates go through common.validate_image_url.
-# Everything else is
-# selector guesswork against a Next.js site with no stable
-# markup contract:
+# Everything else is selector guesswork against a Next.js
+# site with no stable markup contract:
 #
 #   - title: the first <h1> HOLDING TEXT. The three fallback
 #     selectors ("article h1", "[class*='title'] h1",
 #     "main h1") all match a subset of "h1", so they only
 #     ever fire when an empty <h1> stands in front of the
 #     real one — a bs4 4.13 tag is truthy whatever it holds
-#   - content: <article>, else [class*='content'], else
-#     <main> ("main article" is dead the same way), taking
-#     the first that is left with text;
+#   - content: <article>, else "main article", else
+#     [class*='content'], else <main>, taking the first
+#     that is left with text;
 #     script/style/nav/header/footer/aside inside it are
 #     decompose()d, which MUTATES the shared soup — the
 #     image and date lookups below only see what survived,
@@ -531,11 +535,9 @@ def _is_article_href(href: str) -> bool:
 #   - summary: og:description / meta description when the
 #     page carries one, else the body with its leading
 #     chrome dropped — see _article_summary
-#   - image: og:image verbatim, else the first <img> whose
-#     src names vu.lt and is not a logo/icon/pixel/
-#     tracking/avatar; a relative src gets BASE_URL
-#     ("newshub.vu.lt" is a redundant test — it contains
-#     "vu.lt")
+#   - image: og:image, else the first <img> not looking
+#     like a logo/icon/pixel/tracking/avatar; every
+#     candidate goes through common.validate_image_url
 #   - date: the first article:published_time meta that
 #     carries a content attribute, else <time>
 #     datetime attr or text, parsed by
@@ -546,7 +548,7 @@ def _is_article_href(href: str) -> bool:
 #   - author: the constant "Vilniaus universitetas"
 #
 # Title, content and summary come back cut to the same
-# limits news/routes.py enforces on hand-written posts.
+# limits the news views enforce on hand-written posts.
 #
 # Used by:
 #   - scrape_vu_news (above) — once per unseen link
@@ -603,12 +605,11 @@ def _fetch_vu_article(url):
     summary = _article_summary(soup, content, title)
 
 
-    # STEP 4: image — og:image wins (the reliable one on a Next.js
-    # site), else the first <img> that is not chrome.
+    # STEP 4: image — og:image wins (the reliable one on a
+    # Next.js site), else the first <img> that is not chrome.
     # validate_image_url resolves the src against THIS page and
-    # holds it to the image host allowlist and the length cap, so
-    # the "vu.lt in src" substring test is no longer the guard
-    # ============================================================
+    # holds it to the image host allowlist and the length cap
+    # =========================================================
     image_url = None
     og_image = soup.find("meta", {"property": "og:image"})
     if og_image and og_image.get("content"):
@@ -679,7 +680,7 @@ def _fetch_vu_article(url):
 # bylines are all short lines, so lines under 40 characters,
 # lines equal to the title and date-shaped lines are skipped
 # until the first real paragraph. Without this the median
-# vu.lt teaser was a few dozen characters of navigation.
+# vu.lt teaser would be a few dozen characters of navigation.
 # The result is 200 characters cut back to a word boundary.
 #
 # Used by:

@@ -35,17 +35,21 @@ from django.db import models
 # -----------------------------------------------------------
 
 class ScheduleLesson(models.Model):
-    # Columns
+    # Columns — the four natural-key text columns are NOT
+    # NULL on purpose: a NULL inside the unique key would be
+    # distinct from every twin (SQLite), so dedup and the
+    # partition purge only work over '' — NOT NULL makes ''
+    # the one shape a missing value can take
     id = models.TextField(primary_key=True)
     title = models.TextField()
-    teacher = models.TextField(null=True, blank=True)
-    room = models.TextField(null=True, blank=True)
+    teacher = models.TextField(default="", blank=True)
+    room = models.TextField(default="", blank=True)
     time_start = models.TextField()
     time_end = models.TextField()
     day_of_week = models.IntegerField()
-    group_name = models.TextField(null=True, blank=True)
-    semester = models.TextField(null=True, blank=True)
-    created_at = models.TextField()
+    group_name = models.TextField(default="", blank=True)
+    semester = models.TextField(default="", blank=True)
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -53,10 +57,10 @@ class ScheduleLesson(models.Model):
         constraints = [
             models.CheckConstraint(condition=models.Q(day_of_week__gte=0, day_of_week__lte=6),
                                    name="schedule_lessons_day_check"),
-            # The natural key — the whole row IS the
-            # identity, and the scraper's INSERT OR IGNORE dedups on it.
-            # NULLs count as distinct here, which is why the scraper
-            # stores "" and never None for teacher/room
+            # The natural key — the whole row IS the identity,
+            # and the scraper's conflict-ignoring insert dedups
+            # on it. The NOT NULL defaults above keep it total:
+            # no row can ever hold the NULL that would dodge it
             models.UniqueConstraint(
                 fields=["semester", "group_name", "day_of_week", "time_start", "time_end",
                         "title", "teacher", "room"],

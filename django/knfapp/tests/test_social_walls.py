@@ -51,7 +51,7 @@ class WallCrudTests(TestCase):
         bearer(self.client.put, f"/api/social/posts/{post.id}", self.token,
                data={"content": "naujas turinys"}, content_type="application/json")
         post.refresh_from_db()
-        self.assertEqual(post.published_at, "2026-01-01T10:00:00+00:00")
+        self.assertEqual(post.published_at.isoformat(), "2026-01-01T10:00:00+00:00")
 
     def test_own_posts_list_shows_private_only_to_self_and_friends(self):
         create_post(author=self.author, title="Privati", is_public=0)

@@ -7,8 +7,9 @@
 #  (pending → accept/auto-accept/reject-or-cancel, then one
 #  friendships row PER DIRECTION), the caller's own wall
 #  CRUD, blocks (one-directional rows, bidirectional
-#  effect), the report ledger and the activity list. Same
-#  paths, bodies, statuses and slugs as before.
+#  effect), the report ledger and the activity list. Paths,
+#  bodies, statuses and slugs are the frozen wire contract
+#  (swagger/swagger.yaml).
 #
 #  Wall posts live in news_posts — likes/comments/polls
 #  belong to the news app; this one only creates, edits and
@@ -34,12 +35,15 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 
-from django.db import IntegrityError, connection, models, transaction
+from django.db import IntegrityError, models, transaction
+from django.db.models.functions import Coalesce, Greatest, Least
 
 
+from knfapp.chat.models import Message
 from knfapp.common import ratelimit
+from knfapp.common.expressions import JulianDay, JulianDayNow
 from knfapp.common.http import get_json_object, json_error, json_response, parse_pagination
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import as_aware, utc_now
 from knfapp.news.core import (
     MAX_CONTENT_LENGTH,
     MAX_TITLE_LENGTH,
@@ -78,14 +82,34 @@ FRIEND_REQUEST_COOLDOWN_DAYS = 7
 ACTIVITY_PER_PAGE = 30
 
 # The community ranking — recency decay + capped engagement,
-# NO source bonus (walls only rank against walls). julianday
-# is SQLite; a postgres move rewrites this with the news one
-SCORE_SQL = (
-    "COALESCE((1.0 / (1.0 + MAX(0, julianday({now}) - julianday(published_at)))) * 100, 0)"
-    " + COALESCE(MIN(likes_count + comments_count * 2 + shares_count * 3, 100) * 0.5, 0)"
-)
+# NO source bonus (walls only rank against walls). Each term
+# is floored to 0 on its own, matching the news formula's
+# spirit but not its grouping. One ORM annotation; the
+# vendor-split JulianDay expressions carry the engine
+# spelling.
+def _wall_score(ref):
+    recency = Coalesce(
+        models.ExpressionWrapper(
+            1.0 / (1.0 + Greatest(models.Value(0.0), ref - JulianDay(models.F("published_at")))) * 100.0,
+            output_field=models.FloatField(),
+        ),
+        models.Value(0.0),
+    )
+    engagement = Coalesce(
+        models.ExpressionWrapper(
+            Least(
+                models.F("likes_count") + models.F("comments_count") * 2 + models.F("shares_count") * 3,
+                models.Value(100),
+            ) * 0.5,
+            output_field=models.FloatField(),
+        ),
+        models.Value(0.0),
+    )
+    return models.ExpressionWrapper(recency + engagement, output_field=models.FloatField())
 
-REPORT_TARGET_TABLES = {"user": "users", "post": "news_posts", "message": "messages"}
+# The report whitelist: the model a target_type is checked
+# against — always this map's, never the request's
+REPORT_TARGET_MODELS = {"user": User, "post": NewsPost, "message": Message}
 
 
 
@@ -142,7 +166,7 @@ def _parse_before(request):
     pinned = as_utc(parse_iso(raw.replace("Z", "+00:00")))
     if pinned is None:
         return None, json_error("before must be an ISO-8601 timestamp", 400, code="invalid_before")
-    return pinned.isoformat(), None
+    return pinned, None
 
 
 def _blocked_pair(a, b):
@@ -156,11 +180,6 @@ _POST_ROW_FIELDS = (
     "source", "source_url", "post_type", "likes_count", "comments_count",
     "shares_count", "published_at", "is_public", "author_avatar", "author_display_name",
 )
-
-
-def _rows_from_cursor(cursor):
-    columns = [col[0] for col in cursor.description]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
 def _attach_liked(posts, user):
@@ -213,60 +232,46 @@ def social_feed(request):
     user = get_current_user(request)
 
 
-    # STEP 2: visibility WHERE — the active-author and window
-    # floors everybody pays, then the viewer's slice
-    # =======================================================
-    where_clauses = [
-        "p.source = 'user'",
-        "COALESCE(au.active, 1) = 1",
-        f"p.published_at > date('now', '-{FEED_WINDOW_DAYS} day')",
-    ]
-    where_params = []
+    # STEP 2: visibility filter — the active-author and window
+    # floors everybody pays, then the viewer's slice. The
+    # window bound is computed HERE, floored to midnight UTC of
+    # the cutoff day so any stamp on that day stays inside the
+    # window — an ordinary typed range on the stamp column
+    # ========================================================
+    window_floor = (datetime.now(timezone.utc) - timedelta(days=FEED_WINDOW_DAYS)) \
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+    visibility = (
+        models.Q(source="user")
+        & (models.Q(author__active=1) | models.Q(author__isnull=True))
+        & models.Q(published_at__gt=window_floor)
+    )
 
     if user:
         friend_ids = list(Friendship.objects.filter(user_id=user["id"]).values_list("friend_id", flat=True))
         visible_ids = [user["id"]] + friend_ids
-        placeholders = ",".join(["%s"] * len(visible_ids))
-        where_clauses.append(f"(p.author_id IN ({placeholders}) OR p.is_public = 1)")
-        where_params.extend(visible_ids)
+        visibility &= models.Q(author_id__in=visible_ids) | models.Q(is_public=1)
     else:
-        where_clauses.append("p.is_public = 1")
+        visibility &= models.Q(is_public=1)
 
     if before:
-        where_clauses.append("p.published_at <= %s")
-        where_params.append(before)
-
-    where_sql = " AND ".join(where_clauses)
+        visibility &= models.Q(published_at__lte=before)
 
 
-    # STEP 3: the ranked page, the author joined in; the pin is
-    # bound twice when present (score + window)
-    # =========================================================
-    score_sql = SCORE_SQL.format(now="%s" if before else "'now'")
-    score_params = [before] if before else []
-
-    with connection.cursor() as cursor:
-        cursor.execute(
-            f"""SELECT p.*,
-                       au.avatar_url AS author_avatar,
-                       au.display_name AS author_display_name,
-                       {score_sql} AS feed_score
-                FROM news_posts p
-                LEFT JOIN users au ON au.id = p.author_id
-                WHERE {where_sql}
-                ORDER BY feed_score DESC, p.published_at DESC, p.id DESC
-                LIMIT %s OFFSET %s""",
-            score_params + where_params + [per_page, offset],
+    # STEP 3: the ranked page, the author joined in
+    # =============================================
+    ref = JulianDay(models.Value(before)) if before else JulianDayNow()
+    base = NewsPost.objects.filter(visibility)
+    rows = list(
+        base.annotate(
+            feed_score=_wall_score(ref),
+            author_avatar=models.F("author__avatar_url"),
+            author_display_name=models.F("author__display_name"),
         )
-        rows = _rows_from_cursor(cursor)
-
-        cursor.execute(
-            f"""SELECT COUNT(*) FROM news_posts p
-                LEFT JOIN users au ON au.id = p.author_id
-                WHERE {where_sql}""",
-            where_params,
-        )
-        total = cursor.fetchone()[0]
+        .order_by("-feed_score", "-published_at", "-id")
+        .values(*[f.attname for f in NewsPost._meta.concrete_fields],
+                "author_avatar", "author_display_name")[offset:offset + per_page]
+    )
+    total = base.count()
 
 
     # STEP 4: the wire shape (list bodies trimmed) + liked flags
@@ -452,7 +457,7 @@ def update_profile(request):
 
     # STEP 3: one UPDATE, the snapshots with it, then re-read
     # =======================================================
-    updates["updated_at"] = utc_now_iso()
+    updates["updated_at"] = utc_now()
     User.objects.filter(id=request.user["id"]).update(**updates)
     if new_display_name:
         # Same transaction as the rename — posts never show a
@@ -550,7 +555,7 @@ def send_friend_request(request):
 
     if pending:
         if pending["from_user_id"] == target_id:
-            since = utc_now_iso()
+            since = utc_now()
             # get_or_create: a mutual send can leave one direction
             # already written, and the composite PK must not 500
             Friendship.objects.get_or_create(user_id=my_id, friend_id=target_id,
@@ -573,7 +578,7 @@ def send_friend_request(request):
 
     # STEP 3.1: the rejection cooldown + the purge of rows past it
     # ============================================================
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=FRIEND_REQUEST_COOLDOWN_DAYS)).isoformat()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=FRIEND_REQUEST_COOLDOWN_DAYS)
     recently_rejected = FriendRequest.objects.filter(
         status="rejected", from_user_id=my_id, to_user_id=target_id,
     ).annotate(
@@ -592,7 +597,7 @@ def send_friend_request(request):
     # settles a lost race as the same 409
     # ========================================================
     req_id = str(uuid.uuid4())
-    now = utc_now_iso()
+    now = utc_now()
     try:
         with transaction.atomic():
             FriendRequest.objects.create(id=req_id, from_user_id=my_id, to_user_id=target_id,
@@ -689,7 +694,7 @@ def accept_friend_request(request, request_id):
 
     # Both directions — every reader only checks its own; the
     # get_or_create keeps a mutual-send leftover idempotent
-    since = utc_now_iso()
+    since = utc_now()
     Friendship.objects.get_or_create(user_id=fr["from_user_id"], friend_id=fr["to_user_id"],
                                      defaults={"created_at": since})
     Friendship.objects.get_or_create(user_id=fr["to_user_id"], friend_id=fr["from_user_id"],
@@ -720,7 +725,7 @@ def reject_friend_request(request, request_id):
         # A cancel, not a rejection — no cooldown record
         FriendRequest.objects.filter(id=request_id).delete()
     else:
-        FriendRequest.objects.filter(id=request_id).update(status="rejected", updated_at=utc_now_iso())
+        FriendRequest.objects.filter(id=request_id).update(status="rejected", updated_at=utc_now())
     # Withdrawn or declined, the ask leaves the activity list
     drop_activity(fr["to_user_id"], "connect_request", fr["from_user_id"], request_id)
 
@@ -741,8 +746,8 @@ def list_friends(request):
         display_name=models.F("friend__display_name"),
         avatar_url=models.F("friend__avatar_url"),
         role=models.F("friend__role"),
-        # NOCASE folds ASCII case only; real Lithuanian collation
-        # lives client-side, exactly as before
+        # Lower() folds ASCII case only on SQLite; real
+        # Lithuanian collation lives client-side
         sort_name=models.functions.Lower("friend__display_name"),
     ).order_by("sort_name", "friend_id").values(
         "friend_id", "username", "display_name", "avatar_url", "role", "created_at",
@@ -841,13 +846,13 @@ def create_post(request):
     # producer every read path uses
     # ===========================================================
     post_id = str(uuid.uuid4())
-    now = utc_now_iso()
+    now = utc_now()
     NewsPost.objects.create(
         id=post_id, title=title, content=content, summary=content[:SUMMARY_LENGTH],
         image_url=image_url,
         author_id=request.user["id"], author_name=request.user["display_name"],
         source="user", source_url=None, post_type="social",
-        is_public=1 if is_public else 0, published_at=now, created_at=now, updated_at=now,
+        is_public=is_public, published_at=now, created_at=now, updated_at=now,
     )
 
     row = NewsPost.objects.filter(id=post_id).annotate(
@@ -951,7 +956,7 @@ def update_post(request, post_id):
         return json_error("No fields to update", 400)
 
     # published_at untouched — an edit never re-ranks the feed
-    updates["updated_at"] = utc_now_iso()
+    updates["updated_at"] = utc_now()
     NewsPost.objects.filter(id=post_id).update(**updates)
     return json_response({"status": "updated"})
 
@@ -1015,7 +1020,7 @@ def block_user(request):
         return json_error("User not found", 404)
 
     UserBlock.objects.get_or_create(blocker_id=my_id, blocked_id=target_id,
-                                    defaults={"created_at": utc_now_iso()})
+                                    defaults={"created_at": utc_now()})
     Friendship.objects.filter(
         models.Q(user_id=my_id, friend_id=target_id) | models.Q(user_id=target_id, friend_id=my_id),
     ).delete()
@@ -1071,13 +1076,11 @@ def list_blocks(request):
 ############################################################
 #
 # POST /api/social/reports — {target_type, target_id,
-# reason}. The target must exist in the table its type
-# names (the whitelist dict, never the request); a report
+# reason}. The target must exist in the model its type
+# names (the whitelist map, never the request); a report
 # is never anonymous to the admins, only to the reported.
-# The 'message' target checks the chat table — until the
-# chat app ports, a fresh Django database has no messages
-# table and such a report answers the same 404 as a missing
-# target (documented in README's migration map).
+# An unknown type is the 400 naming the three valid ones,
+# a missing target the plain 404.
 #
 # Used by:
 #   - services/api/social.ts reportTarget — the profile's
@@ -1094,7 +1097,7 @@ def create_report(request):
         return json_error("JSON body required", 400)
 
     target_type = data.get("target_type")
-    if target_type not in REPORT_TARGET_TABLES:
+    if target_type not in REPORT_TARGET_MODELS:
         return json_error("target_type must be one of: user, post, message", 400)
 
     target_id = data.get("target_id")
@@ -1110,20 +1113,10 @@ def create_report(request):
         return json_error("reason must be at most 1000 characters", 400)
 
 
-    # STEP 2: the target must exist in its own table — raw on
-    # purpose (the table name is the whitelist's, and 'messages'
-    # may not exist until the chat app lands)
-    # =========================================================
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                f"SELECT 1 FROM {REPORT_TARGET_TABLES[target_type]} WHERE id = %s LIMIT 1",  # noqa: S608 — whitelisted name
-                (target_id,),
-            )
-            exists = cursor.fetchone()
-    except Exception:
-        exists = None
-    if not exists:
+    # STEP 2: the target must exist in the model its type
+    # names — the whitelist map's, never the request's
+    # ===================================================
+    if not REPORT_TARGET_MODELS[target_type].objects.filter(id=target_id).exists():
         return json_error("Report target not found", 404)
 
 
@@ -1131,7 +1124,7 @@ def create_report(request):
     # ===============
     report_id = str(uuid.uuid4())
     Report.objects.create(id=report_id, reporter_id=request.user["id"], target_type=target_type,
-                          target_id=target_id, reason=reason, created_at=utc_now_iso())
+                          target_id=target_id, reason=reason, created_at=utc_now())
     return json_response({"status": "submitted", "id": report_id}, status=201)
 
 
@@ -1162,7 +1155,10 @@ def list_activity(request):
     cursor_param = request.GET.get("cursor", "")
     before, before_id = None, None
     if cursor_param and "|" in cursor_param:
-        before, before_id = cursor_param.split("|", 1)
+        # parse_iso repairs what a query string does to a stamp
+        # (the '+' of the offset arrives as a space)
+        raw_before, before_id = cursor_param.split("|", 1)
+        before = as_utc(parse_iso(raw_before))
 
     base = Activity.objects.filter(user_id=request.user["id"])
     if before and before_id:
@@ -1197,7 +1193,7 @@ def list_activity(request):
         }
         for r in page
     ]
-    next_cursor = f'{page[-1]["created_at"]}|{page[-1]["id"]}' if page and has_more else None
+    next_cursor = f'{page[-1]["created_at"].isoformat()}|{page[-1]["id"]}' if page and has_more else None
     return json_response({
         "notifications": notifications,
         "hasMore": has_more,

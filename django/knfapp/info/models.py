@@ -40,8 +40,8 @@ class FacultyInfo(models.Model):
     id = models.TextField(primary_key=True)
     lang = models.TextField(default="lt")
     section = models.TextField()
-    data_json = models.TextField()
-    scraped_at = models.TextField()
+    data_json = models.JSONField()
+    scraped_at = models.DateTimeField()
 
     # Table metadata
     class Meta:

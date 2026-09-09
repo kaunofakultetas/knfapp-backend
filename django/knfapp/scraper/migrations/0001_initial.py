@@ -1,14 +1,13 @@
 ############################################################
-#  [*] scraper 0001 — the run ledger
+#  [*] scraper 0001 — run bookkeeping
 #
-#  Matches models.py exactly (the suite runs
-#  `makemigrations --check`, so drift fails the tests, not
-#  a deploy). Table/column names match the production
-#  database so the data cutover is a row copy; the source+
-#  started_at index carries a shortened name (the live
-#  31-char one is over Django's cap — names play no part in
-#  the copy).
+#  One table with the per-source status/started indexes the
+#  run lock and the status endpoint lean on.
+#
+#  Head of its app's chain; the suite runs `makemigrations
+#  --check`, so drift against models.py fails the tests.
 ############################################################
+
 
 
 from django.db import migrations, models
@@ -31,8 +30,8 @@ class Migration(migrations.Migration):
                 ('articles_found', models.IntegerField(default=0)),
                 ('articles_new', models.IntegerField(default=0)),
                 ('error_message', models.TextField(blank=True, null=True)),
-                ('started_at', models.TextField()),
-                ('finished_at', models.TextField(blank=True, null=True)),
+                ('started_at', models.DateTimeField()),
+                ('finished_at', models.DateTimeField(blank=True, null=True)),
             ],
             options={
                 'db_table': 'scraper_runs',

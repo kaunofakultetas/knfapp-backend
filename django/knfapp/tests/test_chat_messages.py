@@ -298,18 +298,9 @@ class DisappearingTests(ChatMessageTestCase):
 
 class SearchTests(ChatMessageTestCase):
 
-    def test_like_wildcards_match_literally_on_the_fallback(self):
-        # The FTS arm tokenizes '%' away (its own, correct
-        # semantics); the escape rule
-        # governs the LIKE FALLBACK, so make FTS unavailable the
-        # way a FTS5-less build would be. SQLite DDL is
-        # transactional — the harness rolls the drop back
-        from django.db import connection
-        with connection.cursor() as cursor:
-            for trigger in ("messages_fts_ai", "messages_fts_ad", "messages_fts_au"):
-                cursor.execute(f"DROP TRIGGER IF EXISTS {trigger}")
-            cursor.execute("DROP TABLE IF EXISTS messages_fts")
-
+    def test_like_wildcards_match_literally(self):
+        # The search needle's % must match the CHARACTER, never
+        # become a wildcard that also answers the 100x row
         create_message(self.room, self.ona, text="Pasiekta 100% tikslo")
         create_message(self.room, self.ona, text="Pasiekta 100x tikslo")
         response = json.loads(bearer(self.client.get,

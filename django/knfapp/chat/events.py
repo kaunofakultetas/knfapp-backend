@@ -10,7 +10,7 @@
 #  Facts the rest of the stack leans on:
 #    - Auth is the session token in the handshake's auth
 #      payload (the client passes `auth: { token }`), with
-#      the legacy ?token=… query string kept as a fallback.
+#      a ?token=… query-string fallback for older clients.
 #      The lookup is auth's resolve_session_token, the SAME
 #      function REST goes through: sha256 token hashing,
 #      aware expiry, expired-row purge, users.active gate.
@@ -18,16 +18,14 @@
 #      Everything that revokes access afterwards (logout,
 #      logout-all, password change, admin deactivation,
 #      erasure) calls disconnect_user_sockets below — the
-#      helper every guarded lazy import elsewhere has been
-#      waiting for.
+#      target of the guarded lazy imports elsewhere.
 #    - Presence is _connected_users, a plain dict in this
 #      process (sid → user id). Gunicorn runs ONE gthread
 #      worker (see socket.py), which is the only reason a
 #      process-local dict is right. api/views.py reads it
 #      for create_conversation, the send_message push skip
-#      and /online-status, so its VALUES stay bare user
-#      ids; the display name lives in the parallel
-#      sid-keyed _connected_names.
+#      and /online-status; the display name lives in the
+#      sid-keyed _connected_names beside it.
 #    - Connections are capped per user and per process; an
 #      excess handshake is rejected, live sockets are left
 #      alone.
@@ -70,10 +68,11 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from datetime import datetime, timezone
 from urllib.parse import parse_qs
 
-from django.db import close_old_connections, connection
+from django.db import close_old_connections
+
+from knfapp.chat.models import ConversationParticipant, Message
 
 # The one token → user lookup in the backend: REST reaches it
 # through get_current_user, the handshake below calls it
@@ -128,12 +127,9 @@ _SOCKET_RATE_LIMITS: dict = {
 
 
 def _is_member(conv_id, user_id):
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT 1 FROM conversation_participants WHERE conversation_id = %s AND user_id = %s",
-            (conv_id, user_id),
-        )
-        return cursor.fetchone() is not None
+    return ConversationParticipant.objects.filter(
+        conversation_id=conv_id, user_id=user_id,
+    ).exists()
 
 
 
@@ -154,9 +150,9 @@ def _is_member(conv_id, user_id):
 # with no entry in _SOCKET_RATE_LIMITS always passes.
 #
 # The whole prune-count-append runs under _socket_rate_lock:
-# without it two threads that read the same window both saw
-# room and both recorded, so N threads could spend one slot
-# N times. The store bounds itself in the same pass: a key
+# without it two threads reading the same window would both
+# see room and both record — one slot spent N times. The
+# store bounds itself in the same pass: a key
 # never keeps expired timestamps and the LRU tail is dropped
 # once the key count passes _SOCKET_RATE_MAX_KEYS.
 #
@@ -214,10 +210,10 @@ def reset_socket_state():
 ############################################################
 #
 # Resolves the handshake token — the `auth: { token }`
-# payload, or, for clients from before that switch, the
-# legacy ?token= query parameter off the WSGI environ — to
-# the caller's user dict, or None for a missing, unknown,
-# unencodable, expired or deactivated one. Only the token
+# payload, or the ?token= query-parameter fallback older
+# clients send, off the WSGI environ — to the caller's
+# user dict, or None for a missing, unknown, unencodable,
+# expired or deactivated one. Only the token
 # EXTRACTION lives here: the lookup is auth's
 # resolve_session_token, byte for byte the one REST uses.
 #
@@ -271,9 +267,9 @@ def _authenticate_socket(environ, auth):
 # that died between the snapshot and the call, is not an
 # error — the caller's own route must not fail over it.
 #
-# This is the function the guarded imports elsewhere (auth
-# logout/change-password/erasure, admin deactivate/delete)
-# resolve — every revocation path ends here.
+# Every revocation path (auth logout/change-password/
+# erasure, admin deactivate/delete) reaches it through a
+# guarded lazy import.
 #
 # Used by:
 #   - users/api/auth_views.py — _disconnect_user_sockets
@@ -406,19 +402,15 @@ def register_socket_events(sio):
             return False
 
         try:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT conversation_id FROM conversation_participants WHERE user_id = %s",
-                    (user_id,),
-                )
-                rows = cursor.fetchall()
-            for (room_id,) in rows:
+            room_ids = list(ConversationParticipant.objects.filter(user_id=user_id)
+                            .values_list("conversation_id", flat=True))
+            for room_id in room_ids:
                 sio.enter_room(sid, f"conv:{room_id}")
 
             _connected_users[sid] = user_id
             _connected_names[sid] = user["display_name"] or "Unknown"
 
-            logger.info("Socket connected: user=%s sid=%s rooms=%d", user_id, sid, len(rows))
+            logger.info("Socket connected: user=%s sid=%s rooms=%d", user_id, sid, len(room_ids))
             sio.emit("connected", {"userId": user_id}, to=sid)
         except Exception:
             # No half-connected sid may survive in the presence
@@ -586,15 +578,13 @@ def register_socket_events(sio):
     ############################################################
     #
     # "mark_read" {conversationId} — the socket twin of
-    # PUT /api/chat/conversations/<id>/read. Both call
-    # api/views.py _apply_mark_read: the membership gate, the
-    # bounded receipt scan, the single set-based INSERT and
-    # the last_read_at move inside ONE BEGIN IMMEDIATE
-    # transaction. Only the transport gates stay here; a None
-    # back from the helper (not a participant) is a silent
-    # drop where the REST twin answers 403. Capped at 10 per
-    # 10 s per user, a budget SHARED with the REST twin. When
-    # at least one receipt was new, "messages_read" goes out
+    # PUT /api/chat/conversations/<id>/read. Both transports
+    # call api/views.py _apply_mark_read (see its banner);
+    # only the transport gates live here. A None back from
+    # the helper (not a participant) is a silent drop where
+    # the REST twin answers 403. Capped at 10 per 10 s per
+    # user, a budget SHARED with the REST twin. When at
+    # least one receipt was new, "messages_read" goes out
     # through emit_read_receipt — targeted at the affected
     # senders and the reader's own sockets, not the room.
     ############################################################
@@ -616,8 +606,9 @@ def register_socket_events(sio):
         # module the same way, and only one of the two may bind
         # at import time
         from knfapp.chat.api.views import _apply_mark_read
+        from knfapp.common.timestamps import utc_now
 
-        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        now = utc_now()
         newly_read_ids = _apply_mark_read(conv_id, user_id, now)
 
         if newly_read_ids:
@@ -706,18 +697,13 @@ def _read_receipt_sids(reader_id, message_ids):
         return None
 
     try:
-        placeholders = ",".join(["%s"] * len(message_ids))
-        with connection.cursor() as cursor:
-            cursor.execute(
-                f"SELECT DISTINCT sender_id FROM messages WHERE id IN ({placeholders})",
-                list(message_ids),
-            )
-            rows = cursor.fetchall()
+        rows = list(Message.objects.filter(id__in=list(message_ids))
+                    .values_list("sender_id", flat=True).distinct())
     except Exception:
         logger.exception("Read-receipt targeting failed for reader=%s", reader_id)
         return None
 
-    interested = {sender_id for (sender_id,) in rows}
+    interested = set(rows)
     interested.add(reader_id)
     # list() snapshot: other threads connect and disconnect
     return [sid for sid, uid in list(_connected_users.items()) if uid in interested]

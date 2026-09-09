@@ -4,7 +4,7 @@
 #  knf.vu.lt (2 listing pages) then vu.lt (1), each under
 #  its own guard so one source failing outside its own
 #  handler cannot leave the other unscraped for a tick.
-#  Push notifications stay ON here — this command IS the
+#  Push notifications are ON here — this command IS the
 #  scheduled run; the admin trigger routes are the ones
 #  that pass notify=False. The scrapers record their own
 #  success/failure in scraper_runs; the guards here only

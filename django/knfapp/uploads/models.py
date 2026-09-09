@@ -1,8 +1,7 @@
 ############################################################
 #  [*] uploads — the ownership ledger
 #
-#  Shape matches the live schema — see users/models.py for
-#  the policy.
+#  Shape policy as in users/models.py.
 #
 #  Models:
 #    - Upload — one claim ticket per stored file
@@ -41,15 +40,20 @@ from knfapp.users.models import User
 # -----------------------------------------------------------
 
 class Upload(models.Model):
-    # Columns
+    # Columns — the FK's auto-index would duplicate
+    # idx_uploads_user below
     id = models.TextField(primary_key=True)
     filename = models.TextField(unique=True)
     user = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL,
-                             db_column="user_id", related_name="uploads")
+                             db_column="user_id", db_index=False, related_name="uploads")
     byte_size = models.IntegerField(default=0)
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
         db_table = "uploads"
-        indexes = [models.Index(fields=["user"], name="idx_uploads_user")]
+        indexes = [
+            models.Index(fields=["user"], name="idx_uploads_user"),
+            # The admin listing shows newest first
+            models.Index(fields=["-created_at"], name="idx_uploads_created"),
+        ]

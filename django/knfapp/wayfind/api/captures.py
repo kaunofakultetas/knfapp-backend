@@ -40,7 +40,6 @@
 
 
 import io
-import json
 import logging
 import os
 import re
@@ -48,12 +47,12 @@ import re
 from PIL import Image, ImageOps
 
 from knfapp.common import ratelimit
-from knfapp.common.db import execute as db_execute, q1
 from knfapp.common.http import get_json_object, json_error, json_response
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now
 from knfapp.uploads.gates import MAX_IMAGE_PIXELS as BOMB_GUARD_PIXELS
 from knfapp.users.auth import require_role
 from knfapp.wayfind.api.views import ENTITY_ID_RE, _load_building, _multipart
+from knfapp.wayfind.models import WfCapture, WfCaptureFrame, WfPanorama
 from knfapp.wayfind.store import store_dir, write_replace
 
 
@@ -187,19 +186,16 @@ def create_capture(request, building_id):
     # treat as a rejection
     # =====================================================
     scoped = f"{building_id}:{capture_id}"
-    existing = q1("SELECT status FROM wf_captures WHERE id = %s", (scoped,))
+    existing = WfCapture.objects.filter(id=scoped).values("status").first()
     if existing is not None:
         return json_response({"id": capture_id, "status": existing["status"]}, status=200)
 
-    now = utc_now_iso()
-    db_execute(
-        """
-        INSERT INTO wf_captures (id, building_id, node_id, mode, frame_hfov_deg, targets, expected,
-                                 status, progress_pct, report, pano_id, created_by, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, 'uploading', 0, NULL, NULL, %s, %s, %s)
-        """,
-        (scoped, building_id, node_id, mode, float(hfov), json.dumps(clean_targets, ensure_ascii=False),
-         len(clean_targets), request.user["id"], now, now),
+    now = utc_now()
+    WfCapture.objects.create(
+        id=scoped, building_id=building_id, node_id=node_id, mode=mode, frame_hfov_deg=float(hfov),
+        targets=clean_targets, expected=len(clean_targets),
+        status="uploading", progress_pct=0, report=None, pano_id=None,
+        created_by=request.user["id"], created_at=now, updated_at=now,
     )
 
     return json_response({"id": capture_id, "status": "uploading"}, status=201)
@@ -234,15 +230,14 @@ def _resolve_capture(request, capture_id, form=None):
 
     building_id = (form.get("buildingId") if form else None) or request.GET.get("buildingId")
     if building_id:
-        row = q1("SELECT * FROM wf_captures WHERE id = %s", (f"{building_id}:{capture_id}",))
+        row = WfCapture.objects.filter(id=f"{building_id}:{capture_id}").values().first()
         if row is None:
             return None, json_error("Unknown capture", 404, code="not_found")
         return row, None
 
-    # Neither id regex admits ':', so '%:<id>' matches exactly
-    # the rows whose bare id IS capture_id
-    from knfapp.common.db import q
-    rows = q("SELECT * FROM wf_captures WHERE id LIKE %s", (f"%:{capture_id}",))
+    # Neither id regex admits ':', so the ':<id>' suffix
+    # matches exactly the rows whose bare id IS capture_id
+    rows = list(WfCapture.objects.filter(id__endswith=f":{capture_id}").values())
     if not rows:
         return None, json_error("Unknown capture", 404, code="not_found")
     if len(rows) > 1:
@@ -291,7 +286,7 @@ def upload_capture_frame(request, capture_id, target_id):
     # STEP 1: the target must be on this capture's plan, and
     # the pose must be three real numbers
     # ======================================================
-    targets = json.loads(capture["targets"])
+    targets = capture["targets"]
     if not any(target["id"] == target_id for target in targets):
         return json_error("Unknown target for this capture", 404, code="unknown_target")
     yaw = _form_float(form, "yawDeg")
@@ -340,16 +335,20 @@ def upload_capture_frame(request, capture_id, target_id):
     if not write_replace(directory, f"{target_id}.jpg", blob):
         return json_error("The frame could not be stored", 500, code="write_failed")
 
-    db_execute(
-        """
-        INSERT OR REPLACE INTO wf_capture_frames (capture_id, target_id, yaw_deg, pitch_deg, roll_deg, bytes, width, height, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (capture["id"], target_id, yaw, pitch, roll, len(blob), width, height, utc_now_iso()),
+    # A one-row bulk_create for its update_conflicts: a
+    # re-shot target replaces its row on the composite PK,
+    # pose and size included
+    WfCaptureFrame.objects.bulk_create(
+        [WfCaptureFrame(capture_id=capture["id"], target_id=target_id,
+                        yaw_deg=yaw, pitch_deg=pitch, roll_deg=roll,
+                        bytes=len(blob), width=width, height=height, updated_at=utc_now())],
+        update_conflicts=True,
+        unique_fields=["capture_id", "target_id"],
+        update_fields=["yaw_deg", "pitch_deg", "roll_deg", "bytes", "width", "height", "updated_at"],
     )
-    db_execute("UPDATE wf_captures SET updated_at = %s WHERE id = %s", (utc_now_iso(), capture["id"]))
+    WfCapture.objects.filter(id=capture["id"]).update(updated_at=utc_now())
 
-    stored = q1("SELECT COUNT(*) AS n FROM wf_capture_frames WHERE capture_id = %s", (capture["id"],))["n"]
+    stored = WfCaptureFrame.objects.filter(capture_id=capture["id"]).count()
     return json_response({"stored": stored, "expected": capture["expected"]})
 
 
@@ -411,7 +410,7 @@ def finish_capture(request, capture_id):
     # STEP 2: gate on the frame count, then flip to 'queued'
     # and wake the worker
     # ======================================================
-    frames = q1("SELECT COUNT(*) AS n FROM wf_capture_frames WHERE capture_id = %s", (capture["id"],))["n"]
+    frames = WfCaptureFrame.objects.filter(capture_id=capture["id"]).count()
     if frames < MIN_FINISH_FRAMES:
         return json_response({
             "error": f"At least {MIN_FINISH_FRAMES} frames are needed to stitch — {frames} arrived",
@@ -420,11 +419,8 @@ def finish_capture(request, capture_id):
             "required": MIN_FINISH_FRAMES,
         }, status=422)
 
-    report = json.dumps({"centreYawDeg": float(centre_yaw)}, ensure_ascii=False) if centre_yaw is not None else None
-    db_execute(
-        "UPDATE wf_captures SET status = 'queued', report = %s, updated_at = %s WHERE id = %s",
-        (report, utc_now_iso(), capture["id"]),
-    )
+    report = {"centreYawDeg": float(centre_yaw)} if centre_yaw is not None else None
+    WfCapture.objects.filter(id=capture["id"]).update(status="queued", report=report, updated_at=utc_now())
 
     # The nudge fires only once the queued row is COMMITTED —
     # the worker polls on its own connection and must find it
@@ -466,7 +462,7 @@ def get_capture(request, capture_id):
     if error:
         return error
 
-    frames = q1("SELECT COUNT(*) AS n FROM wf_capture_frames WHERE capture_id = %s", (capture["id"],))["n"]
+    frames = WfCaptureFrame.objects.filter(capture_id=capture["id"]).count()
     payload = {
         "id": capture["id"].split(":", 1)[1],
         "status": capture["status"],
@@ -475,12 +471,12 @@ def get_capture(request, capture_id):
         "progressPct": capture["progress_pct"],
     }
 
-    report = json.loads(capture["report"]) if capture["report"] else None
+    report = capture["report"]
     if report is not None:
         payload["report"] = report
 
     if capture["pano_id"]:
-        pano = q1("SELECT * FROM wf_panoramas WHERE id = %s", (capture["pano_id"],))
+        pano = WfPanorama.objects.filter(id=capture["pano_id"]).values().first()
         if pano is not None:
             coverage = (report or {}).get("coverage") or {}
             payload["pano"] = {

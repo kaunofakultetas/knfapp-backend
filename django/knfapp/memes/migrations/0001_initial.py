@@ -1,9 +1,13 @@
 ############################################################
-#  [*] memes 0001 — the shared library's ledger
+#  [*] memes 0001 — the shared picture library
 #
-#  Generated from models.py and committed; the suite's
-#  `makemigrations --check` fails on drift, never a deploy.
+#  One table with the folded-search column and the
+#  created_at index.
+#
+#  Head of its app's chain; the suite runs `makemigrations
+#  --check`, so drift against models.py fails the tests.
 ############################################################
+
 
 
 import django.db.models.deletion
@@ -31,11 +35,12 @@ class Migration(migrations.Migration):
                 ('height', models.IntegerField(blank=True, null=True)),
                 ('preview', models.TextField(blank=True, null=True)),
                 ('search', models.TextField(blank=True, null=True)),
-                ('created_at', models.TextField()),
+                ('created_at', models.DateTimeField()),
                 ('added_by', models.ForeignKey(blank=True, db_column='added_by', null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='memes', to='users.user')),
             ],
             options={
                 'db_table': 'memes',
+                'indexes': [models.Index(fields=['-created_at'], name='idx_memes_created')],
             },
         ),
     ]

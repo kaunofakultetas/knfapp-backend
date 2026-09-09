@@ -202,11 +202,13 @@ class CompileDeterminismTests(TestCase):
 
     def test_two_compiles_of_one_draft_are_byte_identical(self):
         building = {"id": "b1", "entrance_node_id": None, "north_deg": 12.5}
+        # data rides as dicts, the shape the JSON column hands the
+        # compiler; copies, because the compiler stamps ids in
         rows = [
-            {"kind": "node", "id": "n2", "data": json.dumps(NODE_B), "deleted": 0},
-            {"kind": "level", "id": "l1", "data": json.dumps(LEVEL), "deleted": 0},
-            {"kind": "node", "id": "n1", "data": json.dumps(NODE_A), "deleted": 0},
-            {"kind": "node", "id": "gone", "data": json.dumps(NODE_A), "deleted": 1},
+            {"kind": "node", "id": "n2", "data": dict(NODE_B), "deleted": 0},
+            {"kind": "level", "id": "l1", "data": dict(LEVEL), "deleted": 0},
+            {"kind": "node", "id": "n1", "data": dict(NODE_A), "deleted": 0},
+            {"kind": "node", "id": "gone", "data": dict(NODE_A), "deleted": 1},
         ]
         first = document_text(compile_document(building, rows))
         second = document_text(compile_document(building, list(reversed(rows))))

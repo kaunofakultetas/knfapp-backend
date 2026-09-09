@@ -1,13 +1,14 @@
 ############################################################
-#  [*] wayfind 0001 — the eight indoor-map tables
+#  [*] wayfind 0001 — the indoor-map schema
 #
-#  Matches models.py exactly (the suite runs
-#  `makemigrations --check`, so drift fails the tests, not
-#  a deploy). Table/column/index names match the
-#  production database so the data cutover is a row copy;
-#  the composite PKs on entities, versions and capture
-#  frames ride along.
+#  All eight tables in one initial migration: composite PKs
+#  on entities/versions/frames, the scoped-id CHECK enums,
+#  and the op-log/version indexes.
+#
+#  Head of its app's chain; the suite runs `makemigrations
+#  --check`, so drift against models.py fails the tests.
 ############################################################
+
 
 
 import django.db.models.deletion
@@ -31,8 +32,8 @@ class Migration(migrations.Migration):
                 ('entrance_node_id', models.TextField(blank=True, null=True)),
                 ('draft_revision', models.IntegerField(default=0)),
                 ('published_revision', models.IntegerField(blank=True, null=True)),
-                ('created_at', models.TextField()),
-                ('updated_at', models.TextField()),
+                ('created_at', models.DateTimeField()),
+                ('updated_at', models.DateTimeField()),
             ],
             options={
                 'db_table': 'wf_buildings',
@@ -45,15 +46,15 @@ class Migration(migrations.Migration):
                 ('node_id', models.TextField(blank=True, null=True)),
                 ('mode', models.TextField()),
                 ('frame_hfov_deg', models.FloatField()),
-                ('targets', models.TextField()),
+                ('targets', models.JSONField()),
                 ('expected', models.IntegerField()),
                 ('status', models.TextField()),
                 ('progress_pct', models.IntegerField(default=0)),
-                ('report', models.TextField(blank=True, null=True)),
+                ('report', models.JSONField(blank=True, null=True)),
                 ('pano_id', models.TextField(blank=True, null=True)),
                 ('created_by', models.TextField(blank=True, null=True)),
-                ('created_at', models.TextField()),
-                ('updated_at', models.TextField()),
+                ('created_at', models.DateTimeField()),
+                ('updated_at', models.DateTimeField()),
                 ('building', models.ForeignKey(db_column='building_id', on_delete=django.db.models.deletion.CASCADE, related_name='captures', to='wayfind.wfbuilding')),
             ],
             options={
@@ -71,8 +72,8 @@ class Migration(migrations.Migration):
                 ('bytes', models.IntegerField()),
                 ('width', models.IntegerField()),
                 ('height', models.IntegerField()),
-                ('updated_at', models.TextField()),
-                ('capture', models.ForeignKey(db_column='capture_id', on_delete=django.db.models.deletion.CASCADE, related_name='frames', to='wayfind.wfcapture')),
+                ('updated_at', models.DateTimeField()),
+                ('capture', models.ForeignKey(db_column='capture_id', db_index=False, on_delete=django.db.models.deletion.CASCADE, related_name='frames', to='wayfind.wfcapture')),
             ],
             options={
                 'db_table': 'wf_capture_frames',
@@ -84,12 +85,12 @@ class Migration(migrations.Migration):
                 ('pk', models.CompositePrimaryKey('building_id', 'kind', 'id', blank=True, editable=False, primary_key=True, serialize=False)),
                 ('kind', models.TextField()),
                 ('id', models.TextField()),
-                ('data', models.TextField()),
+                ('data', models.JSONField()),
                 ('revision', models.IntegerField()),
-                ('updated_at', models.TextField()),
+                ('updated_at', models.DateTimeField()),
                 ('updated_by', models.TextField(blank=True, null=True)),
-                ('deleted', models.IntegerField(default=0)),
-                ('building', models.ForeignKey(db_column='building_id', on_delete=django.db.models.deletion.CASCADE, related_name='entities', to='wayfind.wfbuilding')),
+                ('deleted', models.BooleanField(default=False)),
+                ('building', models.ForeignKey(db_column='building_id', db_index=False, on_delete=django.db.models.deletion.CASCADE, related_name='entities', to='wayfind.wfbuilding')),
             ],
             options={
                 'db_table': 'wf_entities',
@@ -102,10 +103,10 @@ class Migration(migrations.Migration):
                 ('revision', models.IntegerField(blank=True, null=True)),
                 ('op', models.TextField()),
                 ('author_id', models.TextField(blank=True, null=True)),
-                ('created_at', models.TextField()),
+                ('created_at', models.DateTimeField()),
                 ('status', models.TextField()),
                 ('reason', models.TextField(blank=True, null=True)),
-                ('building', models.ForeignKey(db_column='building_id', on_delete=django.db.models.deletion.CASCADE, related_name='ops', to='wayfind.wfbuilding')),
+                ('building', models.ForeignKey(db_column='building_id', db_index=False, on_delete=django.db.models.deletion.CASCADE, related_name='ops', to='wayfind.wfbuilding')),
             ],
             options={
                 'db_table': 'wf_ops',
@@ -124,7 +125,7 @@ class Migration(migrations.Migration):
                 ('heading_raw_deg', models.FloatField(blank=True, null=True)),
                 ('heading_source', models.TextField(blank=True, null=True)),
                 ('uploaded_by', models.TextField(blank=True, null=True)),
-                ('created_at', models.TextField()),
+                ('created_at', models.DateTimeField()),
                 ('building', models.ForeignKey(db_column='building_id', on_delete=django.db.models.deletion.CASCADE, related_name='panoramas', to='wayfind.wfbuilding')),
             ],
             options={
@@ -138,7 +139,7 @@ class Migration(migrations.Migration):
                 ('level_id', models.TextField(blank=True, null=True)),
                 ('bytes', models.IntegerField()),
                 ('uploaded_by', models.TextField(blank=True, null=True)),
-                ('created_at', models.TextField()),
+                ('created_at', models.DateTimeField()),
                 ('building', models.ForeignKey(db_column='building_id', on_delete=django.db.models.deletion.CASCADE, related_name='plans', to='wayfind.wfbuilding')),
             ],
             options={
@@ -154,8 +155,8 @@ class Migration(migrations.Migration):
                 ('etag', models.TextField()),
                 ('note', models.TextField(blank=True, null=True)),
                 ('published_by', models.TextField(blank=True, null=True)),
-                ('published_at', models.TextField()),
-                ('building', models.ForeignKey(db_column='building_id', on_delete=django.db.models.deletion.CASCADE, related_name='versions', to='wayfind.wfbuilding')),
+                ('published_at', models.DateTimeField()),
+                ('building', models.ForeignKey(db_column='building_id', db_index=False, on_delete=django.db.models.deletion.CASCADE, related_name='versions', to='wayfind.wfbuilding')),
             ],
             options={
                 'db_table': 'wf_versions',

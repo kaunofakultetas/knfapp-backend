@@ -1,9 +1,9 @@
 ############################################################
 #  [*] ops — operational commands
 #
-#  No models, no routes: the home of the management
-#  commands an operator runs by hand (the data cutover).
-#  The scheduled ticks live with the scraper app instead —
+#  The home of the health probe and the management
+#  commands an operator runs by hand (grant_role). The
+#  scheduled ticks live with the scraper app instead —
 #  the cron container owns those.
 ############################################################
 

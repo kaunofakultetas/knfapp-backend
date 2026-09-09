@@ -9,9 +9,10 @@
 #  web process may carry it; WAYFIND_STITCH_ENABLED=0 turns
 #  it off). The thread polls every 3 s for the oldest
 #  'queued' capture, claims it by flipping the row to
-#  'stitching' (the UPDATE's WHERE status='queued' is the
-#  lock), stitches, and writes the outcome back: 'done' with
-#  a pano_id and a report, or 'failed' with the reason.
+#  'stitching' (the update is filtered on status='queued' —
+#  that filter is the lock), stitches, and writes the
+#  outcome back: 'done' with a pano_id and a report, or
+#  'failed' with the reason.
 #  finish_capture nudges the poll so a stitch starts inside
 #  a second. The thread runs autocommit and closes its DB
 #  connection between polls — a quiet worker parks nothing.
@@ -26,8 +27,8 @@
 #  from the frame centre as the feather. Everything is
 #  vectorised numpy; 36 frames at 1280 px stitch in seconds.
 #  numpy is imported INSIDE the compose call, so a container
-#  built before the numpy pin still boots and only an actual
-#  stitch fails.
+#  without numpy still boots and only an actual stitch
+#  fails.
 #
 #  Frame conventions (world axes): +Z is yaw 0, +X is yaw 90
 #  (clockwise from above), +Y is up; camera-to-world is
@@ -46,7 +47,6 @@
 
 import hashlib
 import io
-import json
 import logging
 import math
 import os
@@ -58,9 +58,9 @@ from PIL import Image
 
 from django.db import close_old_connections, connection
 
-from knfapp.common.db import execute as db_execute, q1
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now
 from knfapp.wayfind.api.captures import frames_dir
+from knfapp.wayfind.models import WfCapture, WfCaptureFrame, WfPanorama
 from knfapp.wayfind.store import store_dir, write_once
 
 
@@ -194,7 +194,8 @@ def nudge_stitch_worker():
 # single-writer SQLite deployment wants. Every pass is
 # wrapped so one broken capture cannot kill the thread, and
 # the thread's connection is closed after each pass. The
-# claim is the conditional UPDATE (WHERE status='queued'),
+# claim is the conditional update (only a row still
+# 'queued' flips, and the rowcount says whether it did),
 # so a second process — or a test driving stitch_capture
 # directly — can never grab the same row. _requeue_orphans
 # flips every 'stitching' row back to 'queued': a row only
@@ -227,21 +228,17 @@ def _worker_loop(stop, wake):
 
 
 def _claim_next():
-    row = q1("SELECT id FROM wf_captures WHERE status = 'queued' ORDER BY updated_at, id LIMIT 1")
-    if row is None:
+    capture_id = (WfCapture.objects.filter(status="queued")
+                  .order_by("updated_at", "id").values_list("id", flat=True).first())
+    if capture_id is None:
         return None
-    claimed = db_execute(
-        "UPDATE wf_captures SET status = 'stitching', progress_pct = 0, updated_at = %s WHERE id = %s AND status = 'queued'",
-        (utc_now_iso(), row["id"]),
-    )
-    return row["id"] if claimed else None
+    claimed = WfCapture.objects.filter(id=capture_id, status="queued").update(
+        status="stitching", progress_pct=0, updated_at=utc_now())
+    return capture_id if claimed else None
 
 
 def _requeue_orphans():
-    requeued = db_execute(
-        "UPDATE wf_captures SET status = 'queued', updated_at = %s WHERE status = 'stitching'",
-        (utc_now_iso(),),
-    )
+    requeued = WfCapture.objects.filter(status="stitching").update(status="queued", updated_at=utc_now())
     if requeued:
         logger.warning("Re-queued %d stitch(es) left 'stitching' by a killed process", requeued)
 
@@ -281,14 +278,12 @@ def stitch_capture(capture_id):
     # STEP 1: load and claim — a row someone else already
     # took (or finished) is left alone
     # ===================================================
-    capture = q1("SELECT * FROM wf_captures WHERE id = %s", (capture_id,))
+    capture = WfCapture.objects.filter(id=capture_id).values().first()
     if capture is None or capture["status"] not in ("queued", "stitching"):
         return False
     if capture["status"] == "queued":
-        claimed = db_execute(
-            "UPDATE wf_captures SET status = 'stitching', progress_pct = 0, updated_at = %s WHERE id = %s AND status = 'queued'",
-            (utc_now_iso(), capture_id),
-        )
+        claimed = WfCapture.objects.filter(id=capture_id, status="queued").update(
+            status="stitching", progress_pct=0, updated_at=utc_now())
         if not claimed:
             return False
 
@@ -302,10 +297,8 @@ def stitch_capture(capture_id):
     except Exception as exc:
         logger.exception("Stitch failed for %s", capture_id)
         reason = str(exc) if isinstance(exc, StitchError) else f"internal: {exc}"
-        db_execute(
-            "UPDATE wf_captures SET status = 'failed', report = %s, updated_at = %s WHERE id = %s",
-            (json.dumps({"reason": reason}, ensure_ascii=False), utc_now_iso(), capture_id),
-        )
+        WfCapture.objects.filter(id=capture_id).update(
+            status="failed", report={"reason": reason}, updated_at=utc_now())
         return False
 
 
@@ -314,14 +307,11 @@ def _run_stitch(capture):
     # loaded and downscaled for composing; the parked centre
     # yaw read out before the report is rewritten
     # ======================================================
-    from knfapp.common.db import q
-
     started = time.time()
-    requested_centre = (json.loads(capture["report"]) or {}).get("centreYawDeg") if capture["report"] else None
-    rows = q(
-        "SELECT * FROM wf_capture_frames WHERE capture_id = %s ORDER BY updated_at, target_id",
-        (capture["id"],),
-    )
+    requested_centre = (capture["report"] or {}).get("centreYawDeg")
+    rows = (WfCaptureFrame.objects.filter(capture_id=capture["id"])
+            .order_by("updated_at", "target_id")
+            .values("target_id", "yaw_deg", "pitch_deg", "roll_deg"))
     directory = frames_dir(capture["id"])
 
     frames = []
@@ -350,10 +340,7 @@ def _run_stitch(capture):
     # UPDATE is visible at once)
     # ========================================================
     def on_progress(done, total):
-        db_execute(
-            "UPDATE wf_captures SET progress_pct = %s WHERE id = %s",
-            (int(done * 90 / total), capture["id"]),
-        )
+        WfCapture.objects.filter(id=capture["id"]).update(progress_pct=int(done * 90 / total))
 
     canvas, coverage = compose_panorama(frames, capture["frame_hfov_deg"], on_progress, centre_yaw_deg=requested_centre)
 
@@ -369,14 +356,16 @@ def _run_stitch(capture):
     if not write_once(store_dir("panoramas"), f"{digest}.jpg", blob):
         raise StitchError("the panorama could not be written")
 
-    db_execute(
-        """
-        INSERT OR IGNORE INTO wf_panoramas (id, building_id, node_id, width, height, bytes, hfov_deg, vfov_deg, heading_raw_deg, heading_source, uploaded_by, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NULL, 'auto', %s, %s)
-        """,
-        (digest, capture["building_id"], capture["node_id"], image.width, image.height, len(blob),
-         coverage["hfovDeg"], coverage["vfovDeg"], capture["created_by"], utc_now_iso()),
-    )
+    # A one-row bulk_create for its ignore_conflicts: the pano
+    # is content-addressed, so a re-stitch that lands on the
+    # same bytes must keep the first record untouched
+    WfPanorama.objects.bulk_create([WfPanorama(
+        id=digest, building_id=capture["building_id"], node_id=capture["node_id"],
+        width=image.width, height=image.height, bytes=len(blob),
+        hfov_deg=coverage["hfovDeg"], vfov_deg=coverage["vfovDeg"],
+        heading_raw_deg=None, heading_source="auto",
+        uploaded_by=capture["created_by"], created_at=utc_now(),
+    )], ignore_conflicts=True)
 
 
     # STEP 4: the report, the 'done' stamp, and the frames
@@ -388,10 +377,9 @@ def _run_stitch(capture):
         "coverage": coverage,
         "timingMs": int((time.time() - started) * 1000),
     }
-    db_execute(
-        "UPDATE wf_captures SET status = 'done', progress_pct = 100, report = %s, pano_id = %s, updated_at = %s WHERE id = %s",
-        (json.dumps(report, ensure_ascii=False), digest, utc_now_iso(), capture["id"]),
-    )
+    WfCapture.objects.filter(id=capture["id"]).update(
+        status="done", progress_pct=100, report=report,
+        pano_id=digest, updated_at=utc_now())
     shutil.rmtree(directory, ignore_errors=True)
     logger.info("Stitched %s: %d frames -> %s in %d ms", capture["id"], len(frames), digest, report["timingMs"])
 

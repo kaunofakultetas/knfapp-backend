@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 
 from django.db import models
+from django.core.exceptions import ValidationError
 from django.test import TestCase
 
 
@@ -30,11 +31,13 @@ class InviteRejectionTests(TestCase):
                                expires_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat())
         self.assertEqual(_invite_rejection(invite)[2], "exhausted")
 
-    def test_naive_expiry_reads_as_utc_and_malformed_as_expired(self):
+    def test_naive_expiry_reads_as_utc_and_garbage_is_refused_at_the_type(self):
         live_naive = create_invite(code="A", expires_at=(datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None).isoformat())
         self.assertIsNone(_invite_rejection(live_naive))
-        broken = create_invite(code="B", expires_at="rytoj")
-        self.assertEqual(_invite_rejection(broken)[2], "expired")
+        # A malformed stamp cannot exist in the column — the
+        # datetime type refuses it before any read must cope
+        with self.assertRaises(ValidationError):
+            create_invite(code="B", expires_at="rytoj")
 
 
 class AtomicBurnTests(TestCase):

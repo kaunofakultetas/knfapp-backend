@@ -12,10 +12,10 @@
 #    - Every `time` field is HH:MM preformatted from the
 #      naive UTC stamp, i.e. 2–3 h off in Lithuania. Clients
 #      ignore it and format `createdAt` / `lastUpdatedMs`.
-#    - Stamps are naive-UTC isoformat strings (now(timezone
-#      .utc) with the offset dropped): no zone, microseconds.
-#      Paging cursors and unread counts are plain string
-#      comparisons on them.
+#    - Wire stamps are naive UTC (no offset, microseconds):
+#      json_response below opts into the naive-stamp
+#      encoder — policy in common/http.py +
+#      common/timestamps.py.
 #    - Two independent read-state stores: the membership
 #      row's last_read_at drives unreadCount and the tab
 #      badge; per-message message_reads rows drive status
@@ -31,30 +31,42 @@
 #  listener refetches on the event — it must find the
 #  rows), so the writes ride transaction.atomic() blocks at
 #  their own boundaries instead of one request-wide
-#  transaction. The two places that must take the SQLite
-#  write lock up front (create_conversation's
-#  dedup-then-insert and _apply_mark_read) issue BEGIN
-#  IMMEDIATE by hand on the autocommit connection.
+#  transaction. The one place that must take the write
+#  lock up front (_apply_mark_read) opens a hand
+#  transaction on the autocommit connection — BEGIN
+#  IMMEDIATE on SQLite, a plain BEGIN elsewhere
+#  (_begin_immediate picks); create_conversation's direct
+#  dedup leans on conversations.direct_key UNIQUE instead,
+#  which both engines enforce.
 #
-#  The raw SQL keeps SQLite spellings where the live engine
-#  is SQLite (INSERT OR IGNORE, COLLATE NOCASE, the FTS5
-#  MATCH arm) — flagged for the postgres move alongside the
-#  feed SQL.
+#  Row traffic goes through the ORM. Raw SQL only where it
+#  is load-bearing: mark_read's hand-issued write-lock
+#  transaction and the statements inside it, the
+#  last-message seek and the unread aggregates, and the
+#  TTL/purge DELETEs that must not cascade.
 ############################################################
 
 
-import json
 import logging
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from django.db import IntegrityError, OperationalError, connection, transaction
+from django.db import IntegrityError, connection, transaction
+from django.db.models import Case, F, Q, When
+from django.db.models.functions import Lower
 
+from knfapp.chat.models import (Conversation, ConversationParticipant, Message,
+                                MessageReaction, MessageRead)
 from knfapp.common import ratelimit
-from knfapp.common.http import get_json_object, json_error, json_response
+from knfapp.common.db import execute as _exec, q as _q, q1 as _q1
+from knfapp.common.http import get_json_object, json_error
+from knfapp.common.http import json_response as _json_response
+from knfapp.common.timestamps import as_aware, utc_now
+from knfapp.social.models import UserBlock
 from knfapp.users.auth import require_auth
+from knfapp.users.models import User
 
 logger = logging.getLogger(__name__)
 
@@ -94,63 +106,40 @@ def _spawn(target, *args):
     threading.Thread(target=target, args=args, daemon=True).start()
 
 
-def _now_naive():
-    # Naive-UTC isoformat — the shape every stamp in these
-    # tables carries; cursors and unread counts compare it
-    # as strings
-    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+def json_response(payload, status=200):
+    # The one place chat's naive-UTC wire shape is decided
+    return _json_response(payload, status=status, naive_stamps=True)
 
 
-def _dict_rows(cursor):
-    columns = [col[0] for col in cursor.description]
-    return [dict(zip(columns, row)) for row in cursor.fetchall()]
-
-
-def _dict_row(cursor):
-    row = cursor.fetchone()
-    if row is None:
-        return None
-    columns = [col[0] for col in cursor.description]
-    return dict(zip(columns, row))
-
-
-def _q(sql, params=()):
-    with connection.cursor() as cursor:
-        cursor.execute(sql, params)
-        return _dict_rows(cursor)
-
-
-def _q1(sql, params=()):
-    with connection.cursor() as cursor:
-        cursor.execute(sql, params)
-        return _dict_row(cursor)
-
-
-def _exec(sql, params=()):
-    with connection.cursor() as cursor:
-        cursor.execute(sql, params)
-        return cursor.rowcount
+def _bind(stamp):
+    # Raw parameters ride the DRIVER's adapter, which keeps an
+    # aware stamp's offset in SQLite's stored text; the ORM's
+    # adapter writes the column's uniform naive-UTC form —
+    # every raw datetime bind goes through it
+    return connection.ops.adapt_datetimefield_value(stamp)
 
 
 def _is_member(conv_id, user_id):
-    return _q1(
-        "SELECT 1 AS x FROM conversation_participants WHERE conversation_id = %s AND user_id = %s",
-        (conv_id, user_id),
-    ) is not None
+    return ConversationParticipant.objects.filter(
+        conversation_id=conv_id, user_id=user_id,
+    ).exists()
 
 
 def _begin_immediate():
-    # The SQLite write lock, taken up front — but ONLY on the
+    # The write lock, taken up front — but ONLY on the
     # autocommit connection production runs on. Inside an
     # enclosing atomic block (the test harness wraps every test
     # in one) a nested BEGIN would raise, and the COMMIT below
     # would commit the harness's transaction — so there the
     # enclosing block is the serialisation and this is a no-op.
+    # BEGIN IMMEDIATE is the SQLite spelling that reserves the
+    # write lock at open; other engines take a plain BEGIN and
+    # lean on their row-level locking instead.
     # Returns whether a transaction was actually opened
     if connection.in_atomic_block:
         return False
     with connection.cursor() as cursor:
-        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("BEGIN IMMEDIATE" if connection.vendor == "sqlite" else "BEGIN")
     return True
 
 
@@ -168,38 +157,25 @@ def _end_immediate(started, commit):
 
 
 ############################################################
-# _format_time / _epoch_ms / _escape_like
+# _format_time / _epoch_ms
 ############################################################
 #
-# _format_time: HH:MM of a naive UTC ISO stamp — UTC, NOT
-# Lithuanian time, which is why clients ignore `time` and
-# format createdAt themselves. _epoch_ms pins the stamp to
+# _format_time: HH:MM of the stamp in UTC, NOT Lithuanian
+# time — which is why clients ignore `time` and format
+# createdAt themselves. _epoch_ms pins the stamp to
 # timezone.utc before .timestamp(), so the number is right
 # whatever /etc/localtime says. Both fail soft ("" / 0), so
-# ONE bad row can never 500 a whole listing. _escape_like
-# escapes \, % and _ in user-typed search text so LIKE
-# matches them literally — every LIKE built from the result
-# must carry ESCAPE '\'.
+# ONE bad row can never 500 a whole listing.
 ############################################################
 
-def _format_time(iso_str):
-    try:
-        dt = datetime.fromisoformat(iso_str)
-        return dt.strftime("%H:%M")
-    except (ValueError, TypeError):
-        return ""
+def _format_time(value):
+    dt = as_aware(value)
+    return dt.strftime("%H:%M") if dt else ""
 
 
-def _epoch_ms(iso_str):
-    try:
-        dt = datetime.fromisoformat(iso_str)
-        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
-    except (ValueError, TypeError):
-        return 0
-
-
-def _escape_like(q):
-    return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+def _epoch_ms(value):
+    dt = as_aware(value)
+    return int(dt.timestamp() * 1000) if dt else 0
 
 
 
@@ -296,12 +272,10 @@ def _reply_payload(row):
     deleted = row["reply_deleted_at"] is not None
     # A quoted gallery lends its first photo as the thumbnail
     reply_image = row["reply_image_url"]
-    if not reply_image and row.get("reply_gallery"):
-        try:
-            first = (json.loads(row["reply_gallery"]) or [{}])[0]
-            reply_image = first.get("url") if isinstance(first, dict) else None
-        except (TypeError, ValueError):
-            reply_image = None
+    gallery = row.get("reply_gallery")
+    if not reply_image and isinstance(gallery, list) and gallery:
+        first = gallery[0]
+        reply_image = first.get("url") if isinstance(first, dict) else None
     return {
         "id": row["reply_to_id"],
         "senderId": row["reply_sender_id"],
@@ -333,19 +307,18 @@ def _reply_payload(row):
 # client renders kind 'system' as a centred caption. LT text
 # on purpose — the app is Lithuanian-first. Bumps the
 # conversation so the room sorts to the top of the list.
-# Every NOT NULL column is named — the Django-built table
-# carries no DDL defaults.
+# kind, forwarded and created_at are stamped explicitly —
+# the table carries no DDL defaults.
 ############################################################
 
 def _insert_system_message(conv_id, actor, text):
     msg_id = str(uuid.uuid4())
-    now = _now_naive()
-    _exec(
-        "INSERT INTO messages (id, conversation_id, sender_id, text, kind, forwarded, created_at)"
-        " VALUES (%s, %s, %s, %s, 'system', 0, %s)",
-        (msg_id, conv_id, actor["id"], text, now),
+    now = utc_now()
+    Message.objects.create(
+        id=msg_id, conversation_id=conv_id, sender_id=actor["id"], text=text,
+        kind="system", forwarded=False, created_at=now,
     )
-    _exec("UPDATE conversations SET updated_at = %s WHERE id = %s", (now, conv_id))
+    Conversation.objects.filter(id=conv_id).update(updated_at=now)
     return {
         "id": msg_id,
         "conversationId": conv_id,
@@ -379,11 +352,11 @@ def _insert_system_message(conv_id, actor, text):
 #
 # The optional frames of the richer message shapes: the
 # `attachment` object of a 'file' message, the media frame
-# of a photo/video (the JSON column parsed), the unfurled
-# card of the first URL, and the photo list of a multi-photo
-# row. All None for other rows, for unsent ones (the
-# blanking clears the columns; these mirror it on the wire)
-# and for anything unparseable.
+# of a photo/video, the unfurled card of the first URL, and
+# the photo list of a multi-photo row. All None for other
+# rows, for unsent ones (the blanking clears the columns;
+# these mirror it on the wire) and for anything that is not
+# the shape its writer stores.
 ############################################################
 
 def _attachment_payload(row, deleted=False):
@@ -398,14 +371,8 @@ def _attachment_payload(row, deleted=False):
 
 
 def _media_payload(row, deleted=False):
-    raw = row.get("attachment_meta")
-    if deleted or not raw:
-        return None
-    try:
-        meta = json.loads(raw)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(meta, dict):
+    meta = row.get("attachment_meta")
+    if deleted or not isinstance(meta, dict):
         return None
     return {
         "width": meta.get("width"),
@@ -418,14 +385,8 @@ def _media_payload(row, deleted=False):
 
 
 def _link_preview_payload(row, deleted=False):
-    raw = row.get("link_preview")
-    if deleted or not raw:
-        return None
-    try:
-        card = json.loads(raw)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(card, dict) or not card.get("url"):
+    card = row.get("link_preview")
+    if deleted or not isinstance(card, dict) or not card.get("url"):
         return None
     return {
         "url": card.get("url"),
@@ -438,14 +399,8 @@ def _link_preview_payload(row, deleted=False):
 
 
 def _gallery_payload(row, deleted=False):
-    raw = row.get("gallery")
-    if deleted or not raw:
-        return None
-    try:
-        items = json.loads(raw)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(items, list) or not items:
+    items = row.get("gallery")
+    if deleted or not isinstance(items, list) or not items:
         return None
     return [
         {"url": item.get("url"), "width": item.get("width"), "height": item.get("height"), "preview": item.get("preview")}
@@ -477,30 +432,21 @@ def _gallery_payload(row, deleted=False):
 ############################################################
 
 def _sweep_expired(conv_id, request=None):
-    now = _now_naive()
-    rows = _q(
-        "SELECT id, image_url, attachment_url, attachment_meta, link_preview, gallery FROM messages"
-        " WHERE conversation_id = %s AND expires_at IS NOT NULL AND expires_at <= %s",
-        (conv_id, now),
-    )
+    now = datetime.now(timezone.utc)
+    rows = list(Message.objects.filter(
+        conversation_id=conv_id, expires_at__isnull=False, expires_at__lte=now,
+    ).values("id", "image_url", "attachment_url", "attachment_meta", "link_preview", "gallery"))
     if not rows:
         return
 
     for row in rows:
         stored_urls = [row["image_url"], row["attachment_url"]]
-        try:
-            stored_urls.append((json.loads(row["attachment_meta"]) or {}).get("thumbnailUrl") if row["attachment_meta"] else None)
-        except (TypeError, ValueError):
-            pass
-        try:
-            stored_urls.append((json.loads(row["link_preview"]) or {}).get("imageUrl") if row["link_preview"] else None)
-        except (TypeError, ValueError):
-            pass
-        try:
-            if row["gallery"]:
-                stored_urls.extend(item.get("url") for item in (json.loads(row["gallery"]) or []) if isinstance(item, dict))
-        except (TypeError, ValueError):
-            pass
+        if isinstance(row["attachment_meta"], dict):
+            stored_urls.append(row["attachment_meta"].get("thumbnailUrl"))
+        if isinstance(row["link_preview"], dict):
+            stored_urls.append(row["link_preview"].get("imageUrl"))
+        if isinstance(row["gallery"], list):
+            stored_urls.extend(item.get("url") for item in row["gallery"] if isinstance(item, dict))
         for stored in stored_urls:
             if not _is_local_upload_url(stored, request):
                 continue
@@ -513,8 +459,11 @@ def _sweep_expired(conv_id, request=None):
     ids = [row["id"] for row in rows]
     marks = ",".join(["%s"] * len(ids))
     with transaction.atomic():
-        _exec(f"DELETE FROM message_reactions WHERE message_id IN ({marks})", ids)
-        _exec(f"DELETE FROM message_reads WHERE message_id IN ({marks})", ids)
+        MessageReaction.objects.filter(message_id__in=ids).delete()
+        MessageRead.objects.filter(message_id__in=ids).delete()
+        # Raw on purpose: the ORM delete would run the
+        # reply-quote SET_NULL cascade and erase the ghost-quote
+        # wire shape the read path relies on
         _exec(f"DELETE FROM messages WHERE id IN ({marks})", ids)
 
 
@@ -541,23 +490,20 @@ def _sweep_expired(conv_id, request=None):
 ############################################################
 
 def _find_committed_send(conv_id, user_id, sender_name, sender_avatar, client_msg_id):
-    row = _q1(
-        """
-        SELECT m.id, m.text, m.image_url, m.created_at, m.client_msg_id,
-               m.reply_to_id, m.deleted_at,
-               m.kind, m.edited_at, m.attachment_url, m.attachment_name, m.attachment_size, m.attachment_mime,
-               m.attachment_meta, m.link_preview, m.gallery, m.pinned_at, m.pinned_by, m.forwarded, m.expires_at,
-               r.sender_id AS reply_sender_id, r.text AS reply_text,
-               r.image_url AS reply_image_url, r.gallery AS reply_gallery, r.deleted_at AS reply_deleted_at,
-               r.kind AS reply_kind, r.attachment_name AS reply_file_name,
-               ru.display_name AS reply_sender_name
-        FROM messages m
-        LEFT JOIN messages r ON r.id = m.reply_to_id
-        LEFT JOIN users ru ON ru.id = r.sender_id
-        WHERE m.conversation_id = %s AND m.sender_id = %s AND m.client_msg_id = %s
-        """,
-        (conv_id, user_id, client_msg_id),
-    )
+    row = Message.objects.filter(
+        conversation_id=conv_id, sender_id=user_id, client_msg_id=client_msg_id,
+    ).values(
+        "id", "text", "image_url", "created_at", "client_msg_id",
+        "reply_to_id", "deleted_at",
+        "kind", "edited_at", "attachment_url", "attachment_name", "attachment_size",
+        "attachment_mime", "attachment_meta", "link_preview", "gallery",
+        "pinned_at", "pinned_by", "forwarded", "expires_at",
+        reply_sender_id=F("reply_to__sender_id"), reply_text=F("reply_to__text"),
+        reply_image_url=F("reply_to__image_url"), reply_gallery=F("reply_to__gallery"),
+        reply_deleted_at=F("reply_to__deleted_at"), reply_kind=F("reply_to__kind"),
+        reply_file_name=F("reply_to__attachment_name"),
+        reply_sender_name=F("reply_to__sender__display_name"),
+    ).first()
     if not row:
         return None
 
@@ -623,15 +569,11 @@ def _reactions_for(msg_ids, current_user_id=None):
     if not msg_ids:
         return {}
 
-    placeholders = ",".join(["%s"] * len(msg_ids))
-    rows = _q(
-        f"""
-        SELECT mr.message_id, mr.emoji, mr.user_id
-        FROM message_reactions mr
-        WHERE mr.message_id IN ({placeholders})
-        """,
-        list(msg_ids),
-    )
+    # Ordered by the reaction stamp on purpose — the group and
+    # byUserIds order must not depend on which index the
+    # planner walks
+    rows = MessageReaction.objects.filter(message_id__in=list(msg_ids)) \
+        .order_by("message_id", "created_at").values("message_id", "emoji", "user_id")
 
     # message id → emoji → the user ids holding it, insertion
     # ordered so the shaped groups keep the row order
@@ -752,10 +694,10 @@ def _find_direct_conversation(user_id, other_id):
 # tab (the memberships, then participants, last messages
 # and unread counts set-based over the id list).
 # unreadCount is other people's messages newer than the
-# caller's last_read_at, compared as ISO strings; a NULL
-# last_read_at counts everything, and unsent messages never
-# count. A direct chat without a title is named after the
-# other participant; when nobody else is (left) in it the
+# caller's last_read_at; a NULL last_read_at counts
+# everything, and unsent messages never count. A direct
+# chat without a title is named after the other
+# participant; when nobody else is (left) in it the
 # title stays null and the client renders its localized
 # fallback. lastUpdatedMs is _epoch_ms of updated_at — 0
 # rather than a 500 on an unparseable stamp, falling back
@@ -772,16 +714,15 @@ def list_conversations(request):
     # newest activity; the id list drives everything below
     # =====================================================
     user_id = request.user["id"]
-    rows = _q(
-        """
-        SELECT c.id, c.type, c.title, c.avatar_emoji, c.created_at, c.updated_at,
-               cp.pinned, cp.last_read_at
-        FROM conversations c
-        JOIN conversation_participants cp ON cp.conversation_id = c.id
-        WHERE cp.user_id = %s
-        ORDER BY cp.pinned DESC, c.updated_at DESC
-        """,
-        (user_id,),
+    rows = list(
+        ConversationParticipant.objects.filter(user_id=user_id)
+        .order_by("-pinned", "-conversation__updated_at")
+        .values(
+            "pinned", "last_read_at",
+            id=F("conversation__id"), type=F("conversation__type"),
+            title=F("conversation__title"), avatar_emoji=F("conversation__avatar_emoji"),
+            created_at=F("conversation__created_at"), updated_at=F("conversation__updated_at"),
+        )
     )
 
     conv_ids = [row["id"] for row in rows]
@@ -797,36 +738,27 @@ def list_conversations(request):
     if conv_ids:
         placeholders = ",".join(["%s"] * len(conv_ids))
 
-        for p in _q(
-            f"""
-            SELECT cp.conversation_id, u.id, u.display_name, u.avatar_url
-            FROM conversation_participants cp
-            JOIN users u ON u.id = cp.user_id
-            WHERE cp.conversation_id IN ({placeholders})
-            """,
-            conv_ids,
+        for p in ConversationParticipant.objects.filter(conversation_id__in=conv_ids).values(
+            "conversation_id",
+            id=F("user__id"), display_name=F("user__display_name"), avatar_url=F("user__avatar_url"),
         ):
             participants_map.setdefault(p["conversation_id"], []).append(p)
 
-        # ROW_NUMBER picks every room's newest row in one pass;
-        # the id tiebreak keeps the pick deterministic when two
-        # stamps match to the microsecond
+        # One descending index seek per room picks its newest
+        # message (the id tiebreak keeps the pick deterministic
+        # when two stamps match to the microsecond) — a window
+        # function over the same rows would visit EVERY message
+        # of every listed room, and this is the app-open query
         for m in _q(
             f"""
-            SELECT conversation_id, id, text, image_url, kind, created_at,
-                   sender_id, deleted_at, sender_name
-            FROM (
-                SELECT m.conversation_id, m.id, m.text, m.image_url, m.kind, m.created_at,
-                       m.sender_id, m.deleted_at, u.display_name AS sender_name,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY m.conversation_id
-                           ORDER BY m.created_at DESC, m.id DESC
-                       ) AS rn
-                FROM messages m
-                JOIN users u ON u.id = m.sender_id
-                WHERE m.conversation_id IN ({placeholders})
-            )
-            WHERE rn = 1
+            SELECT m.conversation_id, m.id, m.text, m.image_url, m.kind, m.created_at,
+                   m.sender_id, m.deleted_at, u.display_name AS sender_name
+            FROM conversations c
+            JOIN messages m ON m.id = (SELECT m2.id FROM messages m2
+                                       WHERE m2.conversation_id = c.id
+                                       ORDER BY m2.created_at DESC, m2.id DESC LIMIT 1)
+            JOIN users u ON u.id = m.sender_id
+            WHERE c.id IN ({placeholders})
             """,
             conv_ids,
         ):
@@ -926,20 +858,17 @@ def list_conversations(request):
 # title; a direct chat stores NULL for both title and
 # avatarEmoji regardless of the body, so an attacker-chosen
 # title can never impersonate the counterpart. The creator
-# is always added and duplicate ids collapse via set(); a
-# member set that reduces to the caller ALONE is a 400, and
-# a direct chat must resolve to exactly two members (400).
-# The two-member dedup answers 200 with the existing id
-# instead of a fresh 201, and only matches rooms whose
-# participant count is really 2. It runs TWICE: once before
-# the write lock (the cheap fast path) and once inside
-# BEGIN IMMEDIATE, so two racing creates can no longer both
-# miss and both insert. Every id must exist in users AND
-# still be active (400), and no member may be in a block
-# pair with the CREATOR (either direction) — a flat 403
-# without naming who blocked whom. Capped at 50 creates per
-# 5 min per user (429). Members start with last_read_at =
-# now, so the new chat opens with unreadCount 0.
+# is always added; a member set that reduces to the caller
+# ALONE is a 400, and a direct chat must resolve to exactly
+# two members (400). An existing two-person DM answers 200
+# with its id instead of a fresh 201 — a racing
+# double-create is settled by the direct_key UNIQUE (STEP
+# 5). Every id must exist in users AND still be active
+# (400), and no member may be in a block pair with the
+# CREATOR (either direction) — a flat 403 without naming
+# who blocked whom. Capped at 50 creates per 5 min per user
+# (429). Members start with last_read_at = now, so the new
+# chat opens with unreadCount 0.
 #
 # Sockets only auto-join conv:* rooms at connect time and
 # the creator's client emits join_conversation when it opens
@@ -1015,9 +944,8 @@ def create_conversation(request):
     # IN query, so a single unknown or deactivated id fails
     # the whole request
     # ========================================================
-    placeholders = ",".join(["%s"] * len(all_ids))
-    found = _q(f"SELECT id FROM users WHERE id IN ({placeholders}) AND active = 1", all_ids)
-    if len(found) != len(all_ids):
+    found = User.objects.filter(id__in=all_ids, active=1).count()
+    if found != len(all_ids):
         return json_error("One or more participant IDs are invalid", 400)
 
 
@@ -1027,22 +955,18 @@ def create_conversation(request):
     # creator's business, only its effect is)
     # =====================================================
     other_ids = [uid for uid in all_ids if uid != user_id]
-    other_ph = ",".join(["%s"] * len(other_ids))
-    blocked_pair = _q1(
-        f"""SELECT 1 AS x FROM user_blocks
-            WHERE (blocker_id = %s AND blocked_id IN ({other_ph}))
-               OR (blocked_id = %s AND blocker_id IN ({other_ph}))
-            LIMIT 1""",
-        [user_id, *other_ids, user_id, *other_ids],
-    )
+    blocked_pair = UserBlock.objects.filter(
+        Q(blocker_id=user_id, blocked_id__in=other_ids)
+        | Q(blocked_id=user_id, blocker_id__in=other_ids),
+    ).exists()
     if blocked_pair:
         return json_error("One or more participants cannot be added", 403)
 
 
     # STEP 4: a direct chat between two people is reused —
     # the existing id answers with 200, not 201. This is the
-    # pre-lock fast path; the same lookup runs again under
-    # BEGIN IMMEDIATE below
+    # cheap fast path; the direct_key UNIQUE below settles
+    # the race the fast path can miss
     # =====================================================
     other_id = None
     if conv_type == "direct":
@@ -1052,52 +976,48 @@ def create_conversation(request):
             return json_response({"conversationId": existing}, status=200)
 
 
-    # STEP 5: the conversation and its members in ONE write
-    # transaction — BEGIN IMMEDIATE by hand on the autocommit
-    # connection takes the write lock first, then the direct
-    # dedup runs once more under it: the loser of a
-    # double-submit finds its twin's row and answers 200
-    # instead of inserting a second DM. last_read_at = now so
-    # the chat opens with unreadCount 0 for everybody
+    # STEP 5: the conversation and its members in ONE atomic
+    # block. A direct room carries direct_key — the UNIQUE the
+    # database enforces — so the loser of a racing
+    # double-submit lands in the except arm, finds its twin's
+    # committed row and answers 200 instead of inserting a
+    # second DM. last_read_at = now so the chat opens with
+    # unreadCount 0 for everybody
     # =======================================================
-    started = _begin_immediate()
+    conv_id = str(uuid.uuid4())
+    now = utc_now()
+    direct_key = "|".join(sorted((user_id, other_id))) if conv_type == "direct" else None
+
     try:
-        if conv_type == "direct":
-            existing = _find_direct_conversation(user_id, other_id)
-            if existing:
-                _end_immediate(started, commit=False)
-                return json_response({"conversationId": existing}, status=200)
-
-        conv_id = str(uuid.uuid4())
-        now = _now_naive()
-
-        _exec(
-            "INSERT INTO conversations (id, type, title, avatar_emoji, created_by, created_at, updated_at)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (conv_id, conv_type, title, avatar_emoji, user_id, now, now),
-        )
-
-        for uid in all_ids:
-            # joined_at named too — the Django-built table has no
-            # DDL default for it
-            _exec(
-                "INSERT INTO conversation_participants (conversation_id, user_id, pinned, last_read_at, joined_at)"
-                " VALUES (%s, %s, 0, %s, %s)",
-                (conv_id, uid, now, now),
+        with transaction.atomic():
+            Conversation.objects.create(
+                id=conv_id, type=conv_type, title=title, avatar_emoji=avatar_emoji,
+                created_by_id=user_id, direct_key=direct_key,
+                created_at=now, updated_at=now,
             )
 
-        # A group opens with its own first line — who made it and
-        # what it is called — so the room never starts blank
-        system_payload = None
-        if conv_type == "group":
-            system_payload = _insert_system_message(
-                conv_id, request.user,
-                f"{request.user['display_name']} sukūrė grupę „{(title or '').strip()}“",
-            )
+            ConversationParticipant.objects.bulk_create([
+                ConversationParticipant(conversation_id=conv_id, user_id=uid,
+                                        pinned=0, last_read_at=now, joined_at=now)
+                for uid in all_ids
+            ])
 
-        _end_immediate(started, commit=True)
-    except Exception:
-        _end_immediate(started, commit=False)
+            # A group opens with its own first line — who made it and
+            # what it is called — so the room never starts blank
+            system_payload = None
+            if conv_type == "group":
+                system_payload = _insert_system_message(
+                    conv_id, request.user,
+                    f"{request.user['display_name']} sukūrė grupę „{(title or '').strip()}“",
+                )
+    except IntegrityError:
+        # Caught OUTSIDE the atomic block (the failed statement
+        # poisons it on postgres). Only direct_key can fire on a
+        # valid body — the racing twin's row answers 200; any
+        # other integrity failure propagates as a 500
+        existing = _find_direct_conversation(user_id, other_id) if conv_type == "direct" else None
+        if existing:
+            return json_response({"conversationId": existing}, status=200)
         raise
 
 
@@ -1152,9 +1072,9 @@ def create_conversation(request):
 #                        composite cursor — the id breaks
 #                        stamp ties so equal-stamp siblings
 #                        never fall through a page boundary;
-#                        without before_id the id arm
-#                        compares against NULL (never true)
-#                        and degrades to the bare-stamp cut
+#                        without before_id the id arm is
+#                        omitted and the window degrades to
+#                        the bare-stamp cut
 #   ?after&after_id      strictly newer — walking forward
 #                        from an anchored window to the head
 #   ?around=<id>         half a page either side of one
@@ -1184,27 +1104,24 @@ def create_conversation(request):
 #   - services/api/chat.ts — fetchMessages / fetchChanges
 ############################################################
 
-def _page_rows(where, params, order, limit):
-    return _q(
-        f"""
-        SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id,
-               m.client_msg_id,
-               m.kind, m.edited_at, m.attachment_url, m.attachment_name, m.attachment_size, m.attachment_mime,
-               m.attachment_meta, m.link_preview, m.gallery, m.pinned_at, m.pinned_by, m.forwarded, m.expires_at,
-               u.display_name AS sender_name, u.avatar_url AS sender_avatar,
-               m.reply_to_id, m.deleted_at,
-               r.sender_id AS reply_sender_id, r.text AS reply_text,
-               r.image_url AS reply_image_url, r.gallery AS reply_gallery, r.deleted_at AS reply_deleted_at,
-               r.kind AS reply_kind, r.attachment_name AS reply_file_name,
-               ru.display_name AS reply_sender_name
-        FROM messages m
-        JOIN users u ON u.id = m.sender_id
-        LEFT JOIN messages r ON r.id = m.reply_to_id
-        LEFT JOIN users ru ON ru.id = r.sender_id
-        WHERE {where}
-        ORDER BY m.created_at {order}, m.id {order} LIMIT %s
-        """,
-        (*params, limit),
+def _page_rows(window, order, limit):
+    ordering = ("-created_at", "-id") if order == "DESC" else ("created_at", "id")
+    return list(
+        Message.objects.filter(window)
+        .order_by(*ordering)
+        .values(
+            "id", "text", "image_url", "created_at", "sender_id", "client_msg_id",
+            "kind", "edited_at", "attachment_url", "attachment_name", "attachment_size",
+            "attachment_mime", "attachment_meta", "link_preview", "gallery",
+            "pinned_at", "pinned_by", "forwarded", "expires_at",
+            "reply_to_id", "deleted_at",
+            sender_name=F("sender__display_name"), sender_avatar=F("sender__avatar_url"),
+            reply_sender_id=F("reply_to__sender_id"), reply_text=F("reply_to__text"),
+            reply_image_url=F("reply_to__image_url"), reply_gallery=F("reply_to__gallery"),
+            reply_deleted_at=F("reply_to__deleted_at"), reply_kind=F("reply_to__kind"),
+            reply_file_name=F("reply_to__attachment_name"),
+            reply_sender_name=F("reply_to__sender__display_name"),
+        )[:limit]
     )
 
 
@@ -1224,9 +1141,13 @@ def get_messages(request, conv_id):
 
     # STEP 2: the page — see the banner for the windows
     # =================================================
-    before = request.GET.get("before")
+    # Cursor stamps come back exactly as a page served them —
+    # parsed to aware datetimes so the ORM binds them in each
+    # engine's own type; a stamp no page could have produced
+    # reads as no cursor
+    before = as_aware(request.GET.get("before")) if request.GET.get("before") else None
     before_id = request.GET.get("before_id")
-    after = request.GET.get("after")
+    after = as_aware(request.GET.get("after")) if request.GET.get("after") else None
     after_id = request.GET.get("after_id")
     around = request.GET.get("around")
     try:
@@ -1236,54 +1157,47 @@ def get_messages(request, conv_id):
     limit = max(1, min(limit, 100))
     has_newer = False
     if around:
-        anchor = _q1(
-            "SELECT created_at, id FROM messages WHERE id = %s AND conversation_id = %s",
-            (around, conv_id),
-        )
+        anchor = Message.objects.filter(id=around, conversation_id=conv_id) \
+            .values("created_at", "id").first()
         if not anchor:
             return json_error("Message not found", 404)
         half = max(1, limit // 2)
+        anchor_at, anchor_id = anchor["created_at"], anchor["id"]
         older = _page_rows(
-            "m.conversation_id = %s AND (m.created_at < %s OR (m.created_at = %s AND m.id <= %s))",
-            (conv_id, anchor["created_at"], anchor["created_at"], anchor["id"]),
-            "DESC",
-            half + 1,
+            Q(conversation_id=conv_id)
+            & (Q(created_at__lt=anchor_at) | Q(created_at=anchor_at, id__lte=anchor_id)),
+            "DESC", half + 1,
         )
         newer = _page_rows(
-            "m.conversation_id = %s AND (m.created_at > %s OR (m.created_at = %s AND m.id > %s))",
-            (conv_id, anchor["created_at"], anchor["created_at"], anchor["id"]),
-            "ASC",
-            half + 1,
+            Q(conversation_id=conv_id)
+            & (Q(created_at__gt=anchor_at) | Q(created_at=anchor_at, id__gt=anchor_id)),
+            "ASC", half + 1,
         )
         has_more = len(older) > half
         has_newer = len(newer) > half
         rows = list(reversed(newer[:half])) + older[:half]
     elif after:
-        newer = _page_rows(
-            "m.conversation_id = %s AND (m.created_at > %s OR (m.created_at = %s AND m.id > %s))",
-            (conv_id, after, after, after_id),
-            "ASC",
-            limit + 1,
-        )
+        window = Q(created_at__gt=after)
+        if after_id:
+            window |= Q(created_at=after, id__gt=after_id)
+        newer = _page_rows(Q(conversation_id=conv_id) & window, "ASC", limit + 1)
         has_newer = len(newer) > limit
         rows = list(reversed(newer[:limit]))
         # Older than this page: the caller already holds it, but
         # the flag stays truthful for a client that started here
-        has_more = _q1(
-            "SELECT 1 AS x FROM messages WHERE conversation_id = %s AND (created_at < %s OR (created_at = %s AND id <= %s)) LIMIT 1",
-            (conv_id, after, after, after_id),
-        ) is not None
+        probe = Q(created_at__lt=after)
+        if after_id:
+            probe |= Q(created_at=after, id__lte=after_id)
+        has_more = Message.objects.filter(Q(conversation_id=conv_id) & probe).exists()
     elif before:
-        rows = _page_rows(
-            "m.conversation_id = %s AND (m.created_at < %s OR (m.created_at = %s AND m.id < %s))",
-            (conv_id, before, before, before_id),
-            "DESC",
-            limit + 1,
-        )
+        window = Q(created_at__lt=before)
+        if before_id:
+            window |= Q(created_at=before, id__lt=before_id)
+        rows = _page_rows(Q(conversation_id=conv_id) & window, "DESC", limit + 1)
         has_more = len(rows) > limit
         rows = rows[:limit]
     else:
-        rows = _page_rows("m.conversation_id = %s", (conv_id,), "DESC", limit + 1)
+        rows = _page_rows(Q(conversation_id=conv_id), "DESC", limit + 1)
         has_more = len(rows) > limit
         rows = rows[:limit]
 
@@ -1295,11 +1209,10 @@ def get_messages(request, conv_id):
     reaction_map_all = _reactions_for(msg_ids, user_id)
     read_map_all = {}
     if msg_ids:
-        placeholders = ",".join(["%s"] * len(msg_ids))
-        for rd in _q(
-            f"SELECT mrd.message_id, mrd.user_id FROM message_reads mrd WHERE mrd.message_id IN ({placeholders})",
-            msg_ids,
-        ):
+        # Ordered by the receipt stamp on purpose — the readBy
+        # order must not depend on which index the planner walks
+        for rd in MessageRead.objects.filter(message_id__in=msg_ids) \
+                .order_by("message_id", "read_at").values("message_id", "user_id"):
             read_map_all.setdefault(rd["message_id"], []).append(rd["user_id"])
 
 
@@ -1307,15 +1220,11 @@ def get_messages(request, conv_id):
     # header and intro card draw portraits and the title from
     # these, and the member count feeds the own-message status
     # ========================================================
-    member_rows = _q(
-        """
-        SELECT u.id, u.display_name, u.avatar_url
-        FROM conversation_participants cp
-        JOIN users u ON u.id = cp.user_id
-        WHERE cp.conversation_id = %s
-        ORDER BY u.display_name
-        """,
-        (conv_id,),
+    member_rows = list(
+        ConversationParticipant.objects.filter(conversation_id=conv_id)
+        .order_by("user__display_name")
+        .values(id=F("user__id"), display_name=F("user__display_name"),
+                avatar_url=F("user__avatar_url"))
     )
     participants = [
         {"id": m["id"], "displayName": m["display_name"], "avatarUrl": m["avatar_url"]}
@@ -1325,10 +1234,8 @@ def get_messages(request, conv_id):
 
     # The conversation itself — a room opened from a push
     # notification has no title or type in its route params
-    conv_row = _q1(
-        "SELECT id, type, title, avatar_emoji, message_ttl_seconds FROM conversations WHERE id = %s",
-        (conv_id,),
-    )
+    conv_row = Conversation.objects.filter(id=conv_id) \
+        .values("id", "type", "title", "avatar_emoji", "message_ttl_seconds").first()
     conversation = {
         "id": conv_row["id"],
         "type": conv_row["type"],
@@ -1409,7 +1316,7 @@ def get_messages(request, conv_id):
         "conversation": conversation,
         # The server clock at the time of the page — the point
         # the client's change feed resumes from
-        "cursor": _now_naive(),
+        "cursor": utc_now(),
     })
 
 
@@ -1422,12 +1329,9 @@ def get_changes(request, conv_id):
     since = (request.GET.get("since") or "").strip()
     if not since:
         return json_error("since is required", 400)
-    try:
-        datetime.fromisoformat(since.replace("Z", "+00:00"))
-    except ValueError:
+    since_key = as_aware(since.replace("Z", "+00:00"))
+    if since_key is None:
         return json_error("since must be an ISO datetime", 400)
-    # Naive UTC, the shape every stamp in this database has
-    since_key = since.replace("Z", "").split("+")[0]
 
 
     # STEP 2: membership
@@ -1439,26 +1343,23 @@ def get_changes(request, conv_id):
     # STEP 3: the rows that moved after the cursor, shaped like
     # a history row (the client applies them to what it holds)
     # ========================================================
-    rows = _q(
-        """
-        SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id, m.reply_to_id, m.deleted_at,
-               m.client_msg_id, u.display_name AS sender_name, u.avatar_url AS sender_avatar,
-               m.kind, m.edited_at, m.attachment_url, m.attachment_name, m.attachment_size, m.attachment_mime,
-               m.attachment_meta, m.link_preview, m.gallery, m.pinned_at, m.pinned_by, m.forwarded, m.expires_at,
-               r.sender_id AS reply_sender_id, r.text AS reply_text,
-               r.image_url AS reply_image_url, r.gallery AS reply_gallery, r.deleted_at AS reply_deleted_at,
-               r.kind AS reply_kind, r.attachment_name AS reply_file_name,
-               ru.display_name AS reply_sender_name
-        FROM messages m
-        JOIN users u ON u.id = m.sender_id
-        LEFT JOIN messages r ON r.id = m.reply_to_id
-        LEFT JOIN users ru ON ru.id = r.sender_id
-        WHERE m.conversation_id = %s
-          AND (m.edited_at > %s OR m.deleted_at > %s)
-        ORDER BY m.created_at ASC, m.id ASC
-        LIMIT 500
-        """,
-        (conv_id, since_key, since_key),
+    rows = list(
+        Message.objects.filter(conversation_id=conv_id)
+        .filter(Q(edited_at__gt=since_key) | Q(deleted_at__gt=since_key))
+        .order_by("created_at", "id")
+        .values(
+            "id", "text", "image_url", "created_at", "sender_id", "reply_to_id",
+            "deleted_at", "client_msg_id",
+            "kind", "edited_at", "attachment_url", "attachment_name", "attachment_size",
+            "attachment_mime", "attachment_meta", "link_preview", "gallery",
+            "pinned_at", "pinned_by", "forwarded", "expires_at",
+            sender_name=F("sender__display_name"), sender_avatar=F("sender__avatar_url"),
+            reply_sender_id=F("reply_to__sender_id"), reply_text=F("reply_to__text"),
+            reply_image_url=F("reply_to__image_url"), reply_gallery=F("reply_to__gallery"),
+            reply_deleted_at=F("reply_to__deleted_at"), reply_kind=F("reply_to__kind"),
+            reply_file_name=F("reply_to__attachment_name"),
+            reply_sender_name=F("reply_to__sender__display_name"),
+        )[:500]
     )
 
     messages = []
@@ -1495,7 +1396,7 @@ def get_changes(request, conv_id):
 
     return json_response({
         "messages": messages,
-        "cursor": _now_naive(),
+        "cursor": utc_now(),
     })
 
 
@@ -1515,21 +1416,20 @@ def get_changes(request, conv_id):
 # attachment?, media?, gallery?, kind?, forwarded?}: text
 # is stripped, a string of at most 5000 chars; at least one
 # of text/imageUrl/attachment/gallery must be present.
-# imageUrl must be a string — EVERY non-string is a 400,
-# the falsy [] / {} / 0 / false included — and, when
-# non-empty, an own /api/uploads/ path (or /api/memes/file/
-# for a shared meme): any other value is a 400, so a stored
-# message can never point a reader's client at a foreign
-# server. replyToId must name a message in THIS conversation
-# (400, blank included). client_msg_id is the idempotency
-# nonce: a repeat of one already committed answers 200 with
-# the EXISTING row — the idempotency index closes the race
-# window. Members only (403); a DIRECT chat between a
-# blocked pair refuses the send (403) — group sends stay,
-# the push lane keeps blocked phones quiet there. One
-# transaction inserts the message, bumps
-# conversations.updated_at, moves the sender's last_read_at
-# forward and writes their own read receipt.
+# imageUrl, when non-empty, must be an own /api/uploads/
+# path (or /api/memes/file/ for a shared meme) — anything
+# else is a 400, so a stored message can never point a
+# reader's client at a foreign server. replyToId must name
+# a message in THIS conversation (400, blank included).
+# client_msg_id is the idempotency nonce: a repeat of one
+# already committed answers 200 with the EXISTING row — the
+# idempotency index closes the race window. Members only
+# (403); a DIRECT chat between a blocked pair refuses the
+# send (403) — group sends are allowed, the push lane keeps
+# blocked phones quiet there. One transaction inserts the
+# message, bumps conversations.updated_at, moves the
+# sender's last_read_at forward and writes their own read
+# receipt.
 #
 # Fan-out after commit: 'new_message' to room conv:<id>,
 # then push for every member WITHOUT a socket in that very
@@ -1719,43 +1619,43 @@ def send_message(request, conv_id):
 
     # STEP 2.0: a DIRECT chat between a blocked pair (either
     # direction) refuses the send — create_conversation stops
-    # NEW rooms, this stops the room that already existed when
-    # the block was placed. Group sends stay: membership is
-    # the group's decision, and the push fan-out below keeps a
-    # blocked pair's phones quiet there
+    # NEW rooms, this stops the room that predates the block.
+    # Group sends are allowed: membership is the group's
+    # decision, and the push fan-out below keeps a blocked
+    # pair's phones quiet there
     # =======================================================
-    conv_type_row = _q1("SELECT type FROM conversations WHERE id = %s", (conv_id,))
+    conv_type_row = Conversation.objects.filter(id=conv_id).values("type").first()
     if conv_type_row and conv_type_row["type"] == "direct":
-        counterpart = _q1(
-            "SELECT user_id FROM conversation_participants"
-            " WHERE conversation_id = %s AND user_id != %s LIMIT 1",
-            (conv_id, user_id),
-        )
+        counterpart = ConversationParticipant.objects.filter(conversation_id=conv_id) \
+            .exclude(user_id=user_id).values("user_id").first()
         if counterpart:
-            pair_blocked = _q1(
-                "SELECT 1 AS x FROM user_blocks WHERE (blocker_id = %s AND blocked_id = %s)"
-                " OR (blocker_id = %s AND blocked_id = %s)",
-                (user_id, counterpart["user_id"], counterpart["user_id"], user_id),
-            )
+            pair_blocked = UserBlock.objects.filter(
+                Q(blocker_id=user_id, blocked_id=counterpart["user_id"])
+                | Q(blocker_id=counterpart["user_id"], blocked_id=user_id),
+            ).exists()
             if pair_blocked:
                 return json_error("You cannot message this user", 403)
 
     reply_row = None
     if reply_to_id:
-        reply_row = _q1(
-            """
-            SELECT r.id AS reply_to_id, r.sender_id AS reply_sender_id, r.text AS reply_text,
-                   r.image_url AS reply_image_url, r.gallery AS reply_gallery, r.deleted_at AS reply_deleted_at,
-                   r.kind AS reply_kind, r.attachment_name AS reply_file_name,
-                   ru.display_name AS reply_sender_name
-            FROM messages r
-            JOIN users ru ON ru.id = r.sender_id
-            WHERE r.id = %s AND r.conversation_id = %s
-            """,
-            (reply_to_id, conv_id),
-        )
-        if not reply_row:
+        quoted = Message.objects.filter(id=reply_to_id, conversation_id=conv_id).values(
+            "id", "sender_id", "text", "image_url", "gallery", "deleted_at", "kind",
+            "attachment_name", sender_name=F("sender__display_name"),
+        ).first()
+        if not quoted:
             return json_error("Quoted message not found in this conversation", 400)
+        # The reply_* keys _reply_payload shapes the quote from
+        reply_row = {
+            "reply_to_id": quoted["id"],
+            "reply_sender_id": quoted["sender_id"],
+            "reply_text": quoted["text"],
+            "reply_image_url": quoted["image_url"],
+            "reply_gallery": quoted["gallery"],
+            "reply_deleted_at": quoted["deleted_at"],
+            "reply_kind": quoted["kind"],
+            "reply_file_name": quoted["attachment_name"],
+            "reply_sender_name": quoted["sender_name"],
+        }
 
 
     # STEP 2.1: idempotent replay — a nonce already committed
@@ -1779,7 +1679,7 @@ def send_message(request, conv_id):
     # answered like the replay above
     # ======================================================
     msg_id = str(uuid.uuid4())
-    now = _now_naive()
+    now = utc_now()
 
     if attachment:
         kind = kind_param if kind_param in ("video", "audio") else "file"
@@ -1787,47 +1687,39 @@ def send_message(request, conv_id):
         kind = "image" if image_url or gallery else "text"
     # The frame only means something on a photo, a video or a
     # voice note (its duration)
-    media_json = json.dumps(media) if media and kind in ("image", "video", "audio") else None
-    gallery_json = json.dumps(gallery) if gallery else None
+    stored_media = media if media and kind in ("image", "video", "audio") else None
     # Disappearing messages: the room's TTL at SEND time stamps
     # this row's hard-delete deadline — changing the TTL later
     # never touches what was already sent
-    ttl_row = _q1("SELECT message_ttl_seconds FROM conversations WHERE id = %s", (conv_id,))
+    ttl_row = Conversation.objects.filter(id=conv_id).values("message_ttl_seconds").first()
     ttl_seconds = ttl_row.get("message_ttl_seconds") if ttl_row else None
-    expires_at = (
-        (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=ttl_seconds)).isoformat()
-        if ttl_seconds
-        else None
-    )
+    expires_at = utc_now() + timedelta(seconds=ttl_seconds) if ttl_seconds else None
 
     try:
         with transaction.atomic():
-            _exec(
-                """INSERT INTO messages
-                   (id, conversation_id, sender_id, text, image_url, reply_to_id, client_msg_id, created_at,
-                    kind, attachment_url, attachment_name, attachment_size, attachment_mime, attachment_meta, gallery,
-                    forwarded, expires_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                (msg_id, conv_id, user_id, text, image_url, reply_to_id or None, client_msg_id or None, now,
-                 kind,
-                 attachment["url"] if attachment else None,
-                 attachment["name"] if attachment else None,
-                 attachment["size"] if attachment else None,
-                 attachment["mime"] if attachment else None,
-                 media_json, gallery_json,
-                 1 if forwarded else 0, expires_at),
+            Message.objects.create(
+                id=msg_id, conversation_id=conv_id, sender_id=user_id, text=text,
+                image_url=image_url, reply_to_id=reply_to_id or None,
+                client_msg_id=client_msg_id or None, created_at=now, kind=kind,
+                attachment_url=attachment["url"] if attachment else None,
+                attachment_name=attachment["name"] if attachment else None,
+                attachment_size=attachment["size"] if attachment else None,
+                attachment_mime=attachment["mime"] if attachment else None,
+                attachment_meta=stored_media, gallery=gallery or None,
+                forwarded=forwarded, expires_at=expires_at,
             )
 
-            _exec("UPDATE conversations SET updated_at = %s WHERE id = %s", (now, conv_id))
+            Conversation.objects.filter(id=conv_id).update(updated_at=now)
 
-            _exec(
-                "UPDATE conversation_participants SET last_read_at = %s WHERE conversation_id = %s AND user_id = %s",
-                (now, conv_id, user_id),
-            )
+            ConversationParticipant.objects.filter(
+                conversation_id=conv_id, user_id=user_id,
+            ).update(last_read_at=now)
 
-            _exec(
-                "INSERT OR IGNORE INTO message_reads (message_id, user_id, read_at) VALUES (%s, %s, %s)",
-                (msg_id, user_id, now),
+            # The sender's own receipt — refused silently when a
+            # racing twin already wrote it (the composite key)
+            MessageRead.objects.bulk_create(
+                [MessageRead(message_id=msg_id, user_id=user_id, read_at=now)],
+                ignore_conflicts=True,
             )
     except IntegrityError:
         # Only the (conversation_id, sender_id, client_msg_id)
@@ -1868,7 +1760,7 @@ def send_message(request, conv_id):
         "kind": kind,
         "editedAt": None,
         "attachment": attachment,
-        "media": json.loads(media_json) if media_json else None,
+        "media": stored_media,
         "gallery": gallery or None,
         # Filled in by the unfurl task after the send; the room
         # hears 'message_updated' when it lands
@@ -1902,23 +1794,18 @@ def send_message(request, conv_id):
         # mutate the dict while this runs
         in_room_ids = {uid for sid, uid in list(_connected_users.items()) if sid in room_sids}
 
-        participants = _q(
-            "SELECT user_id FROM conversation_participants WHERE conversation_id = %s AND user_id != %s",
-            (conv_id, user_id),
-        )
+        participants = ConversationParticipant.objects.filter(conversation_id=conv_id) \
+            .exclude(user_id=user_id).values("user_id")
         recipients = [p["user_id"] for p in participants if p["user_id"] not in in_room_ids]
 
         # Blocks silence the push lane too: in a group the message
         # stays visible in the room, but a phone in a block pair
         # with the sender (either direction) stays quiet
         if recipients:
-            rec_ph = ",".join(["%s"] * len(recipients))
-            block_rows = _q(
-                f"""SELECT blocker_id, blocked_id FROM user_blocks
-                    WHERE (blocker_id = %s AND blocked_id IN ({rec_ph}))
-                       OR (blocked_id = %s AND blocker_id IN ({rec_ph}))""",
-                [user_id, *recipients, user_id, *recipients],
-            )
+            block_rows = UserBlock.objects.filter(
+                Q(blocker_id=user_id, blocked_id__in=recipients)
+                | Q(blocked_id=user_id, blocker_id__in=recipients),
+            ).values("blocker_id", "blocked_id")
             silenced = {
                 r["blocked_id"] if r["blocker_id"] == user_id else r["blocker_id"]
                 for r in block_rows
@@ -1929,7 +1816,7 @@ def send_message(request, conv_id):
             # The title says WHO wrote and, in a group, WHERE — a
             # bare display name on a lock screen leaves the reader
             # guessing which room it came from
-            conv_row = _q1("SELECT type, title FROM conversations WHERE id = %s", (conv_id,))
+            conv_row = Conversation.objects.filter(id=conv_id).values("type", "title").first()
             push_title = user["display_name"]
             if conv_row and conv_row["type"] == "group" and conv_row["title"]:
                 push_title = f"{push_title} · {conv_row['title']}"
@@ -1955,14 +1842,10 @@ def send_message(request, conv_id):
             # Preview privacy: a recipient who turned
             # chat_push_preview off gets the content-free body —
             # their message text never leaves for Expo at all
-            users_ph = ",".join(["%s"] * len(recipients))
-            no_preview = {
-                r["id"]
-                for r in _q(
-                    f"SELECT id FROM users WHERE id IN ({users_ph}) AND chat_push_preview = 0",
-                    recipients,
-                )
-            }
+            no_preview = set(
+                User.objects.filter(id__in=recipients, chat_push_preview=0)
+                .values_list("id", flat=True)
+            )
             full_recipients = [r for r in recipients if r not in no_preview]
             quiet_recipients = [r for r in recipients if r in no_preview]
 
@@ -1975,9 +1858,7 @@ def send_message(request, conv_id):
             mentioned = set()
             if text:
                 lowered = text.lower()
-                for name_row in _q(
-                    f"SELECT id, display_name FROM users WHERE id IN ({users_ph})", recipients,
-                ):
+                for name_row in User.objects.filter(id__in=recipients).values("id", "display_name"):
                     needle = f"@{(name_row['display_name'] or '').strip().lower()}"
                     start = lowered.find(needle) if len(needle) > 1 else -1
                     while start >= 0:
@@ -2076,46 +1957,33 @@ def delete_message(request, conv_id, msg_id):
     # idempotent, and the broadcast lives INSIDE the guard so
     # a repeat call stays silent on the wire
     # ======================================================
-    row = _q1(
-        "SELECT sender_id, deleted_at, image_url, attachment_url, attachment_meta, link_preview, gallery"
-        " FROM messages WHERE id = %s AND conversation_id = %s",
-        (msg_id, conv_id),
-    )
+    row = Message.objects.filter(id=msg_id, conversation_id=conv_id).values(
+        "sender_id", "deleted_at", "image_url", "attachment_url",
+        "attachment_meta", "link_preview", "gallery",
+    ).first()
     if not row:
         return json_error("Message not found", 404)
     if row["sender_id"] != user_id:
         return json_error("Only the sender can delete a message", 403)
 
     if row["deleted_at"] is None:
-        now = _now_naive()
+        now = datetime.now(timezone.utc)
         with transaction.atomic():
-            _exec(
-                "UPDATE messages SET text = '', image_url = NULL, attachment_url = NULL, attachment_name = NULL,"
-                " attachment_size = NULL, attachment_mime = NULL, attachment_meta = NULL, link_preview = NULL,"
-                " gallery = NULL, pinned_at = NULL, pinned_by = NULL, deleted_at = %s WHERE id = %s",
-                (now, msg_id),
+            Message.objects.filter(id=msg_id).update(
+                text="", image_url=None, attachment_url=None, attachment_name=None,
+                attachment_size=None, attachment_mime=None, attachment_meta=None,
+                link_preview=None, gallery=None, pinned_at=None, pinned_by=None,
+                deleted_at=now,
             )
-            _exec("DELETE FROM message_reactions WHERE message_id = %s", (msg_id,))
+            MessageReaction.objects.filter(message_id=msg_id).delete()
 
         # The photo blob goes with the message — matched by
         # _is_local_upload_url, the SAME rule the send accepted
         # it under, so neither form can leave an orphan on disk
-        poster = None
-        try:
-            poster = (json.loads(row["attachment_meta"]) or {}).get("thumbnailUrl") if row["attachment_meta"] else None
-        except (TypeError, ValueError):
-            poster = None
-        preview_image = None
-        try:
-            preview_image = (json.loads(row["link_preview"]) or {}).get("imageUrl") if row["link_preview"] else None
-        except (TypeError, ValueError):
-            preview_image = None
-        gallery_urls = []
-        try:
-            if row["gallery"]:
-                gallery_urls = [item.get("url") for item in (json.loads(row["gallery"]) or []) if isinstance(item, dict)]
-        except (TypeError, ValueError):
-            gallery_urls = []
+        poster = row["attachment_meta"].get("thumbnailUrl") if isinstance(row["attachment_meta"], dict) else None
+        preview_image = row["link_preview"].get("imageUrl") if isinstance(row["link_preview"], dict) else None
+        gallery_urls = [item.get("url") for item in row["gallery"] if isinstance(item, dict)] \
+            if isinstance(row["gallery"], list) else []
         for stored in (row["image_url"], row["attachment_url"], poster, preview_image, *gallery_urls):
             if not _is_local_upload_url(stored, request):
                 continue
@@ -2156,10 +2024,8 @@ def edit_message(request, conv_id, msg_id):
     if not _is_member(conv_id, user_id):
         return json_error("Not a participant", 403)
 
-    row = _q1(
-        "SELECT sender_id, deleted_at, kind FROM messages WHERE id = %s AND conversation_id = %s",
-        (msg_id, conv_id),
-    )
+    row = Message.objects.filter(id=msg_id, conversation_id=conv_id) \
+        .values("sender_id", "deleted_at", "kind").first()
     if not row:
         return json_error("Message not found", 404)
     if row["sender_id"] != user_id:
@@ -2172,9 +2038,9 @@ def edit_message(request, conv_id, msg_id):
 
     # STEP 3: the rewrite, stamped, then the broadcast
     # ================================================
-    now = _now_naive()
+    now = utc_now()
     with transaction.atomic():
-        _exec("UPDATE messages SET text = %s, edited_at = %s WHERE id = %s", (text, now, msg_id))
+        Message.objects.filter(id=msg_id).update(text=text, edited_at=now)
 
     try:
         from knfapp.chat.events import emit_message_edited
@@ -2224,10 +2090,8 @@ def pin_message(request, conv_id, msg_id):
     if not _is_member(conv_id, user_id):
         return json_error("Not a participant", 403)
 
-    row = _q1(
-        "SELECT deleted_at, kind FROM messages WHERE id = %s AND conversation_id = %s",
-        (msg_id, conv_id),
-    )
+    row = Message.objects.filter(id=msg_id, conversation_id=conv_id) \
+        .values("deleted_at", "kind").first()
     if not row or row["deleted_at"] is not None:
         return json_error("Message not found", 404)
     if (row["kind"] or "text") == "system":
@@ -2237,14 +2101,13 @@ def pin_message(request, conv_id, msg_id):
     # STEP 2: flip the pin and tell the room
     # ======================================
     if request.method == "PUT":
-        pinned_at = _now_naive()
+        pinned_at = utc_now()
         pinned_by = user_id
     else:
         pinned_at = None
         pinned_by = None
     with transaction.atomic():
-        _exec("UPDATE messages SET pinned_at = %s, pinned_by = %s WHERE id = %s",
-              (pinned_at, pinned_by, msg_id))
+        Message.objects.filter(id=msg_id).update(pinned_at=pinned_at, pinned_by=pinned_by)
 
     from knfapp.chat.events import emit_message_updated
     emit_message_updated(_get_sio(), conv_id, msg_id, {"pinnedAt": pinned_at, "pinnedBy": pinned_by})
@@ -2263,18 +2126,15 @@ def get_pins(request, conv_id):
 
     # STEP 2: the pinned rows, shaped lean
     # ====================================
-    rows = _q(
-        """SELECT m.id, m.text, m.image_url, m.created_at, m.client_msg_id, m.sender_id,
-                  m.kind, m.edited_at, m.attachment_url, m.attachment_name, m.attachment_size, m.attachment_mime,
-                  m.attachment_meta, m.link_preview, m.gallery, m.pinned_at, m.pinned_by, m.forwarded, m.expires_at,
-                  m.deleted_at, u.display_name, u.avatar_url
-           FROM messages m
-           JOIN users u ON u.id = m.sender_id
-           WHERE m.conversation_id = %s AND m.pinned_at IS NOT NULL AND m.deleted_at IS NULL
-           ORDER BY m.pinned_at DESC
-           LIMIT 20""",
-        (conv_id,),
-    )
+    rows = Message.objects.filter(
+        conversation_id=conv_id, pinned_at__isnull=False, deleted_at__isnull=True,
+    ).order_by("-pinned_at").values(
+        "id", "text", "image_url", "created_at", "client_msg_id", "sender_id",
+        "kind", "edited_at", "attachment_url", "attachment_name", "attachment_size",
+        "attachment_mime", "attachment_meta", "link_preview", "gallery",
+        "pinned_at", "pinned_by", "forwarded", "expires_at", "deleted_at",
+        display_name=F("sender__display_name"), avatar_url=F("sender__avatar_url"),
+    )[:20]
 
     pins = []
     for row in rows:
@@ -2330,7 +2190,7 @@ def set_message_ttl(request, conv_id):
         return json_error("Not a participant", 403)
 
     with transaction.atomic():
-        _exec("UPDATE conversations SET message_ttl_seconds = %s WHERE id = %s", (ttl, conv_id))
+        Conversation.objects.filter(id=conv_id).update(message_ttl_seconds=ttl)
 
         if ttl:
             if ttl < 3600:
@@ -2405,25 +2265,23 @@ def react_to_message(request, conv_id, msg_id):
     # The conversation id in the URL is what the membership
     # check trusted, so the message must really live there —
     # and still be un-unsent
-    msg = _q1(
-        "SELECT 1 AS x FROM messages WHERE id = %s AND conversation_id = %s AND deleted_at IS NULL",
-        (msg_id, conv_id),
-    )
+    msg = Message.objects.filter(
+        id=msg_id, conversation_id=conv_id, deleted_at__isnull=True,
+    ).exists()
     if not msg:
         return json_error("Message not found", 404)
 
     with transaction.atomic():
-        # One emoji per user: replace, never accumulate.
-        # created_at named — no DDL default on the Django table
-        _exec("DELETE FROM message_reactions WHERE message_id = %s AND user_id = %s", (msg_id, user_id))
-        _exec(
-            "INSERT INTO message_reactions (message_id, user_id, emoji, created_at) VALUES (%s, %s, %s, %s)",
-            (msg_id, user_id, emoji, _now_naive()),
+        # One emoji per user: replace, never accumulate
+        MessageReaction.objects.filter(message_id=msg_id, user_id=user_id).delete()
+        MessageReaction.objects.create(
+            message_id=msg_id, user_id=user_id, emoji=emoji,
+            created_at=datetime.now(timezone.utc),
         )
 
-        # Snapshot INSIDE the transaction, broadcast after —
-        # concurrent reactions can no longer slip a newer state
-        # into an older broadcast
+        # Snapshot INSIDE the transaction, broadcast after — a
+        # concurrent reaction cannot slip a newer state into an
+        # older broadcast
         reactions = _reactions_for([msg_id]).get(msg_id, [])
 
     from knfapp.chat.events import emit_reaction_update
@@ -2440,15 +2298,15 @@ def remove_reaction(request, conv_id, msg_id):
     if not _is_member(conv_id, user_id):
         return json_error("Not a participant", 403)
 
-    # Same gates as react_to_message, so the returned list and
-    # the broadcast can no longer leak who reacted to a message
-    # the caller cannot see
-    msg = _q1("SELECT 1 AS x FROM messages WHERE id = %s AND conversation_id = %s", (msg_id, conv_id))
+    # Same gates as react_to_message — the returned list and
+    # the broadcast cannot leak who reacted to a message the
+    # caller cannot see
+    msg = Message.objects.filter(id=msg_id, conversation_id=conv_id).exists()
     if not msg:
         return json_error("Message not found", 404)
 
     with transaction.atomic():
-        _exec("DELETE FROM message_reactions WHERE message_id = %s AND user_id = %s", (msg_id, user_id))
+        MessageReaction.objects.filter(message_id=msg_id, user_id=user_id).delete()
         reactions = _reactions_for([msg_id]).get(msg_id, [])
 
     from knfapp.chat.events import emit_reaction_update
@@ -2486,20 +2344,17 @@ def remove_reaction(request, conv_id, msg_id):
 def toggle_pin(request, conv_id):
     user_id = request.user["id"]
     with transaction.atomic():
-        # One atomic statement — no read-modify-write for a
-        # concurrent toggle to race; 0 rows means non-member
-        changed = _exec(
-            "UPDATE conversation_participants SET pinned = 1 - pinned WHERE conversation_id = %s AND user_id = %s",
-            (conv_id, user_id),
-        )
+        # 0 rows means non-member
+        changed = ConversationParticipant.objects.filter(
+            conversation_id=conv_id, user_id=user_id,
+        ).update(pinned=1 - F("pinned"))
         if changed == 0:
             return json_error("Not a participant", 403)
 
         # Re-read inside the same transaction for the response
-        row = _q1(
-            "SELECT pinned FROM conversation_participants WHERE conversation_id = %s AND user_id = %s",
-            (conv_id, user_id),
-        )
+        row = ConversationParticipant.objects.filter(
+            conversation_id=conv_id, user_id=user_id,
+        ).values("pinned").first()
     return json_response({"pinned": bool(row["pinned"])})
 
 
@@ -2510,34 +2365,20 @@ def toggle_pin(request, conv_id):
 
 
 ############################################################
-# _watermark_regresses / _apply_mark_read / mark_read
+# _apply_mark_read / mark_read
 ############################################################
-#
-# _watermark_regresses: whether writing `now` over `prior`
-# would move a reader's last_read_at BACKWARDS. The two
-# stamps are PARSED rather than compared as text — raw
-# comparison would let a legacy space-form row sort above
-# every real stamp and freeze the pointer for good. A
-# missing/blank/unparseable prior answers False, so the
-# fresh stamp simply lands.
 #
 # _apply_mark_read is the ONE mark-read implementation both
 # transports share — the REST route below and events.py
 # handle_mark_read call it instead of carrying the logic
-# twice. Inside a single hand-issued BEGIN IMMEDIATE on the
-# autocommit connection: the membership lookup doubles as
-# the gate AND yields the prior watermark (no TOCTOU
-# window); the receipt SELECT is bounded to created_at in
-# (prior, now] — unbounded below only when prior is NULL —
-# capped at _MARK_READ_CAP newest rows; the receipts land
-# as ONE set-based INSERT OR IGNORE; then last_read_at
-# ADVANCES to `now` — a `now` older than the stamp already
-# on the row is dropped, so two calls committing out of
-# order can never un-read what the later one cleared.
-# Returns the pre-selected id list for the frozen
-# messages_read broadcast — None means "not a participant"
-# (the REST edge answers 403, the socket edge drops
-# silently).
+# twice. It runs inside a single hand-issued write
+# transaction (_begin_immediate): the membership lookup
+# doubles as the gate AND yields the prior watermark, so
+# there is no TOCTOU window between gate and writes — the
+# STEP comments carry the rest. Returns the pre-selected id
+# list for the frozen messages_read broadcast — None means
+# "not a participant" (the REST edge answers 403, the
+# socket edge drops silently).
 #
 # mark_read spends the SOCKET limiter's mark_read budget
 # (10 per 10 s per user, 429 past it) so the REST path is
@@ -2549,16 +2390,6 @@ def toggle_pin(request, conv_id):
 #   - services/api/chat.ts — markConversationRead
 #   - chat/events.py — handle_mark_read, the socket twin
 ############################################################
-
-def _watermark_regresses(prior, now):
-    if not prior:
-        return False
-
-    try:
-        return datetime.fromisoformat(prior) > datetime.fromisoformat(now)
-    except (ValueError, TypeError):
-        return False
-
 
 def _apply_mark_read(conv_id, user_id, now):
     # STEP 1: BEGIN IMMEDIATE — gate and writes in ONE write
@@ -2595,7 +2426,7 @@ def _apply_mark_read(conv_id, user_id, now):
                   )
                 ORDER BY m.created_at DESC LIMIT %s
                 """,
-                (conv_id, user_id, prior, now, user_id, _MARK_READ_CAP),
+                (conv_id, user_id, _bind(prior), _bind(now), user_id, _MARK_READ_CAP),
             )
         else:
             unread_msgs = _q(
@@ -2609,7 +2440,7 @@ def _apply_mark_read(conv_id, user_id, now):
                   )
                 ORDER BY m.created_at DESC LIMIT %s
                 """,
-                (conv_id, user_id, now, user_id, _MARK_READ_CAP),
+                (conv_id, user_id, _bind(now), user_id, _MARK_READ_CAP),
             )
 
         newly_read_ids = [m["id"] for m in unread_msgs]
@@ -2623,24 +2454,25 @@ def _apply_mark_read(conv_id, user_id, now):
             placeholders = ",".join(["%s"] * len(newly_read_ids))
             _exec(
                 f"""
-                INSERT OR IGNORE INTO message_reads (message_id, user_id, read_at)
+                INSERT INTO message_reads (message_id, user_id, read_at)
                 SELECT m.id, %s, %s FROM messages m WHERE m.id IN ({placeholders})
+                ON CONFLICT (message_id, user_id) DO NOTHING
                 """,
-                [user_id, now] + newly_read_ids,
+                [user_id, _bind(now)] + newly_read_ids,
             )
 
         # The pointer ADVANCES, it is never merely set: every call
         # takes its own `now` BEFORE the write lock, so the one
         # that started earlier can commit last, and a bare SET
         # would drag the watermark back over messages this reader
-        # had already cleared. `prior` was read under this very
-        # BEGIN IMMEDIATE, so nobody can move the row between the
-        # test and the write
-        if not _watermark_regresses(prior, now):
-            _exec(
-                "UPDATE conversation_participants SET last_read_at = %s WHERE conversation_id = %s AND user_id = %s",
-                (now, conv_id, user_id),
-            )
+        # had already cleared. The guard lives in the statement
+        # itself, so the same UPDATE holds on any engine
+        _exec(
+            "UPDATE conversation_participants SET last_read_at = %s"
+            " WHERE conversation_id = %s AND user_id = %s"
+            "   AND (last_read_at IS NULL OR last_read_at < %s)",
+            (_bind(now), conv_id, user_id, _bind(now)),
+        )
 
         _end_immediate(started, commit=True)
     except Exception:
@@ -2665,7 +2497,7 @@ def mark_read(request, conv_id):
     # STEP 2: one `now` for both stores, then the shared
     # helper — None back means the caller is no member
     # ==================================================
-    now = _now_naive()
+    now = utc_now()
     newly_read_ids = _apply_mark_read(conv_id, user_id, now)
     if newly_read_ids is None:
         return json_error("Not a participant", 403)
@@ -2695,7 +2527,7 @@ def mark_read(request, conv_id):
 # unknown conversation, 403 for one the caller never joined.
 # The leaver's own message_reads and message_reactions rows
 # for the room go in the SAME transaction, so the remaining
-# members' read/status math no longer counts a ghost reader;
+# members' read/status math never counts a ghost reader;
 # once nobody is left the messages, their reads and
 # reactions and the conversation itself are purged too. The
 # members who stay see who left (a group's narration); after
@@ -2723,7 +2555,7 @@ def leave_conversation(request, conv_id):
     # delete below
     # ==================================================
     user_id = request.user["id"]
-    if not _q1("SELECT 1 AS x FROM conversations WHERE id = %s", (conv_id,)):
+    if not Conversation.objects.filter(id=conv_id).exists():
         return json_error("Conversation not found", 404)
 
     if not _is_member(conv_id, user_id):
@@ -2736,34 +2568,31 @@ def leave_conversation(request, conv_id):
     # ====================================================
     system_payload = None
     with transaction.atomic():
-        _exec(
-            "DELETE FROM conversation_participants WHERE conversation_id = %s AND user_id = %s",
-            (conv_id, user_id),
-        )
-        _exec(
-            "DELETE FROM message_reads WHERE user_id = %s AND message_id IN (SELECT id FROM messages WHERE conversation_id = %s)",
-            (user_id, conv_id),
-        )
-        _exec(
-            "DELETE FROM message_reactions WHERE user_id = %s AND message_id IN (SELECT id FROM messages WHERE conversation_id = %s)",
-            (user_id, conv_id),
-        )
+        ConversationParticipant.objects.filter(conversation_id=conv_id, user_id=user_id).delete()
+        conv_msg_ids = Message.objects.filter(conversation_id=conv_id).values("id")
+        MessageRead.objects.filter(user_id=user_id, message_id__in=conv_msg_ids).delete()
+        MessageReaction.objects.filter(user_id=user_id, message_id__in=conv_msg_ids).delete()
 
-        remaining = _q1(
-            "SELECT COUNT(*) AS c FROM conversation_participants WHERE conversation_id = %s",
-            (conv_id,),
-        )["c"]
+        remaining = ConversationParticipant.objects.filter(conversation_id=conv_id).count()
 
         if remaining == 0:
-            _exec("DELETE FROM message_reads WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = %s)", (conv_id,))
-            _exec("DELETE FROM message_reactions WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = %s)", (conv_id,))
+            MessageRead.objects.filter(message_id__in=conv_msg_ids).delete()
+            MessageReaction.objects.filter(message_id__in=conv_msg_ids).delete()
+            # Raw on purpose — the ORM delete would collect
+            # every row and run the reply-quote SET_NULL pass
+            # over rows that are all dying anyway
             _exec("DELETE FROM messages WHERE conversation_id = %s", (conv_id,))
-            _exec("DELETE FROM conversations WHERE id = %s", (conv_id,))
+            Conversation.objects.filter(id=conv_id).delete()
         else:
             # The members who stay see who left — a group's
             # narration; a direct chat's other half simply keeps
             # the conversation as it was
-            conv_type_row = _q1("SELECT type FROM conversations WHERE id = %s", (conv_id,))
+            conv_type_row = Conversation.objects.filter(id=conv_id).values("type").first()
+            if conv_type_row and conv_type_row["type"] == "direct":
+                # The half-left room stops claiming the pair — a
+                # fresh create for these two must insert anew, not
+                # answer 200 onto a room the leaver abandoned
+                Conversation.objects.filter(id=conv_id).update(direct_key=None)
             if conv_type_row and conv_type_row["type"] == "group":
                 system_payload = _insert_system_message(
                     conv_id, request.user, f"{request.user['display_name']} paliko pokalbį",
@@ -2828,25 +2657,20 @@ def total_unread_count(request):
 #
 # GET /api/chat/conversations/<id>/messages/search
 #
-# ?q (required, 400 when blank after strip and 400 over 200
+# ?q (required, 400 when blank after strip or over 200
 # chars) and ?limit (default 20, clamped into 1..50,
 # non-numeric → 400, parsed only after the membership gate).
-# Members only (403). The match runs on the messages_fts
-# FTS5 shadow table as a quoted prefix phrase — token-prefix
-# semantics, proper word folding, no full scan — joined back
-# to messages for the deleted_at filter; when FTS5 is
-# missing from the build (or the query defeats the
-# tokenizer) a LIKE '%q%' substring path answers
-# instead, ASCII-only case folding and all, with q's \, %
-# and _ escaped so they match literally. A q carrying a NUL
-# byte is answered {messages: [], total: 0} without a query
-# at all: the driver binds TEXT NUL-terminated, so the
-# pattern would arrive truncated and match far more than was
-# asked. Returns {messages, total}: the newest `limit` hits
-# reversed to chronological order, plus the total so the UI
-# can say "20 of 137" — the counter SATURATES at
-# _SEARCH_TOTAL_CAP, so that value means "this many or
-# more". Capped at 100 searches per 5 min per user (429).
+# Members only (403). ONE substring match both engines run
+# identically — case-insensitive contains on the room's
+# un-unsent rows, the needle's \, % and _ escaped by the
+# lookup so they match literally. A q carrying a NUL byte
+# answers {messages: [], total: 0} without a query at all
+# (see the guard below). Returns {messages, total}: the
+# newest `limit` hits reversed to chronological order, plus
+# the total so the UI can say "20 of 137" — the counter
+# SATURATES at _SEARCH_TOTAL_CAP, so that value means "this
+# many or more". Capped at 100 searches per 5 min per user
+# (429).
 #
 # Used by:
 #   - services/api/chat.ts — searchMessagesApi
@@ -2880,84 +2704,31 @@ def search_messages(request, conv_id):
     limit = max(1, min(limit, 50))
 
     # The driver binds TEXT NUL-TERMINATED, so a NUL in the
-    # needle truncates the pattern INSIDE SQLite: the FTS
-    # phrase loses its closing quote and the LIKE pattern
-    # collapses to a bare '%' that answers the whole room. No
-    # message body holds one, so the needle is answered as
-    # what it is — a miss
+    # needle truncates the pattern INSIDE SQLite and the LIKE
+    # pattern collapses to a bare '%' that answers the whole
+    # room. No message body holds one, so the needle is
+    # answered as what it is — a miss
     if "\x00" in q:
         return json_response({"messages": [], "total": 0})
 
 
     # STEP 3: the newest `limit` hits plus the saturating
-    # total — FTS5 first: q rides as one quoted prefix phrase
-    # ("..."*, inner quotes doubled), joined back to messages
-    # for deleted_at. A build without FTS5 or a query the
-    # tokenizer rejects raises OperationalError and falls back
-    # to the escaped-LIKE substring scan
+    # total — icontains escapes the needle's wildcards itself
+    # and carries the case folding per engine
     # ======================================================
-    rows = None
-    total = 0
-    fts_query = '"' + q.replace('"', '""') + '"*'
-    try:
-        rows = _q(
-            """
-            SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id,
-                   u.display_name AS sender_name, u.avatar_url AS sender_avatar
-            FROM messages_fts
-            JOIN messages m ON m.rowid = messages_fts.rowid
-            JOIN users u ON u.id = m.sender_id
-            WHERE messages_fts MATCH %s AND m.conversation_id = %s AND m.deleted_at IS NULL
-            ORDER BY m.created_at DESC
-            LIMIT %s
-            """,
-            (fts_query, conv_id, limit),
-        )
+    hits = Message.objects.filter(
+        conversation_id=conv_id, deleted_at__isnull=True, text__icontains=q,
+    )
+    rows = list(
+        hits.order_by("-created_at").values(
+            "id", "text", "image_url", "created_at", "sender_id",
+            sender_name=F("sender__display_name"), sender_avatar=F("sender__avatar_url"),
+        )[:limit]
+    )
 
-        # Counted over a capped subquery: the label needs
-        # "many", not the exact number of hits in a decade of
-        # history
-        total = _q1(
-            """
-            SELECT COUNT(*) AS c FROM (
-                SELECT 1 AS x
-                FROM messages_fts
-                JOIN messages m ON m.rowid = messages_fts.rowid
-                WHERE messages_fts MATCH %s AND m.conversation_id = %s AND m.deleted_at IS NULL
-                LIMIT %s
-            )
-            """,
-            (fts_query, conv_id, _SEARCH_TOTAL_CAP),
-        )["c"]
-    except OperationalError:
-        rows = None
-
-    if rows is None:
-        search_pattern = f"%{_escape_like(q)}%"
-        rows = _q(
-            r"""
-            SELECT m.id, m.text, m.image_url, m.created_at, m.sender_id,
-                   u.display_name AS sender_name, u.avatar_url AS sender_avatar
-            FROM messages m
-            JOIN users u ON u.id = m.sender_id
-            WHERE m.conversation_id = %s AND m.deleted_at IS NULL AND m.text LIKE %s ESCAPE '\'
-            ORDER BY m.created_at DESC
-            LIMIT %s
-            """,
-            (conv_id, search_pattern, limit),
-        )
-
-        # Same saturating count as the FTS arm above
-        total = _q1(
-            r"""
-            SELECT COUNT(*) AS c FROM (
-                SELECT 1 AS x FROM messages
-                WHERE conversation_id = %s AND deleted_at IS NULL AND text LIKE %s ESCAPE '\'
-                LIMIT %s
-            )
-            """,
-            (conv_id, search_pattern, _SEARCH_TOTAL_CAP),
-        )["c"]
+    # Counted over a capped subquery: the label needs "many",
+    # not the exact number of hits in a decade of history
+    total = hits[:_SEARCH_TOTAL_CAP].count()
 
 
     # STEP 4: shape the hits — no reactions/status here, and
@@ -3014,8 +2785,8 @@ def search_messages(request, conv_id):
 # pattern to '%') answers {users: []} with 200 so the
 # picker can call it on every keystroke. Returns id,
 # username, displayName, avatarUrl, role — no email;
-# username and role stay because the mobile SearchUserResult
-# types both as required (frozen contract).
+# username and role are required by the mobile
+# SearchUserResult type (frozen contract).
 #
 # Used by:
 #   - services/api/chat.ts — fetchOnlineStatus /
@@ -3045,17 +2816,13 @@ def online_status(request):
     # ======================================================
     shared = set()
     if user_ids:
-        placeholders = ",".join(["%s"] * len(user_ids))
-        rows = _q(
-            f"""
-            SELECT DISTINCT cp2.user_id
-            FROM conversation_participants cp1
-            JOIN conversation_participants cp2 ON cp2.conversation_id = cp1.conversation_id
-            WHERE cp1.user_id = %s AND cp2.user_id IN ({placeholders})
-            """,
-            [user_id] + user_ids,
+        shared = set(
+            ConversationParticipant.objects.filter(
+                user_id__in=user_ids,
+                conversation_id__in=ConversationParticipant.objects
+                    .filter(user_id=user_id).values("conversation_id"),
+            ).values_list("user_id", flat=True).distinct()
         )
-        shared = {r["user_id"] for r in rows}
 
 
     # STEP 3: presence is this process's socket table; an
@@ -3086,30 +2853,22 @@ def search_users(request):
     if len(q) < 2 or "\x00" in q:
         return json_response({"users": []})
 
-    search_pattern = f"%{_escape_like(q)}%"
-    prefix_pattern = f"{_escape_like(q)}%"
-    # COLLATE NOCASE is SQLite spelling — rewrites with the rest
-    # of the raw SQL on a postgres move
-    rows = _q(
-        r"""
-        SELECT id, username, display_name, avatar_url, role
-        FROM users
-        WHERE id != %s AND active = 1 AND (
-            username LIKE %s ESCAPE '\' OR display_name LIKE %s ESCAPE '\'
-        )
-          AND id NOT IN (SELECT blocked_id FROM user_blocks WHERE blocker_id = %s)
-          AND id NOT IN (SELECT blocker_id FROM user_blocks WHERE blocked_id = %s)
-        ORDER BY
-            CASE
-                WHEN username = %s COLLATE NOCASE THEN 0
-                WHEN display_name LIKE %s ESCAPE '\' THEN 1
-                ELSE 2
-            END,
-            display_name COLLATE NOCASE,
-            id
-        LIMIT 20
-        """,
-        (user_id, search_pattern, search_pattern, user_id, user_id, q, prefix_pattern),
+    # The case-insensitive lookups carry the folding per
+    # engine — SQLite's ASCII LIKE, real folding where LIKE
+    # is case-sensitive — and escape the needle's wildcards
+    # themselves
+    rows = list(
+        User.objects.exclude(id=user_id).filter(active=1)
+        .filter(Q(username__icontains=q) | Q(display_name__icontains=q))
+        .exclude(id__in=UserBlock.objects.filter(blocker_id=user_id).values("blocked_id"))
+        .exclude(id__in=UserBlock.objects.filter(blocked_id=user_id).values("blocker_id"))
+        .annotate(rank=Case(
+            When(username__iexact=q, then=0),
+            When(display_name__istartswith=q, then=1),
+            default=2,
+        ))
+        .order_by("rank", Lower("display_name"), "id")
+        .values("id", "username", "display_name", "avatar_url", "role")[:20]
     )
 
     return json_response({

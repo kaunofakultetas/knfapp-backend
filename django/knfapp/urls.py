@@ -18,7 +18,6 @@
 from django.urls import path
 
 
-# Initialize the urlpatterns list
 urlpatterns = []
 
 

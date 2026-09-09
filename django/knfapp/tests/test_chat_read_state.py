@@ -5,8 +5,7 @@
 #  ever advances, the receipt cap, the shared socket+REST
 #  budget), the relationship-gated presence oracle, the
 #  people picker's exclusions and ranking, the socket rate
-#  window, and the now-live chat side of erasure/export —
-#  the guarded hooks the earlier rounds parked.
+#  window, and the chat side of erasure and export.
 ############################################################
 
 
@@ -17,7 +16,7 @@ from django.test import Client, TestCase
 
 
 from knfapp.chat import events
-from knfapp.chat.api.views import _apply_mark_read, _watermark_regresses
+from knfapp.chat.api.views import _apply_mark_read
 from knfapp.chat.models import ConversationParticipant, Message, MessageRead
 from knfapp.common import ratelimit
 from knfapp.users import auth
@@ -60,14 +59,11 @@ class MarkReadTests(ReadStateTestCase):
 
         self.assertIsNotNone(_apply_mark_read(self.room.id, self.tomas.id, fresh))
         # The out-of-order twin commits later with an older `now`
+        # — the advance-only guard lives in the UPDATE itself,
+        # so the same statement holds on either engine
         _apply_mark_read(self.room.id, self.tomas.id, stale)
         row = ConversationParticipant.objects.get(conversation_id=self.room.id, user_id=self.tomas.id)
-        self.assertEqual(row.last_read_at, fresh)
-
-        # The parse-not-compare rule: a malformed prior is no
-        # reason to freeze the pointer
-        self.assertFalse(_watermark_regresses("vakar vakare", fresh))
-        self.assertFalse(_watermark_regresses(None, fresh))
+        self.assertEqual(row.last_read_at.replace(tzinfo=None), fresh)
 
     def test_a_non_member_writes_nothing_and_hears_403(self):
         outsider = create_user(username="pasalinis")
@@ -85,6 +81,43 @@ class MarkReadTests(ReadStateTestCase):
         response = bearer(self.client.put, f"/api/chat/conversations/{self.room.id}/read", self.tomas_token)
         self.assertEqual(response.status_code, 429)
         self.assertEqual(json.loads(response.content)["code"], "rate_limited")
+
+
+class SocketHandshakeTests(TestCase):
+
+    def test_a_valid_token_joins_every_room_and_lands_in_presence(self):
+        # The front door: an accepted handshake must join the
+        # user's conv:* rooms and record presence. This runs the
+        # REAL handler against a recording sio stub — a crash
+        # inside its try-arm reads as a silent rejection that no
+        # HTTP pin would ever notice
+        user = create_user(username="tomas")
+        other = create_user(username="ona")
+        room = create_room([user, other])
+        token = auth.mint_session(user.id)
+
+        calls = {"handlers": {}, "rooms": [], "emits": []}
+
+        class _Sio:
+            def on(self, event, handler=None):
+                calls["handlers"][event] = handler
+
+            def enter_room(self, sid, room_name):
+                calls["rooms"].append(room_name)
+
+            def emit(self, event, payload=None, to=None, **kwargs):
+                calls["emits"].append(event)
+
+        events.reset_socket_state()
+        try:
+            events.register_socket_events(_Sio())
+            accepted = calls["handlers"]["connect"]("sid-1", {}, {"token": token})
+            self.assertNotEqual(accepted, False)
+            self.assertIn(f"conv:{room.id}", calls["rooms"])
+            self.assertEqual(events._connected_users.get("sid-1"), user.id)
+            self.assertIn("connected", calls["emits"])
+        finally:
+            events.reset_socket_state()
 
 
 class SocketRateTests(TestCase):
@@ -155,9 +188,8 @@ class PeoplePickerTests(ReadStateTestCase):
 class ChatErasureParityTests(ReadStateTestCase):
 
     def test_erasure_now_reaches_the_chat_tables(self):
-        # The guarded _CHAT_SQL the erasure round parked goes live
-        # with the chat app: photo refs nulled, the reader state
-        # hard-deleted, the messages kept for the room
+        # Erasure's chat pass: photo refs nulled, the reader
+        # state hard-deleted, the messages kept for the room
         msg = create_message(self.room, self.tomas, text="Lieka",
                              image_url="/api/uploads/" + "e" * 32 + ".jpg")
         foreign = create_message(self.room, self.ona)

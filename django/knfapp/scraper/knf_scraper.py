@@ -8,7 +8,7 @@
 #  and no author_id. Deduplication is by source_url in its
 #  canonical normalise_url shape, which is also UNIQUE in
 #  the schema — the SELECT is the fetch-avoidance path and
-#  INSERT OR IGNORE the backstop, so a lost race costs one
+#  the DO NOTHING insert the backstop, so a lost race costs one
 #  row instead of the whole run. A title already stored
 #  under this source counts as the same article too, which
 #  catches one story republished under a second URL.
@@ -24,8 +24,8 @@
 #  command (pages=2, every 20 minutes) and POST
 #  /api/scraper/trigger|/run (the same pages=2 and
 #  notify=False) — `pages` is the MINIMUM number of listing
-#  pages walked. The run lock is two-layered now that those
-#  are different PROCESSES: the module threading.Lock is the
+#  pages walked. Those are different PROCESSES, so the run
+#  lock is two-layered: the module threading.Lock is the
 #  in-process fast path, common.open_run the cross-process
 #  guard — either one refusing reports {"skipped": True},
 #  which the route turns into 409.
@@ -34,10 +34,10 @@
 #  run fetches and parses everything first, then writes the
 #  batch inside one transaction.atomic() block — which also
 #  owns the rollback on failure.
-#  published_at is naive UTC with the source's offset
-#  APPLIED (not dropped) and clamped to the last five years.
-#  created_at/updated_at are stamped in the house ISO-T
-#  form.
+#  published_at is aware UTC (+00:00) with the source's
+#  offset APPLIED (not dropped) and clamped to the last
+#  five years; created_at/updated_at are stamped aware UTC
+#  too.
 #
 #  New articles trigger one push on the "news" channel —
 #  Lithuanian copy (declined via scraper/plurals.py) with an
@@ -57,7 +57,7 @@ from bs4 import BeautifulSoup
 
 from django.db import connection, transaction
 
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now
 from knfapp.news.models import NewsPost
 from knfapp.scraper.common import (
     KNF_HOSTS,
@@ -104,12 +104,14 @@ _RUN_LOCK = threading.Lock()
 
 # Every NOT NULL column named: the Django-built table
 # carries no DDL defaults (the model's defaults are ORM-side
-# and a raw INSERT walks past them)
+# and a raw INSERT walks past them). is_public is BOUND —
+# Python True — so each engine stores its native boolean
 _INSERT_SQL = """
-    INSERT OR IGNORE INTO news_posts
+    INSERT INTO news_posts
       (id, title, content, summary, image_url, author_name, source, source_url, post_type,
        is_public, likes_count, comments_count, shares_count, published_at, created_at, updated_at)
-    VALUES (%s, %s, %s, %s, %s, %s, 'knf.vu.lt', %s, 'article', 1, 0, 0, 0, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, 'knf.vu.lt', %s, 'article', %s, 0, 0, 0, %s, %s, %s)
+    ON CONFLICT (source_url) DO NOTHING
 """
 
 
@@ -132,10 +134,10 @@ _INSERT_SQL = """
 # is what the command logs and /api/scraper/trigger returns.
 # "found" counts distinct listing links with a non-empty
 # title INCLUDING ones already stored; "new" counts rows
-# actually inserted (INSERT OR IGNORE rowcount, so a row
+# actually inserted (the DO NOTHING insert's rowcount, so a row
 # another run wrote first is not counted twice). A link is
 # only marked seen once it HAS that title, so the thumbnail
-# anchor of a blog card no longer swallows the titled link
+# anchor of a blog card cannot swallow the titled link
 # beside it.
 #
 # `pages` is the MINIMUM number of listing pages walked:
@@ -243,10 +245,10 @@ def _run(run_id, pages, notify, deadline):
                 # An empty link text is dropped before counting and
                 # BEFORE the URL is marked seen: a Joomla card puts a
                 # thumbnail anchor beside the titled one, and marking
-                # the URL seen on the thumbnail swallowed the article
-                # for the whole run. The text itself is kept as the
-                # title of last resort for an article page whose own
-                # markup parses to nothing
+                # the URL seen on the thumbnail would swallow the
+                # article for the whole run. The text itself is kept
+                # as the title of last resort for an article page
+                # whose own markup parses to nothing
                 listing_title = link.get_text(strip=True)
                 if not listing_title:
                     continue
@@ -301,15 +303,16 @@ def _run(run_id, pages, notify, deadline):
 
 
         # STEP 4: ONE short write transaction, every fetch already
-        # done. INSERT OR IGNORE keeps a lost race to a single
+        # done. ON CONFLICT DO NOTHING keeps a lost race to a single
         # skipped row instead of a failed run
         # ========================================================
         articles_new = 0
         with transaction.atomic():
             for full_url, listing_title, article_data in pending:
-                # The article page's own title, then the listing link
-                # text — storing an unparsable page as
-                # "Untitled" would keep every later run from revisiting it
+                # The article page's own title, then the listing
+                # link text — storing an unparsable page as
+                # "Untitled" would keep every later run from
+                # revisiting it
                 title = (article_data["title"] or listing_title)[:MAX_TITLE_LENGTH]
 
                 # Nothing recognisable on the page at all: write NO
@@ -325,7 +328,7 @@ def _run(run_id, pages, notify, deadline):
                     logger.info("knf.vu.lt article already stored under another URL: %s", title)
                     continue
 
-                now = utc_now_iso()
+                now = utc_now()
                 with connection.cursor() as cursor:
                     cursor.execute(_INSERT_SQL, (
                         str(uuid.uuid4()),
@@ -335,6 +338,7 @@ def _run(run_id, pages, notify, deadline):
                         article_data["image_url"],
                         article_data["author"],
                         full_url,
+                        True,  # is_public — a scraped article is guest-visible
                         article_data["date"],
                         now,
                         now,
@@ -460,7 +464,7 @@ def _listing_links(soup):
 # back with an EMPTY title, which is what lets the caller
 # fall back to the listing link text and, failing even that,
 # store no row at all. Title, content and summary come back
-# already cut to the same limits news/routes.py enforces on
+# already cut to the same limits the news views enforce on
 # hand-written posts.
 #
 # Per field:
@@ -590,7 +594,7 @@ def _fetch_article(url):
 
     # STEP 6: date — four sources tried IN ORDER, each falling
     # through to the next when it is missing OR unparsable, so
-    # one broken <time> no longer costs the article its real
+    # one broken <time> cannot cost the article its real
     # publication date. The offset is APPLIED (Vilnius wall
     # clock converted to UTC) and the result clamped
     # ========================================================
@@ -646,10 +650,10 @@ def _fetch_article(url):
             author = text
             break
 
-    # Cut to the limits the news routes enforce on hand-written
-    # posts — a scraped row must not bypass them. An
-    # empty title stays EMPTY: the caller has the listing link
-    # text to fall back on
+    # Cut to the limits the news routes enforce on hand-
+    # written posts — a scraped row must not bypass them. An
+    # empty title stays EMPTY: the caller has the listing
+    # link text to fall back on
     return {
         "title": title[:MAX_TITLE_LENGTH],
         "content": content[:MAX_CONTENT_LENGTH],

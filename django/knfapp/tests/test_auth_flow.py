@@ -2,11 +2,11 @@
 #  [*] Regression tests — the account flows over the wire
 #
 #  register → me → login → logout through the real URLconf
-#  and middleware, pinning the CONTRACT the mobile app was
-#  built against: paths, bodies, status codes and the
-#  machine `code` slugs it translates. Not a re-test of
-#  every input permutation — each
-#  case here pins one decision that must survive rewrites.
+#  and middleware, pinning the CONTRACT the mobile app
+#  depends on: paths, bodies, status codes and the machine
+#  `code` slugs it translates. Not a re-test of every input
+#  permutation — each case pins one decision that must
+#  survive rewrites.
 ############################################################
 
 

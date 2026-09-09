@@ -1,16 +1,15 @@
 ############################################################
 #  [*] users — accounts, invitation codes, bearer sessions
 #
-#  Table and column names match the production database
-#  byte-for-byte (db_table/db_column), so the data cutover
-#  is a row copy, never a rename. Three shape rules every
-#  app's models follow:
+#  Three shape rules every app's models follow:
 #
 #    - TEXT primary keys stay TextField(primary_key=True) —
-#      every id is a uuid4 string minted in Python
-#    - timestamps stay TEXT (ISO-8601 with offset, the
-#      shape common/timestamps.py writes); Django DateTime
-#      columns would rewrite every stored stamp
+#      every id is a uuid4 string minted in Python (raw SQL
+#      and the wire treat ids as opaque strings)
+#    - timestamps are DateTimeField holding aware UTC
+#      instants; the wire shape is decided per response at
+#      serialization (the stamp policy lives in
+#      common/timestamps.py + common/http.py)
 #    - the CHECK constraints (role, source, ...) live in
 #      Meta.constraints so the database itself enforces the
 #      enums
@@ -27,6 +26,7 @@
 
 
 from django.db import models
+from django.db.models.functions import Lower
 
 
 ROLES = ("student", "teacher", "admin", "curator")
@@ -48,7 +48,11 @@ PRIVILEGED_ROLES = ("admin", "curator")
 # a code was burned at registration; the student_* trio is
 # the optional student card. Erasure anonymises this row in
 # place — it is never hard-deleted, so foreign keys to it
-# cannot dangle.
+# cannot dangle. Username/email uniqueness is enforced
+# case-INSENSITIVELY by the two functional indexes below —
+# the register race and any out-of-band writer are refused
+# by the database itself, which is what makes login's
+# case-variant handling unreachable for new data.
 #
 # Table: users
 # -----------------------------------------------------------
@@ -61,21 +65,27 @@ class User(models.Model):
     display_name = models.TextField()
     password_hash = models.TextField()
     role = models.TextField(default="student")
-    invited = models.IntegerField(default=0)
+    invited = models.BooleanField(default=False)
     avatar_url = models.TextField(null=True, blank=True)
     student_number = models.TextField(null=True, blank=True)
     study_group = models.TextField(null=True, blank=True)
     study_program = models.TextField(null=True, blank=True)
-    active = models.IntegerField(default=1)
-    chat_push_preview = models.IntegerField(default=1)
-    created_at = models.TextField()
-    updated_at = models.TextField()
+    active = models.BooleanField(default=True)
+    chat_push_preview = models.BooleanField(default=True)
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
         db_table = "users"
         constraints = [
             models.CheckConstraint(condition=models.Q(role__in=ROLES), name="users_role_check"),
+            # The columns' own unique=True is BINARY; these bind
+            # the case-insensitive rule the views enforce
+            # (usernames are ASCII by regex, so SQLite's
+            # ASCII-only lower() matches iexact exactly)
+            models.UniqueConstraint(Lower("username"), name="users_username_ci"),
+            models.UniqueConstraint(Lower("email"), name="users_email_ci"),
         ]
 
 
@@ -109,8 +119,8 @@ class InvitationCode(models.Model):
     )
     max_uses = models.IntegerField(default=1)
     use_count = models.IntegerField(default=0)
-    expires_at = models.TextField()
-    created_at = models.TextField()
+    expires_at = models.DateTimeField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -144,8 +154,8 @@ class Session(models.Model):
     id = models.TextField(primary_key=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id", related_name="sessions")
     token = models.TextField(unique=True)
-    created_at = models.TextField()
-    expires_at = models.TextField()
+    created_at = models.DateTimeField()
+    expires_at = models.DateTimeField()
 
     # Table metadata
     class Meta:

@@ -1,9 +1,14 @@
 ############################################################
-#  [*] schedule 0001 — the scraped timetable
+#  [*] schedule 0001 — scraped lessons
 #
-#  Generated from models.py and committed; the suite's
-#  `makemigrations --check` fails on drift, never a deploy.
+#  One table with the 8-column natural-key UNIQUE (the row
+#  IS the identity; teacher/room store '' so the key stays
+#  NOT NULL) and the filter index.
+#
+#  Head of its app's chain; the suite runs `makemigrations
+#  --check`, so drift against models.py fails the tests.
 ############################################################
+
 
 
 from django.db import migrations, models
@@ -22,18 +27,19 @@ class Migration(migrations.Migration):
             fields=[
                 ('id', models.TextField(primary_key=True, serialize=False)),
                 ('title', models.TextField()),
-                ('teacher', models.TextField(blank=True, null=True)),
-                ('room', models.TextField(blank=True, null=True)),
+                ('teacher', models.TextField(blank=True, default='')),
+                ('room', models.TextField(blank=True, default='')),
                 ('time_start', models.TextField()),
                 ('time_end', models.TextField()),
                 ('day_of_week', models.IntegerField()),
-                ('group_name', models.TextField(blank=True, null=True)),
-                ('semester', models.TextField(blank=True, null=True)),
-                ('created_at', models.TextField()),
+                ('group_name', models.TextField(blank=True, default='')),
+                ('semester', models.TextField(blank=True, default='')),
+                ('created_at', models.DateTimeField()),
             ],
             options={
                 'db_table': 'schedule_lessons',
-                'constraints': [models.CheckConstraint(condition=models.Q(('day_of_week__gte', 0), ('day_of_week__lte', 6)), name='schedule_lessons_day_check')],
+                'indexes': [models.Index(fields=['semester', 'group_name', 'day_of_week'], name='idx_schedule_lessons_filter')],
+                'constraints': [models.CheckConstraint(condition=models.Q(('day_of_week__gte', 0), ('day_of_week__lte', 6)), name='schedule_lessons_day_check'), models.UniqueConstraint(fields=('semester', 'group_name', 'day_of_week', 'time_start', 'time_end', 'title', 'teacher', 'room'), name='idx_schedule_lessons_natural')],
             },
         ),
     ]

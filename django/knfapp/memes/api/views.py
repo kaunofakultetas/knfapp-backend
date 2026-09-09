@@ -35,7 +35,7 @@ from django.http import FileResponse
 
 from knfapp.common import ratelimit
 from knfapp.common.http import json_error, json_response
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now
 from knfapp.memes.models import Meme
 from knfapp.uploads.gates import reencode_image
 from knfapp.users.auth import require_auth
@@ -231,7 +231,7 @@ def push_meme(request):
     Meme.objects.create(
         id=meme_id, filename=safe_name, title=title, tags=tags or None,
         added_by_id=request.user["id"], byte_size=len(stored), width=width, height=height,
-        preview=preview, search=_fold(f"{title} {tags}"), created_at=utc_now_iso(),
+        preview=preview, search=_fold(f"{title} {tags}"), created_at=utc_now(),
     )
     row = Meme.objects.filter(id=meme_id).values(*_ROW_FIELDS).first()
     return json_response({"meme": _meme_payload(row)}, status=201)

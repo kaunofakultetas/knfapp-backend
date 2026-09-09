@@ -1,10 +1,9 @@
 ############################################################
 #  [*] Ops API — the readiness probe
 #
-#  GET /api/health — the one route swagger documents that
-#  had no handler here until now. Public on purpose: it
-#  carries no data, and a probe that needs credentials is a
-#  probe nobody wires up.
+#  GET /api/health. Public on purpose: it carries no data,
+#  and a probe that needs credentials is a probe nobody
+#  wires up.
 ############################################################
 
 

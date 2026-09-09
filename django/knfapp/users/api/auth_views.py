@@ -11,12 +11,16 @@
 #
 #  Split into:
 #
-#    validate_code — POST /api/auth/validate-code
-#    register      — POST /api/auth/register
-#    login         — POST /api/auth/login
-#    me            — GET  /api/auth/me
-#    logout        — POST /api/auth/logout
-#    logout_all    — POST /api/auth/logout-all
+#    validate_code   — POST /api/auth/validate-code
+#    register        — POST /api/auth/register
+#    login           — POST /api/auth/login
+#    me              — GET  /api/auth/me (PUT → update_me,
+#                      DELETE → delete_me)
+#    export_me       — GET  /api/auth/me/export
+#    change_password — POST /api/auth/change-password
+#    logout          — POST /api/auth/logout
+#    logout_all      — POST /api/auth/logout-all
+#    (+ _invite_rejection and the two cross-app hooks)
 ############################################################
 
 
@@ -33,7 +37,7 @@ from django.views.decorators.http import require_POST
 
 from knfapp.common import ratelimit
 from knfapp.common.http import client_ip, get_json_object, json_error, json_response
-from knfapp.common.timestamps import parse_stored, utc_now_iso
+from knfapp.common.timestamps import as_naive_utc, parse_stored, utc_now, utc_now_iso
 from knfapp.notifications.models import PushToken
 from knfapp.users.auth import (
     DUMMY_PASSWORD_HASH,
@@ -160,8 +164,8 @@ def validate_code(request):
 # (ATOMIC_REQUESTS) and answers 201 {"user", "token"} — the
 # client is signed in straight away. A given code must be
 # valid (a bad one is a 400, never a silent downgrade); a
-# valid one grants its role and invited=1, no code means
-# student/invited=0.
+# valid one grants its role and invited=True, no code means
+# student/invited=False.
 #
 # The body is validated BEFORE the rate-limit attempt is
 # recorded — malformed retries must not eat an honest
@@ -242,7 +246,7 @@ def register(request):
         return json_error("invitation_code must be a string", 400)
     invite_code = (raw_code or "").strip()
     role = "student"
-    invited = 0
+    invited = False
 
     if invite_code:
         invite = InvitationCode.objects.filter(code=invite_code).first()
@@ -260,7 +264,7 @@ def register(request):
             return json_error(prose, 400, code=slug)
 
         role = invite.role
-        invited = 1
+        invited = True
 
 
     # STEP 4: one 409 for a taken username OR email, checked
@@ -276,7 +280,7 @@ def register(request):
     # =============================================================
     user_id = str(uuid.uuid4())
     password_hash = bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()
-    now = utc_now_iso()
+    now = utc_now()
     try:
         User.objects.create(
             id=user_id, username=username, email=email, display_name=display_name,
@@ -292,7 +296,7 @@ def register(request):
     # ============================================================
     token = mint_session(user_id)
 
-    logger.info("Registered user %s (%s) role=%s invited=%d from %s", user_id, username, role, invited, ip)
+    logger.info("Registered user %s (%s) role=%s invited=%s from %s", user_id, username, role, invited, ip)
     if invited:
         logger.info("Invitation code %r consumed by user %s", invite_code, user_id)
 
@@ -318,9 +322,11 @@ def register(request):
 #
 # POST /api/auth/login — body {"username" | "email",
 # "password"}: whichever key is sent becomes one identifier
-# matched case-insensitively against BOTH columns, and with
-# legacy case-variant rows the password is tried against
-# every match — the row it verifies for wins. Answers
+# matched case-insensitively against BOTH columns; should
+# the table ever hold case-variant duplicates (the CI
+# unique indexes forbid new ones), the password is tried
+# against every match — the row it verifies for wins.
+# Answers
 # {"user", "token"} with a fresh 30-day session; the
 # newest SESSIONS_PER_USER rows survive.
 #
@@ -659,7 +665,7 @@ def update_me(request):
     # STEP 2: one UPDATE from the whitelist, the rename
     # propagated in the same transaction, then re-read
     # ================================================
-    updates["updated_at"] = utc_now_iso()
+    updates["updated_at"] = utc_now()
     User.objects.filter(id=request.user["id"]).update(**updates)
     if new_display_name:
         # Same transaction as the rename — posts never show a
@@ -748,7 +754,7 @@ def change_password(request):
         return json_error("Invalid credentials", 400, code="invalid_credentials")
 
     new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-    User.objects.filter(id=user_id).update(password_hash=new_hash, updated_at=utc_now_iso())
+    User.objects.filter(id=user_id).update(password_hash=new_hash, updated_at=utc_now())
 
     # Every OTHER session dies — the presented one (by hash) is
     # the survivor
@@ -778,8 +784,8 @@ def change_password(request):
 # success every session is gone, so the 200 is the
 # account's last authenticated response. Export answers the
 # caller's whole history as one JSON document (the chat
-# sections fill in the moment the chat tables migrate);
-# tightly rate limited — the body spans everything.
+# sections answer [] on a deployment stripped of the chat
+# tables); tightly rate limited — the body spans everything.
 #
 # Used by:
 #   - services/api/auth.ts — deleteAccountApi /
@@ -835,28 +841,26 @@ def delete_me(request):
 @require_auth
 @ratelimit.per_user("export", max_attempts=5)
 def export_me(request):
-    from django.db import connection
-
     user_id = request.user["id"]
 
     def orm_rows(queryset):
         return list(queryset)
 
-    def guarded_rows(sql, params):
+    def guarded_rows(queryset):
         # Resilience for the chat sections — a missing table
         # (a stripped-down deployment) answers an empty
         # section, never a 500
         try:
-            with connection.cursor() as cursor:
-                cursor.execute(sql, params)
-                columns = [col[0] for col in cursor.description]
-                return [dict(zip(columns, r)) for r in cursor.fetchall()]
+            return list(queryset)
         except Exception:
             return []
 
+    from knfapp.chat.models import ConversationParticipant, Message, MessageReaction
+    from knfapp.memes.models import Meme
     from knfapp.news.models import NewsComment, NewsLike, NewsPost, PollVote
+    from knfapp.notifications.core import token_digest
     from knfapp.notifications.models import NotificationChannel
-    from knfapp.social.models import FriendRequest, Friendship, Report, UserBlock
+    from knfapp.social.models import Activity, FriendRequest, Friendship, Report, UserBlock
     from knfapp.uploads.models import Upload
 
     profile = User.objects.filter(id=user_id).values(
@@ -874,14 +878,31 @@ def export_me(request):
             "published_at", "created_at", "updated_at")),
         "comments": orm_rows(NewsComment.objects.filter(user_id=user_id).order_by("created_at")
                              .values("id", "post_id", "text", "created_at")),
-        "messages": guarded_rows(
-            """SELECT id, conversation_id, text, image_url, reply_to_id, deleted_at, created_at
-               FROM messages WHERE sender_id = %s ORDER BY created_at""", (user_id,)),
-        "conversations": guarded_rows(
-            """SELECT c.id, c.type, c.title, c.created_at, cp.last_read_at
-               FROM conversation_participants cp
-               JOIN conversations c ON c.id = cp.conversation_id
-               WHERE cp.user_id = %s ORDER BY c.created_at""", (user_id,)),
+        # The chat sections are the export's ONE naive-wire
+        # island: the response mixes both stamp shapes, so the
+        # per-response encoder flag cannot serve it — these
+        # as_naive_utc wraps are the deliberate per-field
+        # exception to the aware-everywhere rule
+        "messages": [
+            {**row, "deleted_at": as_naive_utc(row["deleted_at"]) if row["deleted_at"] else None,
+             "created_at": as_naive_utc(row["created_at"])}
+            for row in guarded_rows(
+                Message.objects.filter(sender_id=user_id).order_by("created_at").values(
+                    "id", "conversation_id", "text", "image_url", "reply_to_id",
+                    "deleted_at", "created_at"))
+        ],
+        "conversations": [
+            {**row, "created_at": as_naive_utc(row["created_at"]),
+             "last_read_at": as_naive_utc(row["last_read_at"]) if row["last_read_at"] else None}
+            for row in guarded_rows(
+                ConversationParticipant.objects.filter(user_id=user_id)
+                .order_by("conversation__created_at")
+                .values("last_read_at",
+                        id=models.F("conversation__id"),
+                        type=models.F("conversation__type"),
+                        title=models.F("conversation__title"),
+                        created_at=models.F("conversation__created_at")))
+        ],
         "likes": orm_rows(NewsLike.objects.filter(user_id=user_id).order_by("created_at")
                           .values("post_id", "created_at")),
         "pollVotes": orm_rows(PollVote.objects.filter(user_id=user_id).order_by("created_at")
@@ -900,4 +921,27 @@ def export_me(request):
                                          .values("channel", "enabled", "updated_at")),
         "uploads": orm_rows(Upload.objects.filter(user_id=user_id).order_by("created_at")
                             .values("filename", "byte_size", "created_at")),
+        # The device registry — the raw token is a live push
+        # credential and an export file gets shared, so only
+        # its 8-hex digest (the same handle the logs use) rides
+        "pushTokens": [
+            {"tokenDigest": token_digest(row.pop("token")), **row}
+            for row in PushToken.objects.filter(user_id=user_id).order_by("created_at")
+            .values("token", "platform", "language", "active", "created_at")
+        ],
+        # The stored column is already only a hash — the stamps
+        # are the personal data here
+        "sessions": orm_rows(Session.objects.filter(user_id=user_id).order_by("created_at")
+                             .values("created_at", "expires_at")),
+        "activity": orm_rows(Activity.objects.filter(user_id=user_id).order_by("created_at")
+                             .values("kind", "actor_id", "subject_id", "subject_preview",
+                                     "created_at", "read")),
+        "reactions": [
+            {**row, "created_at": as_naive_utc(row["created_at"])}
+            for row in guarded_rows(
+                MessageReaction.objects.filter(user_id=user_id).order_by("created_at")
+                .values("message_id", "emoji", "created_at"))
+        ],
+        "memes": orm_rows(Meme.objects.filter(added_by_id=user_id).order_by("created_at")
+                          .values("id", "title", "tags", "created_at")),
     })

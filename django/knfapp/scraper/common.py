@@ -19,9 +19,10 @@
 #      tracking params, canonical scheme/host, no trailing
 #      slash
 #    - utc_now_naive / parse_source_datetime /
-#      sanitise_published_at — naive-UTC timestamps with the
-#      source's offset APPLIED instead of dropped, plus a
-#      [now - 5 years, now] clamp
+#      sanitise_published_at — source datetimes with the
+#      offset APPLIED instead of dropped, a [now - 5 years,
+#      now] clamp, and an AWARE (+00:00) stored shape so
+#      published_at carries one shape for every source
 #    - open_run / mark_run_failed / prune_scraper_runs /
 #      load_deleted_urls — the scraper_runs and tombstone
 #      bookkeeping all four scrapers repeat
@@ -42,20 +43,21 @@
 #  older than the scraper's own wall-clock budget is not a
 #  live run (every run self-limits to that budget), so a
 #  SIGKILLed run blocks its source for minutes, never until
-#  the daily reconcile. The in-process lock stays as the
-#  cheap fast path.
+#  the daily reconcile. The in-process lock is the cheap
+#  fast path.
 #
-#  Database access is django.db.connection with the
-#  scrapers running in AUTOCOMMIT (management commands, and
+#  The scrapers run in AUTOCOMMIT (management commands, and
 #  the trigger routes are @transaction.non_atomic_requests):
 #  the run row must be visible to /status while fetches take
 #  their minutes, and the write batches wrap themselves in
-#  transaction.atomic() at their own commit
-#  boundaries. mark_run_failed opens with
-#  close_old_connections() — it runs exactly when the
-#  connection in hand may be the thing that broke, and that
-#  call is Django's way of handing the next query a fresh
-#  one.
+#  transaction.atomic() at their own commit boundaries. The
+#  run bookkeeping is plain ORM except open_run, whose
+#  conditional INSERT must test and claim in ONE statement —
+#  that one rides django.db.connection. mark_run_failed
+#  opens with close_old_connections() — it runs exactly when
+#  the connection in hand may be the thing that broke, and
+#  that call is Django's way of handing the next query a
+#  fresh one.
 ############################################################
 
 
@@ -71,8 +73,9 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from django.db import Error as DatabaseError, close_old_connections, connection
+from django.db.models import OuterRef, Subquery
 
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -476,7 +479,7 @@ def parse_source_datetime(value: str):
     except (ValueError, TypeError):
         pass
 
-    # A date-only or space-form value from an older template
+    # Fallbacks for date-only and space-separated stamps
     for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(text, fmt)
@@ -496,7 +499,11 @@ def parse_source_datetime(value: str):
 # sanitise_published_at
 ############################################################
 #
-# The naive-UTC ISO string a news row stores: an AWARE
+# The AWARE UTC datetime a news row stores — the
+# same shape member and faculty posts write, so the whole
+# published_at column carries ONE stamp shape and its
+# string order IS its time order (the feed's keyset anchor
+# and ORDER BY tiebreak compare it raw). An aware source
 # datetime is converted to UTC (the offset applied, not
 # dropped — Vilnius news would land 2-3 h in the future
 # otherwise), a naive one is taken as UTC already, and
@@ -516,11 +523,13 @@ def parse_source_datetime(value: str):
 #   - vu_scraper.py — _fetch_vu_article
 ############################################################
 
-def sanitise_published_at(parsed) -> str:
+def sanitise_published_at(parsed) -> datetime:
+    # The comparisons run naive; only the RETURNS attach UTC,
+    # so every stored stamp goes out aware
     now = utc_now_naive()
 
     if parsed is None:
-        return now.isoformat()
+        return now.replace(tzinfo=timezone.utc)
 
     if parsed.tzinfo is not None:
         # Applying the offset to a year-9999 or year-1 stamp walks
@@ -532,13 +541,13 @@ def sanitise_published_at(parsed) -> str:
         except OverflowError:
             logger.warning("published_at %s is outside the datetime range — stamping now instead",
                            parsed.isoformat())
-            return now.isoformat()
+            return now.replace(tzinfo=timezone.utc)
 
     if parsed > now or parsed < now - timedelta(days=MAX_ARTICLE_AGE_DAYS):
         logger.warning("published_at %s out of range — stamping now instead", parsed.isoformat())
-        return now.isoformat()
+        return now.replace(tzinfo=timezone.utc)
 
-    return parsed.isoformat()
+    return parsed.replace(tzinfo=timezone.utc)
 
 
 
@@ -571,7 +580,7 @@ def sanitise_published_at(parsed) -> str:
 
 def open_run(source: str, budget_seconds: int):
     run_id = str(uuid.uuid4())
-    stale_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=budget_seconds)).isoformat()
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(seconds=budget_seconds)
 
     # The counts are named explicitly — the Django-built table
     # carries no DDL defaults for its NOT NULL columns
@@ -583,7 +592,7 @@ def open_run(source: str, budget_seconds: int):
                    SELECT 1 FROM scraper_runs
                    WHERE source = %s AND status = 'running' AND started_at > %s
                )""",
-            (run_id, source, utc_now_iso(), source, stale_cutoff),
+            (run_id, source, utc_now(), source, stale_cutoff),
         )
         if cursor.rowcount == 0:
             logger.info("%s scrape already running in another process — this trigger is skipped", source)
@@ -612,14 +621,12 @@ def open_run(source: str, budget_seconds: int):
 ############################################################
 
 def close_run(run_id: str, found: int, new: int, error_message=None):
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """UPDATE scraper_runs
-               SET status = 'completed', articles_found = %s, articles_new = %s,
-                   error_message = %s, finished_at = %s
-               WHERE id = %s""",
-            (found, new, error_message, utc_now_iso(), run_id),
-        )
+    from knfapp.scraper.models import ScraperRun
+
+    ScraperRun.objects.filter(id=run_id).update(
+        status="completed", articles_found=found, articles_new=new,
+        error_message=error_message, finished_at=utc_now(),
+    )
 
 
 
@@ -644,15 +651,13 @@ def close_run(run_id: str, found: int, new: int, error_message=None):
 ############################################################
 
 def mark_run_failed(run_id: str, message: str):
+    from knfapp.scraper.models import ScraperRun
+
     try:
         close_old_connections()
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """UPDATE scraper_runs
-                   SET status = 'failed', error_message = %s, finished_at = %s
-                   WHERE id = %s""",
-                (str(message)[:1000], utc_now_iso(), run_id),
-            )
+        ScraperRun.objects.filter(id=run_id).update(
+            status="failed", error_message=str(message)[:1000], finished_at=utc_now(),
+        )
     except Exception:
         logger.exception("Failed to close scraper run %s as failed", run_id)
 
@@ -686,16 +691,12 @@ STALE_RUN_SECONDS = 6 * 3600
 
 
 def reconcile_interrupted_runs(older_than_seconds: int = STALE_RUN_SECONDS) -> int:
-    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat()
+    from knfapp.scraper.models import ScraperRun
 
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """UPDATE scraper_runs
-               SET status = 'failed', error_message = 'interrupted', finished_at = %s
-               WHERE status = 'running' AND started_at < %s""",
-            (utc_now_iso(), cutoff),
-        )
-        closed = cursor.rowcount
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)
+    closed = ScraperRun.objects.filter(status="running", started_at__lt=cutoff).update(
+        status="failed", error_message="interrupted", finished_at=utc_now(),
+    )
 
     if closed:
         logger.warning("Closed %d scraper run(s) left 'running' by a killed process", closed)
@@ -714,36 +715,33 @@ def reconcile_interrupted_runs(older_than_seconds: int = STALE_RUN_SECONDS) -> i
 #
 # Deletes scraper_runs rows older than 30 days at the end of
 # a run — the table grows by a row per scheduled scrape
-# forever otherwise. The cutoff is built in Python so it
-# compares against the ISO-T text the rows carry.
+# forever otherwise.
 #
 # The newest run of each source is KEPT whatever its age —
 # retention must never be the reason a source that has not
 # succeeded in months disappears from /api/scraper/status.
-# SQLite's bare-column rule makes "id, MAX(started_at)"
-# return the id OF the newest row per group; that spelling
-# rewrites alongside the feed SQL when DATABASE_URL moves
-# to postgres.
+# The keep-set rides a correlated subquery (the newest row
+# id per source, id as the same-stamp tiebreak) — plain ORM,
+# same plan on either engine.
 #
 # Used by:
 #   - all four scrapers — after the run row is closed
 ############################################################
 
 def prune_scraper_runs():
+    from knfapp.scraper.models import ScraperRun
+
     try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=RUN_RETENTION_DAYS)).isoformat()
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """DELETE FROM scraper_runs
-                   WHERE started_at < %s
-                     AND id NOT IN (
-                         SELECT id FROM (
-                             SELECT id, MAX(started_at) FROM scraper_runs GROUP BY source
-                         )
-                     )""",
-                (cutoff,),
-            )
-            pruned = cursor.rowcount
+        cutoff = datetime.now(timezone.utc) - timedelta(days=RUN_RETENTION_DAYS)
+        newest_of_source = (
+            ScraperRun.objects.filter(source=OuterRef("source"))
+            .order_by("-started_at", "-id").values("id")[:1]
+        )
+        pruned, _ = (
+            ScraperRun.objects.filter(started_at__lt=cutoff)
+            .exclude(id=Subquery(newest_of_source))
+            .delete()
+        )
         if pruned:
             logger.info("Pruned %d scraper_runs row(s) older than %d days", pruned, RUN_RETENTION_DAYS)
     except DatabaseError:
@@ -891,12 +889,11 @@ def validate_image_url(page_url: str, src: str):
 #   - this source already pushed within the last hour
 #
 # The hourly cap is per process and monotonic (an NTP step
-# must not open the gate) — with cron a news tick IS a fresh
-# process, but the 20-minute cadence keeps pushes an hour
-# apart on its own; the cap's real work is against back-to-
-# back manual triggers in one worker, exactly as before.
+# must not open the gate) — under cron every tick is a
+# fresh process, so the cap's real work is against back-to-
+# back manual triggers in one worker.
 # Failing OPEN on a database error is deliberate — a broken
-# count must not silence the feature that works.
+# probe must not silence the feature that works.
 #
 # Used by:
 #   - knf_scraper.py, vu_scraper.py, schedule_scraper.py —
@@ -904,19 +901,20 @@ def validate_image_url(page_url: str, src: str):
 ############################################################
 
 def push_allowed(source: str, new_count: int, run_id: str) -> bool:
+    from knfapp.scraper.models import ScraperRun
+
+
     # STEP 1: first successful run for this source = backfill
     # =======================================================
     try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """SELECT COUNT(*) FROM scraper_runs
-                   WHERE source = %s AND status = 'completed' AND id != %s""",
-                (source, run_id),
-            )
-            earlier = cursor.fetchone()[0]
+        earlier = (
+            ScraperRun.objects.filter(source=source, status="completed")
+            .exclude(id=run_id)
+            .exists()
+        )
     except DatabaseError:
-        logger.warning("Could not count earlier %s runs — allowing the push", source, exc_info=True)
-        earlier = 1
+        logger.warning("Could not check for earlier %s runs — allowing the push", source, exc_info=True)
+        earlier = True
 
     if not earlier:
         logger.info("Suppressing the %s push: first completed run (%d row(s) is a backfill)",
@@ -969,20 +967,21 @@ def push_allowed(source: str, new_count: int, run_id: str) -> bool:
 ############################################################
 
 def check_yield_drop(source: str, found: int, run_id: str):
+    from knfapp.scraper.models import ScraperRun
+
     try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """SELECT articles_found FROM scraper_runs
-                   WHERE source = %s AND status = 'completed' AND id != %s
-                   ORDER BY started_at DESC LIMIT 1""",
-                (source, run_id),
-            )
-            row = cursor.fetchone()
+        previous = (
+            ScraperRun.objects.filter(source=source, status="completed")
+            .exclude(id=run_id)
+            .order_by("-started_at")
+            .values_list("articles_found", flat=True)
+            .first()
+        )
     except DatabaseError:
         logger.warning("Could not read the previous %s run", source, exc_info=True)
         return
 
-    previous = (row[0] or 0) if row else 0
+    previous = previous or 0
 
     # Under ten there is no order of magnitude to lose — a
     # source that always yields two items is not broken

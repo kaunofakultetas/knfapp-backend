@@ -1,7 +1,7 @@
 ############################################################
 #  [*] Regression tests — wayfind guided captures
 #
-#  The phase-2 capture contract, proved through the real
+#  The guided-capture contract, proved through the real
 #  routes: a capture id is scoped per building like op ids
 #  (the same client uuid opens a second building's session,
 #  the bare id resolves while unique, a genuinely ambiguous

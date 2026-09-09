@@ -47,8 +47,8 @@ class ScraperRun(models.Model):
     articles_found = models.IntegerField(default=0)
     articles_new = models.IntegerField(default=0)
     error_message = models.TextField(null=True, blank=True)
-    started_at = models.TextField()
-    finished_at = models.TextField(null=True, blank=True)
+    started_at = models.DateTimeField()
+    finished_at = models.DateTimeField(null=True, blank=True)
 
     # Table metadata
     class Meta:
@@ -59,8 +59,7 @@ class ScraperRun(models.Model):
         ]
         indexes = [
             models.Index(fields=["-started_at"], name="idx_scraper_runs_started"),
-            # The live index is idx_scraper_runs_source_started — 31
-            # chars, one over Django's name cap, so this one carries a
-            # shortened name. Index names play no part in the row copy
+            # "idx_scraper_runs_source_started" would be 31 chars —
+            # one over Django's index-name cap — hence the short name
             models.Index(fields=["source", "-started_at"], name="idx_scraper_runs_src_started"),
         ]

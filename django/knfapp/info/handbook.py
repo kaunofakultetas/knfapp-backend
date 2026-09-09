@@ -1,10 +1,10 @@
 ############################################################
 #  [*] info handbook — the curated fallback payload
 #
-#  The hardcoded bilingual handbook, {lang: {section: ...}},
-#  copied VERBATIM from the previous backend so the wire
-#  bytes cannot drift: contacts, links, hours, programs and
-#  FAQ, Lithuanian first. Diacritics are spelled as \u
+#  The hardcoded bilingual handbook, {lang: {section: ...}}:
+#  contacts, links, hours, programs and FAQ, Lithuanian
+#  first — the literals are frozen wire bytes, edited only
+#  deliberately. Diacritics are spelled as \u
 #  escapes — the literals decode to the real text, but a
 #  grep for "Studijų" will not find them. After a
 #  successful scrape only links/hours/faq (and every 'en'

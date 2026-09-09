@@ -8,8 +8,13 @@
 #  Lithuanian marker), authored posts tombstone, fed
 #  counters decrement while the rows still exist, uploads
 #  leave the disk, comments stay (they pick the marker up
-#  at read time). The export answers every stored section,
-#  an empty one as [] — never a 500.
+#  at read time). The chat side scrubs the richer media
+#  columns, renames the frozen system narrations, purges
+#  the activity feed both ways, and takes any room the
+#  departure emptied down whole. The export answers every
+#  stored section — devices with a digest instead of the
+#  live push credential, sessions as bare stamps — an empty
+#  one as [] — never a 500.
 ############################################################
 
 
@@ -23,15 +28,18 @@ import uuid
 from django.test import Client, TestCase
 
 
+from knfapp.chat.models import Conversation, Message
 from knfapp.common import ratelimit
 from knfapp.common.timestamps import utc_now_iso
 from knfapp.news.models import NewsComment, NewsLike, NewsPost
-from knfapp.social.models import Friendship
+from knfapp.notifications.models import PushToken
+from knfapp.social.activity import record_activity
+from knfapp.social.models import Activity, Friendship
 from knfapp.uploads import storage
 from knfapp.uploads.models import Upload
 from knfapp.users import auth
 from knfapp.users.models import Session, User
-from .utils import PASSWORD, bearer, befriend, create_post, create_user
+from .utils import PASSWORD, bearer, befriend, create_message, create_post, create_room, create_user
 
 
 class DeleteMeTests(TestCase):
@@ -99,6 +107,50 @@ class DeleteMeTests(TestCase):
         self.assertEqual(Session.objects.filter(user_id=self.user.id).count(), 0)
         self.assertEqual(bearer(self.client.get, "/api/auth/me", self.token).status_code, 401)
 
+    def test_the_chat_side_scrubs_media_names_activity_and_orphan_rooms(self):
+        other = create_user(username="kitas")
+
+        # A living room: a system narration opening with the
+        # actor's name, and a message carrying the richer media
+        # columns the unsend path clears
+        room = create_room([self.user, other], conv_type="group", title="Komanda")
+        narration = create_message(room, self.user, text="Tomas sukūrė grupę „Komanda“", kind="system")
+        media = create_message(room, self.user, text="štai failas",
+                               attachment_url="/api/uploads/x.pdf", attachment_name="CV Tomas.pdf",
+                               attachment_size=9, attachment_mime="application/pdf",
+                               attachment_meta={"thumbnailUrl": "/api/uploads/t.jpg"},
+                               gallery=[{"url": "/api/uploads/g.jpg"}],
+                               link_preview={"imageUrl": "/api/uploads/l.jpg"})
+
+        # A room the departure will EMPTY — its history must
+        # not survive a member nobody can ever be again
+        orphan = create_room([self.user])
+        create_message(orphan, self.user, text="vienas kambaryje")
+
+        # Their private feed and their gesture in another feed
+        record_activity(self.user.id, "like", other.id, subject_id="p1", subject_preview="x")
+        record_activity(other.id, "like", self.user.id, subject_id="p2", subject_preview="y")
+
+        self.assertEqual(self._delete().status_code, 200)
+
+        # The narration wears the tombstone name; the media
+        # columns are gone with the files they pointed at
+        narration.refresh_from_db()
+        self.assertEqual(narration.text, "Ištrintas naudotojas sukūrė grupę „Komanda“")
+        media.refresh_from_db()
+        for column in ("attachment_url", "attachment_name", "attachment_size",
+                       "attachment_mime", "attachment_meta", "gallery", "link_preview"):
+            self.assertIsNone(getattr(media, column), column)
+
+        # The emptied room is purged whole; the living room stays
+        self.assertFalse(Conversation.objects.filter(id=orphan.id).exists())
+        self.assertFalse(Message.objects.filter(conversation_id=orphan.id).exists())
+        self.assertTrue(Conversation.objects.filter(id=room.id).exists())
+
+        # Both activity directions are gone — the feed was
+        # theirs, the gesture rows advertised deleted gestures
+        self.assertEqual(Activity.objects.count(), 0)
+
     def test_the_last_active_admin_cannot_delete_themselves(self):
         admin = create_user(username="vadovas", role="admin")
         token = auth.mint_session(admin.id)
@@ -123,13 +175,17 @@ class ExportMeTests(TestCase):
 
     def test_the_export_carries_every_section_and_no_hash(self):
         create_post(author=self.user, source="user", post_type="social")
+        PushToken.objects.create(id=str(uuid.uuid4()), user_id=self.user.id,
+                                 token="ExponentPushToken[slaptas]", platform="ios",
+                                 created_at=utc_now_iso(), updated_at=utc_now_iso())
         response = self._export()
         self.assertEqual(response.status_code, 200)
         payload = json.loads(response.content)
 
         for section in ("profile", "posts", "comments", "messages", "conversations", "likes",
                         "pollVotes", "friends", "friendRequests", "blocks", "reports",
-                        "notificationChannels", "uploads"):
+                        "notificationChannels", "uploads", "pushTokens", "sessions",
+                        "activity", "reactions", "memes"):
             self.assertIn(section, payload)
 
         self.assertEqual(payload["profile"]["username"], "tomas")
@@ -138,6 +194,14 @@ class ExportMeTests(TestCase):
         # A user with no chat rows gets empty sections, not nulls
         self.assertEqual(payload["messages"], [])
         self.assertEqual(payload["conversations"], [])
+
+        # The device section masks the credential: an 8-hex
+        # digest rides, the raw token never does
+        device = payload["pushTokens"][0]
+        self.assertNotIn("token", device)
+        self.assertRegex(device["tokenDigest"], r"^[0-9a-f]{8}$")
+        # Session rows carry only their stamps — never the hash
+        self.assertEqual(set(payload["sessions"][0]), {"created_at", "expires_at"})
 
     def test_the_export_budget_is_five_per_window(self):
         for _ in range(5):

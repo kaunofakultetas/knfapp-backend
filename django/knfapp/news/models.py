@@ -8,7 +8,8 @@
 #  The engagement counters are denormalised on the row and
 #  RECOMPUTED from the child tables on every write — never
 #  nudged ±1 — so a drifted counter heals instead of
-#  compounding. Shape policy as in users/models.py.
+#  compounding. (Polls deliberately carry NO stored total —
+#  see the Poll banner.) Shape policy as in users/models.py.
 #
 #  Models:
 #    - NewsPost         — the unified post row, all sources
@@ -70,13 +71,13 @@ class NewsPost(models.Model):
     source = models.TextField(default="app")
     source_url = models.TextField(null=True, blank=True, unique=True)
     post_type = models.TextField(default="article")
-    is_public = models.IntegerField(default=1)
+    is_public = models.BooleanField(default=True)
     likes_count = models.IntegerField(default=0)
     comments_count = models.IntegerField(default=0)
     shares_count = models.IntegerField(default=0)
-    published_at = models.TextField()
-    created_at = models.TextField()
-    updated_at = models.TextField()
+    published_at = models.DateTimeField()
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -113,11 +114,14 @@ class NewsPost(models.Model):
 # -----------------------------------------------------------
 
 class NewsLike(models.Model):
-    # Columns
+    # Columns — user_id leads the composite PK, so its FK
+    # auto-index would be a duplicate; post_id keeps its own
+    # (the per-post like recount leads with it)
     pk = models.CompositePrimaryKey("user_id", "post_id")
-    user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id", related_name="news_likes")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id",
+                             db_index=False, related_name="news_likes")
     post = models.ForeignKey(NewsPost, on_delete=models.CASCADE, db_column="post_id", related_name="likes")
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -147,7 +151,7 @@ class NewsComment(models.Model):
     post = models.ForeignKey(NewsPost, on_delete=models.CASCADE, db_column="post_id", related_name="comments")
     user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id", related_name="news_comments")
     text = models.TextField()
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -164,9 +168,12 @@ class NewsComment(models.Model):
 # Poll
 # -----------------------------------------------------------
 #
-# At most one poll per post; `total_votes` is denormalised
-# and recomputed from poll_votes like every other counter.
-# Detaching the poll restores the post's original type.
+# At most one poll per post. The poll's vote total is NOT
+# stored — every reader already loads the options with
+# their per-option votes, so totalVotes is derived at shape
+# time as their sum and can never drift from what the
+# widget renders. Detaching the poll restores the post's
+# original type.
 #
 # Table: polls
 # -----------------------------------------------------------
@@ -178,9 +185,8 @@ class Poll(models.Model):
     # post, a racing twin's IntegrityError answering the same 409
     post = models.OneToOneField(NewsPost, on_delete=models.CASCADE, db_column="post_id", related_name="poll")
     title = models.TextField()
-    end_date = models.TextField(null=True, blank=True)
-    total_votes = models.IntegerField(default=0)
-    created_at = models.TextField()
+    end_date = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -209,9 +215,8 @@ class PollOption(models.Model):
     poll = models.ForeignKey(Poll, on_delete=models.CASCADE, db_column="poll_id", related_name="options")
     text = models.TextField()
     votes = models.IntegerField(default=0)
-    # The live table orders options by rowid — the order the
-    # creator sent them. An explicit column keeps that order
-    # portable off SQLite; the data migration backfills it
+    # The order the creator sent the options — an explicit
+    # column so the ordering is portable across engines
     position = models.IntegerField(default=0)
 
     # Table metadata
@@ -238,12 +243,15 @@ class PollOption(models.Model):
 # -----------------------------------------------------------
 
 class PollVote(models.Model):
-    # Columns
+    # Columns — user_id leads the composite PK, so its FK
+    # auto-index would be a duplicate; poll_id and option_id
+    # keep theirs (the vote recounts lead with them)
     pk = models.CompositePrimaryKey("user_id", "poll_id")
-    user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id", related_name="poll_votes")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, db_column="user_id",
+                             db_index=False, related_name="poll_votes")
     poll = models.ForeignKey(Poll, on_delete=models.CASCADE, db_column="poll_id", related_name="votes")
     option = models.ForeignKey(PollOption, on_delete=models.CASCADE, db_column="option_id", related_name="option_votes")
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -274,7 +282,7 @@ class DeletedSourceUrl(models.Model):
     source_url = models.TextField(primary_key=True)
     deleted_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL,
                                    db_column="deleted_by", related_name="deleted_source_urls")
-    deleted_at = models.TextField()
+    deleted_at = models.DateTimeField()
 
     # Table metadata
     class Meta:

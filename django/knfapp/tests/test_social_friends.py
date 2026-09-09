@@ -132,8 +132,8 @@ class UnfriendTests(TestCase):
         self.assertEqual(Friendship.objects.count(), 0)
 
     def test_a_half_present_friendship_clears_from_either_side(self):
-        # One direction lost to a crash or a hand-edit — the fix
-        # that made unfriend a both-directions DELETE
+        # One direction lost to a crash or a hand-edit — unfriend
+        # is a both-directions DELETE, so either side clears it
         Friendship.objects.create(user=self.b, friend=self.a, created_at=utc_now_iso())
         response = bearer(self.client.delete, f"/api/social/friends/{self.b.id}", self.token)
         self.assertEqual(response.status_code, 200)

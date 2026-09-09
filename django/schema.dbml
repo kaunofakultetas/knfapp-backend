@@ -1,12 +1,17 @@
 // ============================================================
-//  knfapp — Django / SQLite schema
+//  knfapp — Django schema (SQLite or Postgres)
 //
 //  Every primary key is a uuid4 TEXT string minted in Python
 //  (except the composite tables and the content-addressed /
-//  scoped ids called out below). Timestamps are ISO-8601 TEXT:
-//  most tables carry the aware "+00:00" form, the chat and
-//  push tables carry NAIVE UTC (no offset) — cursors and
-//  unread counts compare them as strings.
+//  scoped ids called out below). Timestamps are real datetime
+//  columns holding one aware UTC instant (timestamptz on
+//  Postgres; SQLite stores the engine's own text form and the
+//  ORM converts) — cursors and unread counts compare them as
+//  datetimes on both engines. The WIRE keeps its frozen ISO
+//  shapes: aware "+00:00" on most endpoints, naive UTC on the
+//  chat/push/scraper surfaces — the serializer decides, never
+//  the storage. The database starts EMPTY in production:
+//  first boot is migrate + grant_role.
 //
 //  Solid arrows = real foreign keys (enforced per connection).
 //  Delete behaviour lives in the APPLICATION, not in ON DELETE
@@ -14,10 +19,12 @@
 //  hard-deleted — erasure anonymises the row in place, so
 //  user references never dangle.
 //
-//  Denormalised counters (post likes/comments, poll totals)
-//  are recomputed from child rows on every write, never ±1.
-//  messages has an FTS5 shadow table (messages_fts, kept in
-//  sync by triggers) that is not drawn here.
+//  Denormalised counters (post likes/comments, per-option
+//  votes) are recomputed from child rows on every write,
+//  never ±1; a poll's TOTAL is derived from its options at
+//  shape time and not stored at all. In-room chat search is
+//  one case-insensitive substring match on messages.text —
+//  identical on both engines.
 // ============================================================
 
 
@@ -27,20 +34,20 @@
 
 Table users {
   id                 text  [pk, note: 'uuid4']
-  username           text  [unique]
-  email              text  [unique]
+  username           text  [unique, note: 'Plus UNIQUE(lower(username)) — case-variant twins are refused by the database']
+  email              text  [unique, note: 'Plus UNIQUE(lower(email))']
   display_name       text  [note: 'Snapshotted into news_posts.author_name on write; a rename rewrites the snapshots']
   password_hash      text  [note: 'bcrypt; erasure replaces it with an unreachable bcrypt-shaped hash']
   role               text  [note: 'CHECK: student / teacher / admin / curator']
-  invited            int   [default: 1]
+  invited            boolean  [default: false]
   avatar_url         text  [null, note: 'Own /api/uploads/ path or NULL']
   student_number     text  [null]
   study_group        text  [null]
   study_program      text  [null]
-  active             int   [default: 1, note: '0 locks the account out on live sessions too']
-  chat_push_preview  int   [default: 1, note: '0 = push shows "Nauja žinutė" instead of message text']
-  created_at         text
-  updated_at         text
+  active             boolean  [default: true, note: 'false locks the account out on live sessions too']
+  chat_push_preview  boolean  [default: true, note: 'false = push shows "Nauja žinutė" instead of message text']
+  created_at         timestamptz
+  updated_at         timestamptz
 }
 
 Table invitation_codes {
@@ -50,8 +57,8 @@ Table invitation_codes {
   created_by  text  [null, note: 'Curators may only list/revoke their OWN mintable-role codes']
   max_uses    int   [note: '1..1000 — out-of-range is rejected, never clamped']
   use_count   int   [default: 0, note: 'Burned atomically: UPDATE ... WHERE use_count < max_uses']
-  expires_at  text
-  created_at  text
+  expires_at  timestamptz
+  created_at  timestamptz
 }
 Ref: invitation_codes.created_by > users.id
 
@@ -59,8 +66,8 @@ Table sessions {
   id          text  [pk, note: 'uuid4']
   user_id     text  [note: 'App deletes on logout-all, deactivation, erasure; trimmed to newest 10 per user']
   token       text  [unique, note: 'sha256 HEX of the bearer — the raw token is never stored']
-  created_at  text
-  expires_at  text  [note: '30 days; expired rows are purged lazily, push tokens with them']
+  created_at  timestamptz
+  expires_at  timestamptz  [note: '30 days; expired rows are purged lazily, push tokens with them']
 }
 Ref: sessions.user_id > users.id
 
@@ -73,19 +80,19 @@ Table push_tokens {
   id          text  [pk, note: 'uuid4']
   user_id     text
   token       text  [unique, note: 'ExponentPushToken[...] — a bearer credential for that phone; logs only ever carry its sha256[:8]']
-  platform    text  [default: 'unknown']
-  active      int   [default: 1, note: '0 = Expo said DeviceNotRegistered; the next register flips it back']
+  platform    text  [default: 'unknown', note: 'CHECK: ios / android / web / unknown']
+  active      boolean  [default: true, note: 'false = Expo said DeviceNotRegistered; the next register flips it back']
   language    text  [default: 'lt', note: 'Routes the lt/en push copy per device']
-  created_at  text  [note: 'NAIVE UTC — the historical shape of this table']
-  updated_at  text
+  created_at  timestamptz  [note: 'Push surfaces keep their naive-UTC wire shape; the column stores the instant']
+  updated_at  timestamptz
 }
 Ref: push_tokens.user_id > users.id
 
 Table notification_channels {
   user_id     text  [pk, note: 'Composite PK (user_id, channel)']
   channel     text  [pk, note: 'CHECK: news / chat / schedule / admin']
-  enabled     int   [note: 'OPT-OUT model: a missing row means enabled; only an explicit 0 suppresses']
-  updated_at  text
+  enabled     boolean  [note: 'OPT-OUT model: a missing row means enabled; only an explicit false suppresses']
+  updated_at  timestamptz
 }
 Ref: notification_channels.user_id > users.id
 
@@ -99,7 +106,7 @@ Table uploads {
   filename    text  [unique, note: '<32 hex>.<ext> — the only shape serve/delete accept']
   user_id     text  [null, note: 'Ownership for the delete gate and the quota; erasure removes the files from disk']
   byte_size   int
-  created_at  text
+  created_at  timestamptz
 }
 Ref: uploads.user_id > users.id
 
@@ -119,20 +126,20 @@ Table news_posts {
   source          text  [note: 'CHECK: knf.vu.lt / vu.lt / faculty / user / app — the feed score gives sources +15/+10']
   source_url      text  [unique, null, note: 'Scraper dedup key, canonical normalise_url shape']
   post_type       text  [note: 'CHECK: article / event / social']
-  is_public       int   [default: 1, note: '0 = members-only; hidden and missing answer the same 404']
+  is_public       boolean  [default: true, note: 'false = members-only; hidden and missing answer the same 404']
   likes_count     int   [default: 0, note: 'Recomputed from news_likes on every toggle']
   comments_count  int   [default: 0, note: 'Recomputed from news_comments']
   shares_count    int   [default: 0, note: 'Plain counter — shares have no child table']
-  published_at    text  [note: 'NAIVE UTC for scraped rows; feed recency divides by its age']
-  created_at      text
-  updated_at      text
+  published_at    timestamptz  [note: 'Scraped rows keep their naive-UTC wire shape; feed recency divides by its age']
+  created_at      timestamptz
+  updated_at      timestamptz
 }
 Ref: news_posts.author_id > users.id
 
 Table news_likes {
   user_id     text  [pk, note: 'Composite PK (user_id, post_id) — one like per person']
   post_id     text  [pk]
-  created_at  text
+  created_at  timestamptz
 }
 Ref: news_likes.user_id > users.id
 Ref: news_likes.post_id > news_posts.id
@@ -142,7 +149,7 @@ Table news_comments {
   post_id     text
   user_id     text  [note: 'Comments SURVIVE erasure — they join users at read time and pick the tombstone name up']
   text        text
-  created_at  text
+  created_at  timestamptz
 }
 Ref: news_comments.post_id > news_posts.id
 Ref: news_comments.user_id > users.id
@@ -151,9 +158,8 @@ Table polls {
   id           text  [pk, note: 'uuid4']
   post_id      text  [unique, note: 'One poll per post — a racing duplicate hits IntegrityError and answers 409']
   title        text
-  end_date     text  [null, note: 'Unparseable = poll stays open (never a 500)']
-  total_votes  int   [default: 0, note: 'Recomputed from poll_votes']
-  created_at   text
+  end_date     timestamptz  [null, note: 'NULL = never closes; an unparseable date is refused with a 400, the column type refuses it outright']
+  created_at   timestamptz
 }
 Ref: polls.post_id - news_posts.id
 
@@ -162,7 +168,7 @@ Table poll_options {
   poll_id   text
   text      text
   votes     int   [default: 0, note: 'Recomputed from poll_votes']
-  position  int   [note: 'Display order; the cutover numbered it from the stored order']
+  position  int   [note: 'Display order, numbered at creation']
 }
 Ref: poll_options.poll_id > polls.id
 
@@ -170,7 +176,7 @@ Table poll_votes {
   user_id     text  [pk, note: 'Composite PK (user_id, poll_id) — one vote per person, moved by ON CONFLICT upsert']
   poll_id     text  [pk]
   option_id   text
-  created_at  text
+  created_at  timestamptz
 }
 Ref: poll_votes.user_id > users.id
 Ref: poll_votes.poll_id > polls.id
@@ -178,7 +184,7 @@ Ref: poll_votes.option_id > poll_options.id
 
 Table deleted_source_urls {
   source_url  text  [pk, note: 'Tombstone: an admin-deleted scraped article the scrapers must never re-insert']
-  deleted_at  text
+  deleted_at  timestamptz
   deleted_by  text  [null]
 }
 Ref: deleted_source_urls.deleted_by > users.id
@@ -192,7 +198,9 @@ Ref: deleted_source_urls.deleted_by > users.id
 Table friendships {
   user_id     text  [pk, note: 'Composite PK (user_id, friend_id) — a friendship is TWO rows, one per direction']
   friend_id   text  [pk]
-  created_at  text
+  created_at  timestamptz
+
+  Note: 'CHECK user_id <> friend_id — self-friendship is impossible for any writer'
 }
 Ref: friendships.user_id > users.id
 Ref: friendships.friend_id > users.id
@@ -202,10 +210,10 @@ Table friend_requests {
   from_user_id  text
   to_user_id    text
   status        text  [note: 'CHECK: pending / accepted / rejected; accept DELETES the row and writes both friendship rows']
-  created_at    text
-  updated_at    text  [note: 'A rejection stamp here starts the 7-day re-request cooldown']
+  created_at    timestamptz
+  updated_at    timestamptz  [note: 'A rejection stamp here starts the 7-day re-request cooldown']
 
-  Note: 'PARTIAL UNIQUE (from_user_id, to_user_id) WHERE status = pending — one open request per directed pair; the loser of a race gets 409'
+  Note: 'PARTIAL UNIQUE (from_user_id, to_user_id) WHERE status = pending — one open request per directed pair; the loser of a race gets 409. CHECK from_user_id <> to_user_id'
 }
 Ref: friend_requests.from_user_id > users.id
 Ref: friend_requests.to_user_id > users.id
@@ -213,7 +221,9 @@ Ref: friend_requests.to_user_id > users.id
 Table user_blocks {
   blocker_id  text  [pk, note: 'Composite PK (blocker_id, blocked_id) — one-directional row, bidirectional effect']
   blocked_id  text  [pk]
-  created_at  text  [note: 'Placing a block severs the friendship and any pending requests in the same transaction']
+  created_at  timestamptz  [note: 'Placing a block severs the friendship and any pending requests in the same transaction']
+
+  Note: 'CHECK blocker_id <> blocked_id'
 }
 Ref: user_blocks.blocker_id > users.id
 Ref: user_blocks.blocked_id > users.id
@@ -225,7 +235,7 @@ Table reports {
   target_id    text  [note: 'POLYMORPHIC — validated against the matching table at write time, NOT an FK']
   reason       text
   status       text  [default: 'open', note: 'CHECK: open / resolved — reopening is allowed']
-  created_at   text
+  created_at   timestamptz
 }
 Ref: reports.reporter_id > users.id
 
@@ -236,17 +246,17 @@ Table activity {
   actor_id         text  [note: 'Who did it']
   subject_id       text  [null, note: 'The post/comment concerned — loose ref, NOT an FK']
   subject_preview  text  [null, note: 'Frozen excerpt for the list row']
-  read             int   [default: 0]
-  created_at       text  [note: 'Keyset cursor: (created_at, id) descending']
+  read             boolean  [default: false]
+  created_at       timestamptz  [note: 'Keyset cursor: (created_at, id) descending']
 
-  Note: 'UNIQUE (user_id, kind, actor_id, subject_id) — an unlike/redo cannot double a row; drop_activity is the undo'
+  Note: 'UNIQUE (user_id, kind, actor_id, subject_id) — an unlike/redo cannot double a row; drop_activity is the undo. PARTIAL UNIQUE (user_id, kind, actor_id) WHERE subject_id IS NULL binds the subject-less rows (NULLs are distinct to SQLite)'
 }
 Ref: activity.user_id > users.id
 Ref: activity.actor_id > users.id
 
 
 // ------------------------------------------------------------
-// Chat (chat app) — NAIVE-UTC stamps throughout; two
+// Chat (chat app) — naive-UTC wire shapes throughout; two
 // independent read stores (participants watermark + receipts)
 // ------------------------------------------------------------
 
@@ -256,9 +266,10 @@ Table conversations {
   title                text  [null, note: 'Groups only — a direct chat is always NAMED AFTER the counterpart, never stored']
   avatar_emoji         text  [null]
   message_ttl_seconds  int   [null, note: 'Disappearing messages: stamps expires_at on rows sent AFTER the change']
+  direct_key           text  [null, unique, note: 'Sorted "id|id" of a DM pair — the UNIQUE that settles a racing double-create; nulled when a member leaves, so a recreate inserts fresh']
   created_by           text  [null]
-  created_at           text
-  updated_at           text  [note: 'Bumped on every message — the list orders by it']
+  created_at           timestamptz
+  updated_at           timestamptz  [note: 'Bumped on every message — the list orders by it']
 }
 Ref: conversations.created_by > users.id
 
@@ -266,8 +277,8 @@ Table conversation_participants {
   conversation_id  text  [pk, note: 'Composite PK (conversation_id, user_id)']
   user_id          text  [pk]
   pinned           int   [default: 0, note: 'The list pin of the CALLER alone, per membership row']
-  last_read_at     text  [null, note: 'Read store #1: drives unreadCount and the tab badge; only ever ADVANCES']
-  joined_at        text  [note: 'App deletes the row on leave; last leaver purges the whole room']
+  last_read_at     timestamptz  [null, note: 'Read store #1: drives unreadCount and the tab badge; only ever ADVANCES']
+  joined_at        timestamptz  [note: 'App deletes the row on leave; last leaver purges the whole room']
 }
 Ref: conversation_participants.conversation_id > conversations.id
 Ref: conversation_participants.user_id > users.id
@@ -278,23 +289,23 @@ Table messages {
   sender_id        text
   text             text  [note: 'Blanked on unsend']
   image_url        text  [null, note: 'Own /api/uploads/ or /api/memes/file/ path ONLY — the beacon guard']
-  reply_to_id      text  [null, note: 'Self-reference; the quote follows edits and blanks on unsend']
-  deleted_at       text  [null, note: 'SOFT delete ("unsend") — the row keeps its slot, content is cleared']
+  reply_to_id      text  [null, note: 'LOOSE self-reference (no FK) — the TTL sweep deletes quoted rows under live replies; a dangling ref renders as the ghost quote']
+  deleted_at       timestamptz  [null, note: 'SOFT delete ("unsend") — the row keeps its slot, content is cleared']
   client_msg_id    text  [null, note: 'The idempotency nonce of the sender — a retry answers the committed row']
-  kind             text  [default: 'text', note: 'text / image / file / video / audio / system']
-  edited_at        text  [null]
+  kind             text  [default: 'text', note: 'CHECK: text / image / file / video / audio / system']
+  edited_at        timestamptz  [null]
   attachment_url   text  [null]
   attachment_name  text  [null]
   attachment_size  int   [null]
   attachment_mime  text  [null]
-  attachment_meta  text  [null, note: 'JSON: width/height/duration/thumbnailUrl/preview/waveform']
-  link_preview     text  [null, note: 'JSON card the server unfurled — the picture is re-hosted as an own upload']
-  gallery          text  [null, note: 'JSON list of 2-8 photos; rides alone, no single image/file beside it']
-  pinned_at        text  [null]
+  attachment_meta  json  [null, note: 'width/height/duration/thumbnailUrl/preview/waveform (jsonb on postgres)']
+  link_preview     json  [null, note: 'The card the server unfurled — the picture is re-hosted as an own upload']
+  gallery          json  [null, note: '2-8 photos; rides alone, no single image/file beside it']
+  pinned_at        timestamptz  [null]
   pinned_by        text  [null, note: 'Loose ref — the pinner is remembered even after they leave']
-  forwarded        int   [default: 0]
-  expires_at       text  [null, note: 'Partial index — the sweeps hard-delete overdue rows and their files']
-  created_at       text  [note: 'NAIVE UTC — the paging cursor compares (created_at, id) as strings']
+  forwarded        boolean  [default: false]
+  expires_at       timestamptz  [null, note: 'Partial index — the sweeps hard-delete overdue rows and their files']
+  created_at       timestamptz  [note: 'The paging cursor compares (created_at, id) as typed datetimes on both engines']
 
   indexes {
     (conversation_id, sender_id, client_msg_id) [unique, note: 'The idempotent-send index']
@@ -302,12 +313,11 @@ Table messages {
 }
 Ref: messages.conversation_id > conversations.id
 Ref: messages.sender_id > users.id
-Ref: messages.reply_to_id > messages.id
 
 Table message_reads {
   message_id  text  [pk, note: 'Composite PK (message_id, user_id) — read store #2: drives status and readBy']
   user_id     text  [pk]
-  read_at     text
+  read_at     timestamptz
 }
 Ref: message_reads.message_id > messages.id
 Ref: message_reads.user_id > users.id
@@ -316,7 +326,7 @@ Table message_reactions {
   message_id  text  [pk, note: 'Composite PK (message_id, user_id) — ONE emoji per person, replaced never accumulated']
   user_id     text  [pk]
   emoji       text  [note: 'One of the six picker emoji — server-side allowlist']
-  created_at  text
+  created_at  timestamptz
 }
 Ref: message_reactions.message_id > messages.id
 Ref: message_reactions.user_id > users.id
@@ -329,14 +339,14 @@ Ref: message_reactions.user_id > users.id
 Table schedule_lessons {
   id           text  [pk, note: 'uuid4 — but the IDENTITY is the natural key below']
   title        text
-  teacher      text  [null, note: 'Scraper stores "" never NULL — NULLs count as distinct in the unique key']
-  room         text  [null]
+  teacher      text  [not null, default: '', note: '"" never NULL — a NULL would be distinct in the unique key, so the schema forbids it']
+  room         text  [not null, default: '']
   time_start   text  [note: '"HH:MM" wall clock']
   time_end     text
   day_of_week  int   [note: 'CHECK 0..6, 0 = Monday']
-  group_name   text  [null, note: 'Programme abbreviation + course, e.g. "ISKS-1"; parallel groups share it']
-  semester     text  [null, note: '"YYYY-R" autumn / "YYYY-P" spring, keyed on the first calendar year of the academic year']
-  created_at   text
+  group_name   text  [not null, default: '', note: 'Programme abbreviation + course, e.g. "ISKS-1"; parallel groups share it']
+  semester     text  [not null, default: '', note: '"YYYY-R" autumn / "YYYY-P" spring, keyed on the first calendar year of the academic year']
+  created_at   timestamptz
 
   Note: 'UNIQUE over (semester, group_name, day_of_week, time_start, time_end, title, teacher, room) — the whole row IS the identity; the scraper rewrites the current semester partitions against it'
 }
@@ -345,8 +355,8 @@ Table faculty_info {
   id          text  [pk, note: 'uuid4 — survives re-scrapes (the row is updated in place)']
   lang        text  [note: 'Only "lt" is ever scraped; "en" serves the curated handbook']
   section     text  [note: 'contacts / programs / general_contact']
-  data_json   text  [note: 'The scraped JSON blob the API overlays on the curated handbook']
-  scraped_at  text  [note: 'NAIVE UTC; the API drops sections older than 30 days']
+  data_json   json  [note: 'The scraped structure the API overlays on the curated handbook']
+  scraped_at  timestamptz  [note: 'Naive-UTC on the wire; the API drops sections older than 30 days']
 
   indexes {
     (lang, section) [unique]
@@ -364,7 +374,7 @@ Table memes {
   height      int   [null]
   preview     text  [null, note: 'Tiny data: URI blur-up']
   search      text  [null, note: 'Title+tags with Lithuanian diacritics folded to ASCII']
-  created_at  text
+  created_at  timestamptz
 }
 Ref: memes.added_by > users.id
 
@@ -378,8 +388,8 @@ Table admin_audit {
   actor_id    text  [null, note: 'The trail outlives an erased admin account']
   action      text  [note: 'e.g. invitation.create, user.role, user.delete, notification.broadcast, report.status']
   target      text  [null, note: 'The acted-on id — loose ref across many tables']
-  payload     text  [null, note: 'JSON context; written INSIDE the mutating transaction, on its own savepoint']
-  created_at  text
+  payload     json  [null, note: 'Structured context; written INSIDE the mutating transaction, on its own savepoint']
+  created_at  timestamptz
 }
 Ref: admin_audit.actor_id > users.id
 
@@ -395,8 +405,8 @@ Table scraper_runs {
   articles_found  int   [default: 0, note: 'The column names come from the news scraper; every source reports through them']
   articles_new    int   [default: 0]
   error_message   text  [null, note: 'Truncated exception text — HTTP answers only the stable slug']
-  started_at      text
-  finished_at     text  [null]
+  started_at      timestamptz
+  finished_at     timestamptz  [null]
 }
 
 
@@ -413,19 +423,19 @@ Table wf_buildings {
   entrance_node_id    text  [null, note: 'Loose ref into the draft — may name a node not yet created']
   draft_revision      int   [default: 0, note: 'Bumped once per accepted op batch']
   published_revision  int   [null, note: 'Points at the wf_versions snapshot students fetch']
-  created_at          text
-  updated_at          text
+  created_at          timestamptz
+  updated_at          timestamptz
 }
 
 Table wf_entities {
   building_id  text  [pk, note: 'Composite PK (building_id, kind, id)']
   kind         text  [pk, note: 'CHECK: level / node / edge / room']
   id           text  [pk, note: 'The editor-facing entity id']
-  data         text  [note: 'The entity JSON — shape-checked on write, fully validated at publish']
+  data         json  [note: 'The entity body — shape-checked on write, fully validated at publish']
   revision     int   [note: 'The draft revision this entity last changed in — what baseRevision conflicts and ?since deltas read']
-  updated_at   text
+  updated_at   timestamptz
   updated_by   text  [null]
-  deleted      int   [default: 0, note: 'TOMBSTONE — the row stays so a ?since delta can carry the deletion']
+  deleted      boolean  [default: false, note: 'TOMBSTONE — the row stays so a ?since delta can carry the deletion']
 }
 Ref: wf_entities.building_id > wf_buildings.id
 
@@ -437,7 +447,7 @@ Table wf_ops {
   author_id    text  [null]
   status       text  [note: 'CHECK: applied / rejected']
   reason       text  [null, note: 'The rejection ("conflict", a shape error, ...)']
-  created_at   text
+  created_at   timestamptz
 }
 Ref: wf_ops.building_id > wf_buildings.id
 
@@ -448,7 +458,7 @@ Table wf_versions {
   etag          text  [note: 'sha256 of document — If-None-Match answers 304']
   note          text  [null]
   published_by  text  [null]
-  published_at  text
+  published_at  timestamptz
 }
 Ref: wf_versions.building_id > wf_buildings.id
 
@@ -464,7 +474,7 @@ Table wf_panoramas {
   heading_raw_deg  real  [null]
   heading_source   text  [null, note: '"auto" for stitched panoramas']
   uploaded_by      text  [null]
-  created_at       text
+  created_at       timestamptz
 }
 Ref: wf_panoramas.building_id > wf_buildings.id
 
@@ -474,7 +484,7 @@ Table wf_plans {
   level_id     text  [null, note: 'Loose ref into the draft']
   bytes        int
   uploaded_by  text  [null]
-  created_at   text
+  created_at   timestamptz
 }
 Ref: wf_plans.building_id > wf_buildings.id
 
@@ -484,15 +494,15 @@ Table wf_captures {
   node_id         text  [null]
   mode            text  [note: 'CHECK: full / walls']
   frame_hfov_deg  real
-  targets         text  [note: 'The aiming plan of the client, stored verbatim as JSON']
+  targets         json  [note: 'The aiming plan of the client']
   expected        int   [note: 'len(targets)']
   status          text  [note: 'CHECK: uploading / queued / stitching / done / failed — the conditional queued→stitching UPDATE is the claim of the worker']
   progress_pct    int   [default: 0]
-  report          text  [null, note: 'JSON: coverage + timing on done, the reason on failed, the parked centreYawDeg between finish and stitch']
+  report          json  [null, note: 'Coverage + timing on done, the reason on failed, the parked centreYawDeg between finish and stitch']
   pano_id         text  [null, note: 'The stitched wf_panoramas id — loose ref']
   created_by      text  [null]
-  created_at      text
-  updated_at      text
+  created_at      timestamptz
+  updated_at      timestamptz
 }
 Ref: wf_captures.building_id > wf_buildings.id
 
@@ -505,7 +515,7 @@ Table wf_capture_frames {
   bytes       int
   width       int
   height      int
-  updated_at  text  [note: 'Earliest updated_at gives the stitcher its fallback centre column']
+  updated_at  timestamptz  [note: 'Earliest updated_at gives the stitcher its fallback centre column']
 }
 Ref: wf_capture_frames.capture_id > wf_captures.id
 

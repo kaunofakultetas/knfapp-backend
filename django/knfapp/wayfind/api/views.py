@@ -53,13 +53,15 @@ import os
 import re
 
 from django.db import transaction
+from django.db.models import F
+from django.db.models.functions import Length
 from django.http import FileResponse, HttpResponse
 from PIL import Image, ImageOps
 
 from knfapp.common import ratelimit
-from knfapp.common.db import execute as db_execute, q, q1
+from knfapp.common.db import q
 from knfapp.common.http import get_json_object, json_error, json_response
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import as_aware, utc_now
 from knfapp.uploads.gates import MAX_IMAGE_PIXELS as BOMB_GUARD_PIXELS
 from knfapp.users.auth import require_role
 from knfapp.wayfind.graph import (
@@ -70,6 +72,7 @@ from knfapp.wayfind.graph import (
     entity_shape_error,
     validate_document,
 )
+from knfapp.wayfind.models import WfBuilding, WfEntity, WfOp, WfPanorama, WfPlan, WfVersion
 from knfapp.wayfind.store import store_dir as _store_dir, write_once as _write_once
 
 
@@ -97,8 +100,7 @@ PANO_MAX_EDGE = 8192
 # DecompressionBombError catch in upload_panorama is what
 # actually delivers the 413. Derived, not copied, so the
 # constant cannot drift from the guard; the explicit
-# width*height comparison stays as the belt for the day the
-# guard moves.
+# width*height comparison is the belt beside it.
 PANO_MAX_PIXELS = 2 * BOMB_GUARD_PIXELS
 PLAN_MAX_BYTES = 2 * 1024 * 1024
 
@@ -119,9 +121,9 @@ SVG_JS_HREF_RE = re.compile(r"(\s(?:xlink:)?href\s*=\s*)([\"'])\s*javascript:[^\
 # _load_building / _multipart
 ############################################################
 #
-# The wf_buildings row for a validated id, or None — the id
-# regex runs first so a stray path segment never reaches
-# SQL. _multipart parses a request's form + files whatever
+# The wf_buildings row as a dict, or None — the id regex
+# runs first so a stray path segment never reaches a query.
+# _multipart parses a request's form + files whatever
 # the verb: Django only populates request.POST/FILES for
 # POST, and the capture frame upload is a multipart PUT.
 ############################################################
@@ -129,7 +131,7 @@ SVG_JS_HREF_RE = re.compile(r"(\s(?:xlink:)?href\s*=\s*)([\"'])\s*javascript:[^\
 def _load_building(building_id):
     if not BUILDING_ID_RE.match(building_id or ""):
         return None
-    return q1("SELECT * FROM wf_buildings WHERE id = %s", (building_id,))
+    return WfBuilding.objects.filter(id=building_id).values().first()
 
 
 def _multipart(request):
@@ -186,7 +188,7 @@ def list_buildings(request):
                 "publishedRevision": row["published_revision"],
                 "draftRevision": row["draft_revision"],
                 "etag": row["etag"],
-                "publishedAt": row["published_at"],
+                "publishedAt": as_aware(row["published_at"]),
             }
             for row in rows
         ]
@@ -206,14 +208,13 @@ def create_building(request):
     if north is not None and not isinstance(north, (int, float)):
         return json_error("northDeg must be a number", 400, code="bad_north")
 
-    if q1("SELECT 1 AS x FROM wf_buildings WHERE id = %s", (building_id,)):
+    if WfBuilding.objects.filter(id=building_id).exists():
         return json_error("A building with that id exists", 409, code="exists")
 
-    now = utc_now_iso()
-    db_execute(
-        "INSERT INTO wf_buildings (id, name, north_deg, entrance_node_id, draft_revision, published_revision, created_at, updated_at)"
-        " VALUES (%s, %s, %s, %s, 0, NULL, %s, %s)",
-        (building_id, name.strip(), north, body.get("entranceNodeId"), now, now),
+    now = utc_now()
+    WfBuilding.objects.create(
+        id=building_id, name=name.strip(), north_deg=north, entrance_node_id=body.get("entranceNodeId"),
+        draft_revision=0, published_revision=None, created_at=now, updated_at=now,
     )
 
     return json_response({"id": building_id, "name": name.strip(), "draftRevision": 0, "publishedRevision": None}, status=201)
@@ -247,10 +248,8 @@ def get_graph(request, building_id):
     if building is None or building["published_revision"] is None:
         return json_error("No published map for this building", 404, code="not_published")
 
-    version = q1(
-        "SELECT document, etag FROM wf_versions WHERE building_id = %s AND revision = %s",
-        (building_id, building["published_revision"]),
-    )
+    version = (WfVersion.objects.filter(building_id=building_id, revision=building["published_revision"])
+               .values("document", "etag").first())
     if version is None:
         return json_error("No published map for this building", 404, code="not_published")
 
@@ -300,11 +299,9 @@ def get_draft(request, building_id):
             since_revision = int(since)
         except ValueError:
             return json_error("since must be an integer revision", 400, code="bad_since")
-        rows = q(
-            "SELECT kind, id, data, revision, deleted, updated_at, updated_by FROM wf_entities"
-            " WHERE building_id = %s AND revision > %s ORDER BY revision, kind, id",
-            (building_id, since_revision),
-        )
+        rows = (WfEntity.objects.filter(building_id=building_id, revision__gt=since_revision)
+                .order_by("revision", "kind", "id")
+                .values("kind", "id", "data", "revision", "deleted", "updated_at", "updated_by"))
         return json_response({
             "revision": building["draft_revision"],
             "since": since_revision,
@@ -313,17 +310,17 @@ def get_draft(request, building_id):
                 {
                     "kind": row["kind"],
                     "id": row["id"],
-                    "data": None if row["deleted"] else json.loads(row["data"]),
+                    "data": None if row["deleted"] else row["data"],
                     "revision": row["revision"],
                     "deleted": bool(row["deleted"]),
-                    "updatedAt": row["updated_at"],
+                    "updatedAt": as_aware(row["updated_at"]),
                     "updatedBy": row["updated_by"],
                 }
                 for row in rows
             ],
         })
 
-    rows = q("SELECT kind, id, data, revision, deleted FROM wf_entities WHERE building_id = %s", (building_id,))
+    rows = list(WfEntity.objects.filter(building_id=building_id).values("kind", "id", "data", "revision", "deleted"))
     document = compile_document(building, rows)
     # Per-entity revisions ride along so an editor can stamp its
     # ops' baseRevision without a second round trip
@@ -392,21 +389,22 @@ def post_ops(request, building_id):
 
 
     # STEP 1: take SQLite's write lock BEFORE reading any
-    # entity row — a no-op touch of the building row serialises
-    # overlapping batches, so the conflict check below only
-    # ever sees committed state. draft_revision is re-read
-    # under that lock: the _load_building read above may
-    # predate a batch that committed while this one queued
-    # ========================================================
+    # entity row — the F() self-assignment is a no-op touch
+    # of the building row that serialises overlapping
+    # batches, so the conflict check below only ever sees
+    # committed state. draft_revision is re-read under that
+    # lock: the _load_building read above may predate a
+    # batch that committed while this one queued
+    # =====================================================
     author = request.user["id"]
-    now = utc_now_iso()
+    now = utc_now()
     results = []
     applied_any = False
 
     try:
         with transaction.atomic():
-            db_execute("UPDATE wf_buildings SET updated_at = updated_at WHERE id = %s", (building_id,))
-            building = q1("SELECT draft_revision FROM wf_buildings WHERE id = %s", (building_id,))
+            WfBuilding.objects.filter(id=building_id).update(updated_at=F("updated_at"))
+            building = WfBuilding.objects.filter(id=building_id).values("draft_revision").first()
             revision = building["draft_revision"] + 1
 
 
@@ -424,8 +422,7 @@ def post_ops(request, building_id):
             # of duplicates or rejections leaves the revision alone
             # =====================================================
             if applied_any:
-                db_execute("UPDATE wf_buildings SET draft_revision = %s, updated_at = %s WHERE id = %s",
-                           (revision, now, building_id))
+                WfBuilding.objects.filter(id=building_id).update(draft_revision=revision, updated_at=now)
     except Exception:
         logger.error("Wayfind op batch failed for %s", building_id, exc_info=True)
         return json_error("The batch could not be applied", 500, code="batch_failed")
@@ -443,7 +440,7 @@ def _apply_op(building_id, op, revision, author, now):
         return {"id": None, "status": "rejected", "reason": "op needs a string id"}
     op_id = op["id"]
     log_id = f"{building_id}:{op_id}"
-    seen = q1("SELECT status, reason, revision FROM wf_ops WHERE id = %s", (log_id,))
+    seen = WfOp.objects.filter(id=log_id).values("status", "reason", "revision").first()
     if seen is not None:
         # A replay after a lost answer: say what the original
         # did — of/reason, and for an applied op the revision,
@@ -462,31 +459,26 @@ def _apply_op(building_id, op, revision, author, now):
         if not isinstance(data, dict):
             rejection = "data must be an object"
         else:
-            fields = []
-            values = []
+            changes = {}
             if "name" in data:
                 if not isinstance(data["name"], str) or not data["name"].strip():
                     rejection = "name must be a non-empty string"
                 else:
-                    fields.append("name = %s")
-                    values.append(data["name"].strip())
+                    changes["name"] = data["name"].strip()
             if "northDeg" in data and rejection is None:
                 if data["northDeg"] is not None and not isinstance(data["northDeg"], (int, float)):
                     rejection = "northDeg must be a number or null"
                 else:
-                    fields.append("north_deg = %s")
-                    values.append(data["northDeg"])
+                    changes["north_deg"] = data["northDeg"]
             if "entranceNodeId" in data and rejection is None:
                 if data["entranceNodeId"] is not None and not (isinstance(data["entranceNodeId"], str) and ENTITY_ID_RE.match(data["entranceNodeId"])):
                     rejection = "entranceNodeId must be an id or null"
                 else:
-                    fields.append("entrance_node_id = %s")
-                    values.append(data["entranceNodeId"])
-            if rejection is None and not fields:
+                    changes["entrance_node_id"] = data["entranceNodeId"]
+            if rejection is None and not changes:
                 rejection = "nothing to change"
             if rejection is None:
-                db_execute(f"UPDATE wf_buildings SET {', '.join(fields)}, updated_at = %s WHERE id = %s",
-                           (*values, now, building_id))
+                WfBuilding.objects.filter(id=building_id).update(**changes, updated_at=now)
 
 
     # STEP 2: an entity upsert or delete — shape, then the
@@ -500,23 +492,18 @@ def _apply_op(building_id, op, revision, author, now):
         elif not isinstance(entity_id, str) or not ENTITY_ID_RE.match(entity_id):
             rejection = "entityId must be a short id (letters, digits, . _ : -)"
         else:
-            row = q1(
-                "SELECT data, revision, deleted FROM wf_entities WHERE building_id = %s AND kind = %s AND id = %s",
-                (building_id, entity_kind, entity_id),
-            )
+            row = (WfEntity.objects.filter(building_id=building_id, kind=entity_kind, id=entity_id)
+                   .values("data", "revision", "deleted").first())
             base = op.get("baseRevision")
             if row is not None and isinstance(base, int) and row["revision"] > base:
                 rejection = "conflict"
-                current = {"data": None if row["deleted"] else json.loads(row["data"]), "revision": row["revision"], "deleted": bool(row["deleted"])}
+                current = {"data": None if row["deleted"] else row["data"], "revision": row["revision"], "deleted": bool(row["deleted"])}
             elif kind == "delete":
                 if row is None:
                     rejection = "no such entity"
                 else:
-                    db_execute(
-                        "UPDATE wf_entities SET deleted = 1, revision = %s, updated_at = %s, updated_by = %s"
-                        " WHERE building_id = %s AND kind = %s AND id = %s",
-                        (revision, now, author, building_id, entity_kind, entity_id),
-                    )
+                    WfEntity.objects.filter(building_id=building_id, kind=entity_kind, id=entity_id).update(
+                        deleted=1, revision=revision, updated_at=now, updated_by=author)
             else:
                 data = op.get("data")
                 shape = entity_shape_error(entity_kind, data)
@@ -525,15 +512,17 @@ def _apply_op(building_id, op, revision, author, now):
                 else:
                     stored = dict(data)
                     stored.pop("id", None)
-                    db_execute(
-                        """
-                        INSERT INTO wf_entities (building_id, kind, id, data, revision, updated_at, updated_by, deleted)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, 0)
-                        ON CONFLICT(building_id, kind, id) DO UPDATE SET
-                            data = excluded.data, revision = excluded.revision,
-                            updated_at = excluded.updated_at, updated_by = excluded.updated_by, deleted = 0
-                        """,
-                        (building_id, entity_kind, entity_id, json.dumps(stored, ensure_ascii=False), revision, now, author),
+                    # A one-row bulk_create for its update_conflicts:
+                    # insert or replace on the composite PK — and the
+                    # row always lands deleted False, so an upsert
+                    # revives a tombstoned entity
+                    WfEntity.objects.bulk_create(
+                        [WfEntity(building_id=building_id, kind=entity_kind, id=entity_id,
+                                  data=stored, revision=revision,
+                                  updated_at=now, updated_by=author, deleted=False)],
+                        update_conflicts=True,
+                        unique_fields=["building_id", "kind", "id"],
+                        update_fields=["data", "revision", "updated_at", "updated_by", "deleted"],
                     )
     else:
         rejection = "type must be upsert, delete or building"
@@ -543,10 +532,9 @@ def _apply_op(building_id, op, revision, author, now):
     # rejected alike
     # =====================================================
     status = "rejected" if rejection else "applied"
-    db_execute(
-        "INSERT INTO wf_ops (id, building_id, revision, op, author_id, created_at, status, reason)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-        (log_id, building_id, revision if status == "applied" else None, json.dumps(op, ensure_ascii=False), author, now, status, rejection),
+    WfOp.objects.create(
+        id=log_id, building_id=building_id, revision=revision if status == "applied" else None,
+        op=json.dumps(op, ensure_ascii=False), author_id=author, created_at=now, status=status, reason=rejection,
     )
     result = {"id": op_id, "status": status}
     if rejection:
@@ -593,7 +581,7 @@ def publish_building(request, building_id):
 
     # STEP 1: compile and validate — an error is a refusal
     # ====================================================
-    rows = q("SELECT kind, id, data, revision, deleted FROM wf_entities WHERE building_id = %s", (building_id,))
+    rows = list(WfEntity.objects.filter(building_id=building_id).values("kind", "id", "data", "revision", "deleted"))
     document = compile_document(building, rows)
     issues = validate_document(document)
     if issues:
@@ -603,18 +591,25 @@ def publish_building(request, building_id):
     # STEP 2: the snapshot, stamped, hashed and pointed at
     # ====================================================
     revision = building["draft_revision"]
-    now = utc_now_iso()
+    now = utc_now()
     document["revision"] = revision
-    document["publishedAt"] = now
+    # The document is a TEXT artifact — its publishedAt is the
+    # aware wire string, byte-for-byte what the ETag hashes
+    document["publishedAt"] = now.isoformat()
     text = document_text(document)
     etag = document_etag(text)
-    db_execute(
-        "INSERT OR REPLACE INTO wf_versions (building_id, revision, document, etag, note, published_by, published_at)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (building_id, revision, text, etag, note, request.user["id"], now),
+    # A one-row bulk_create for its update_conflicts: should
+    # this revision number ever be published again, the new
+    # snapshot replaces the old row on the composite PK
+    # instead of erroring
+    WfVersion.objects.bulk_create(
+        [WfVersion(building_id=building_id, revision=revision, document=text, etag=etag,
+                   note=note, published_by=request.user["id"], published_at=now)],
+        update_conflicts=True,
+        unique_fields=["building_id", "revision"],
+        update_fields=["document", "etag", "note", "published_by", "published_at"],
     )
-    db_execute("UPDATE wf_buildings SET published_revision = %s, updated_at = %s WHERE id = %s",
-               (revision, now, building_id))
+    WfBuilding.objects.filter(id=building_id).update(published_revision=revision, updated_at=now)
 
     return json_response({"revision": revision, "etag": etag, "publishedAt": now, "bytes": len(text.encode("utf-8"))})
 
@@ -625,16 +620,14 @@ def list_versions(request, building_id):
     if building is None:
         return json_error("Unknown building", 404, code="not_found")
 
-    rows = q(
-        "SELECT revision, etag, note, published_by, published_at, LENGTH(document) AS bytes"
-        " FROM wf_versions WHERE building_id = %s ORDER BY revision DESC",
-        (building_id,),
-    )
+    rows = (WfVersion.objects.filter(building_id=building_id).order_by("-revision")
+            .annotate(bytes=Length("document"))
+            .values("revision", "etag", "note", "published_by", "published_at", "bytes"))
     return json_response({
         "publishedRevision": building["published_revision"],
         "versions": [
             {"revision": row["revision"], "etag": row["etag"], "note": row["note"],
-             "publishedBy": row["published_by"], "publishedAt": row["published_at"], "bytes": row["bytes"]}
+             "publishedBy": row["published_by"], "publishedAt": as_aware(row["published_at"]), "bytes": row["bytes"]}
             for row in rows
         ],
     })
@@ -730,13 +723,14 @@ def upload_panorama(request, building_id):
     name = f"{digest}.jpg"
     if not _write_once(_store_dir("panoramas"), name, blob):
         return json_error("The panorama could not be stored", 500, code="write_failed")
-    db_execute(
-        """
-        INSERT OR IGNORE INTO wf_panoramas (id, building_id, node_id, width, height, bytes, hfov_deg, vfov_deg, heading_raw_deg, heading_source, uploaded_by, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (digest, building_id, node_id, width, height, len(blob), hfov, vfov, heading_raw, heading_source, request.user["id"], utc_now_iso()),
-    )
+    # A one-row bulk_create for its ignore_conflicts: the row
+    # is content-addressed, so a re-upload of the same picture
+    # must keep the first record untouched
+    WfPanorama.objects.bulk_create([WfPanorama(
+        id=digest, building_id=building_id, node_id=node_id, width=width, height=height, bytes=len(blob),
+        hfov_deg=hfov, vfov_deg=vfov, heading_raw_deg=heading_raw, heading_source=heading_source,
+        uploaded_by=request.user["id"], created_at=utc_now(),
+    )], ignore_conflicts=True)
 
     return json_response({
         "id": digest,
@@ -847,10 +841,13 @@ def upload_plan(request, building_id):
     name = f"{digest}.svg"
     if not _write_once(_store_dir("plans"), name, blob):
         return json_error("The plan could not be stored", 500, code="write_failed")
-    db_execute(
-        "INSERT OR IGNORE INTO wf_plans (id, building_id, level_id, bytes, uploaded_by, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
-        (digest, building_id, level_id, len(blob), request.user["id"], utc_now_iso()),
-    )
+    # A one-row bulk_create for its ignore_conflicts: the row
+    # is content-addressed, so a re-upload of the same drawing
+    # must keep the first record untouched
+    WfPlan.objects.bulk_create([WfPlan(
+        id=digest, building_id=building_id, level_id=level_id, bytes=len(blob),
+        uploaded_by=request.user["id"], created_at=utc_now(),
+    )], ignore_conflicts=True)
 
     return json_response({"id": digest, "url": f"/api/wayfind/plans/{name}", "bytes": len(blob)}, status=201)
 

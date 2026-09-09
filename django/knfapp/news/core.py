@@ -1,19 +1,19 @@
 ############################################################
-#  [*] news core — visibility, wire shapes, cache watermark
+#  [*] news core — visibility, wire shapes, feed fingerprint
 #
 #  The pure(ish) helpers every news route shares, kept in
 #  one module so the wire contract cannot drift between
-#  routes: the lenient ISO parse (query
-#  strings eat '+'), the overflow-safe UTC move, the ONE
-#  visibility predicate, the post/poll wire shapes and the
-#  feed's cheap change fingerprint.
+#  routes: the lenient ISO parse (query strings eat '+'),
+#  the overflow-safe UTC move, the ONE visibility
+#  predicate, the post/poll wire shapes and the feed's
+#  cheap change fingerprint.
 #
 #  Split into:
 #
 #    parse_iso / as_utc / to_utc_iso — timestamp repairs
 #    can_view_post                   — the visibility gate
 #    post_to_dict                    — the NewsPost wire shape
-#    feed_version                    — the ETag watermark
+#    feed_version                    — the ETag seed
 #    poll_shape / polls_for_posts / poll_to_dict
 ############################################################
 
@@ -54,10 +54,10 @@ FEED_CACHE_MAX_AGE = 60
 # aware stamp onto UTC, answering None when UTC cannot hold
 # it: "0001-01-01T00:00:00+14:00" parses happily and then
 # overflows astimezone(), which would be a 500 PAST every
-# validation gate. to_utc_iso normalises a STORED string to
-# explicit-UTC T-form for the wire, handing back an
-# unparseable one untouched — a null endDate would read as
-# "never closes".
+# validation gate. to_utc_iso normalises a stored stamp to
+# explicit-UTC ISO for the wire, handing back an
+# unparseable string untouched — a null endDate would read
+# as "never closes".
 #
 # Used by:
 #   - api/views.py — get_feed (?before), create_poll,
@@ -66,6 +66,8 @@ FEED_CACHE_MAX_AGE = 60
 ############################################################
 
 def parse_iso(value):
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     if not isinstance(value, str) or not value.strip():
         return None
     text = value.strip()
@@ -93,6 +95,12 @@ def to_utc_iso(value):
     if parsed is None:
         return value if isinstance(value, str) and value.strip() else None
     return parsed.isoformat()
+
+
+def feed_stamp(value):
+    # ETag seeds want a stable TEXT token for a stamp column's
+    # aggregate — datetime in, canonical ISO out
+    return value.isoformat() if isinstance(value, datetime) else (value or "-")
 
 
 
@@ -220,7 +228,7 @@ def feed_version():
         likes=Sum("likes_count"), comments=Sum("comments_count"), shares=Sum("shares_count"),
     )
     return (
-        f"{row['rows_total']}:{row['newest'] or '-'}:{row['touched'] or '-'}"
+        f"{row['rows_total']}:{feed_stamp(row['newest'])}:{feed_stamp(row['touched'])}"
         f":{row['likes'] or 0}:{row['comments'] or 0}:{row['shares'] or 0}"
     )
 
@@ -237,11 +245,10 @@ def feed_version():
 #
 # The ONE producer of the poll wire shape (the mobile
 # PollResponse); options ride in creation order (the
-# explicit position column — the live table's rowid order).
-# polls_for_posts serves a whole page in THREE queries —
-# the polls, all their options, the caller's votes —
-# instead of two per card; poll_to_dict is the single-poll
-# form the poll routes use.
+# position column). polls_for_posts serves a whole page in
+# THREE queries — the polls, all their options, the
+# caller's votes — instead of two per card; poll_to_dict
+# is the single-poll form the poll routes use.
 #
 # Used by:
 #   - api/views.py — get_feed, get_post, get_poll,
@@ -254,7 +261,9 @@ def poll_shape(poll_row, option_rows, user_vote):
         "postId": poll_row["post_id"],
         "title": poll_row["title"],
         "endDate": to_utc_iso(poll_row["end_date"]),
-        "totalVotes": poll_row["total_votes"],
+        # Derived, not stored — the options are always in hand,
+        # so the total can never drift from what the widget sums
+        "totalVotes": sum(o["votes"] for o in option_rows),
         "createdAt": poll_row["created_at"],
         "userVote": user_vote,
         "options": [{"id": o["id"], "text": o["text"], "votes": o["votes"]} for o in option_rows],
@@ -265,7 +274,7 @@ def polls_for_posts(post_ids, user_id=None):
     if not post_ids:
         return {}
     poll_rows = list(Poll.objects.filter(post_id__in=post_ids)
-                     .values("id", "post_id", "title", "end_date", "total_votes", "created_at"))
+                     .values("id", "post_id", "title", "end_date", "created_at"))
     if not poll_rows:
         return {}
 
@@ -308,7 +317,7 @@ def poll_to_dict(poll_row, user_id=None):
 ############################################################
 #
 # Re-exported from common/http.py — schedule and info share
-# the same pair; the names stay here for the feed's callers.
+# the same pair; the feed's callers import them from here.
 #
 # Used by:
 #   - api/views.py — get_feed

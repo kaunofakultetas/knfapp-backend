@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 
+from django.core.exceptions import ValidationError
 from django.test import RequestFactory, TestCase
 
 
@@ -99,15 +100,17 @@ class ResolveTests(TestCase):
 
     def test_naive_legacy_expiry_is_read_as_utc(self):
         user = create_user()
-        # Naive text a legacy row could carry — one hour in the future
+        # A naive stamp reads as UTC — one hour in the future here
         naive = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(tzinfo=None).isoformat()
         _session_for(user, "legacy-token", expires_at=naive)
         self.assertIsNotNone(auth.resolve_session_token("legacy-token"))
 
-    def test_malformed_expiry_counts_as_expired_never_a_500(self):
+    def test_malformed_expiry_cannot_be_stored(self):
         user = create_user()
-        _session_for(user, "broken-token", expires_at="pirmadienis")
-        self.assertIsNone(auth.resolve_session_token("broken-token"))
+        # The typed column refuses garbage at the write — the
+        # 500-proofing lives in the schema itself
+        with self.assertRaises(ValidationError):
+            _session_for(user, "broken-token", expires_at="pirmadienis")
 
     def test_deactivated_account_is_locked_out_on_a_live_session(self):
         user = create_user(active=0)

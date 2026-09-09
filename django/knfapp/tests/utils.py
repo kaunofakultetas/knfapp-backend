@@ -88,9 +88,9 @@ def befriend(a, b):
 
 
 def naive_now(minutes_ago=0):
-    # Chat stamps are NAIVE-UTC isoformat — cursors and unread
-    # counts compare them as strings
-    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).replace(tzinfo=None).isoformat()
+    # Chat stamps are naive-UTC datetimes — the exact kind the
+    # views bind and the encoder turns into the naive wire shape
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).replace(tzinfo=None)
 
 
 def create_room(members, conv_type="direct", title=None, message_ttl_seconds=None):

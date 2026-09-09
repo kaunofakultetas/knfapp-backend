@@ -6,8 +6,8 @@
 #  single-use credentials, a curator's view of the code list
 #  is scoped to their own mintable-role rows (404, never a
 #  403 oracle), the user editor's continuity guards and the
-#  deactivation purge, the stats cache with its GLOB'd
-#  date-sanity gate, and the complaint queue's role split.
+#  deactivation purge, the stats cache's stale-inside-TTL
+#  snapshot, and the complaint queue's role split.
 #  Every mutation leaves its admin_audit row.
 ############################################################
 
@@ -16,6 +16,8 @@ import json
 from datetime import datetime, timedelta, timezone
 
 
+from django.core.exceptions import ValidationError
+from django.db import transaction
 from django.test import Client, TestCase
 
 
@@ -72,7 +74,9 @@ class InvitationMintTests(TestCase):
         row = AdminAudit.objects.get(action="invitation.create")
         self.assertEqual(row.actor_id, self.admin.id)
         self.assertEqual(row.target, json.loads(response.content)["id"])
-        self.assertEqual(json.loads(row.payload)["maxUses"], 5)
+        # The JSON column stores the payload structurally — the
+        # trail row is read back as the dict the handler wrote
+        self.assertEqual(row.payload["maxUses"], 5)
 
 
 class InvitationScopeTests(TestCase):
@@ -219,12 +223,13 @@ class StatsTests(TestCase):
         views.reset_stats_cache()
         self.assertEqual(self._stats()["users"], first["users"] + 1)
 
-    def test_garbage_expiry_strings_are_not_active_invitations(self):
-        # 'netrukus' sorts above every timestamp and would be
-        # COUNTED — the GLOB gate throws out anything that does
-        # not open with a date; a lapsed same-day code stays out
+    def test_garbage_expiry_cannot_exist_and_a_lapsed_code_stays_out(self):
+        # The typed column is the gate: 'netrukus' is refused at
+        # the write, so the counter needs no string armour — and
+        # a code that lapsed an hour ago still stays out
         create_invite(code="GYVAS")
-        create_invite(code="SUGADINTAS", expires_at="netrukus")
+        with self.assertRaises(ValidationError), transaction.atomic():
+            create_invite(code="SUGADINTAS", expires_at="netrukus")
         create_invite(code="KA_TIK_BAIGESI",
                       expires_at=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat())
         self.assertEqual(self._stats()["activeInvitations"], 1)

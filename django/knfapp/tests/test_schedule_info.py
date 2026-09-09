@@ -11,7 +11,6 @@
 ############################################################
 
 
-import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -90,9 +89,10 @@ class ScheduleTests(TestCase):
 
 
 def _overlay_row(section, data, lang="lt", scraped_at=None):
+    # data_json is a JSON column — the structure goes in as-is
     return FacultyInfo.objects.create(
         id=str(uuid.uuid4()), lang=lang, section=section,
-        data_json=json.dumps(data),
+        data_json=data,
         scraped_at=scraped_at or utc_now_iso(),
     )
 

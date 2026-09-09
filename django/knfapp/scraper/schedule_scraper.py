@@ -13,7 +13,7 @@
 #  rewritten from the freshly scraped set, so a moved
 #  lecture, a cancelled one and last week's phantom room all
 #  disappear on the next run. Neighbouring semesters caught
-#  by the window are only ever added to (INSERT OR IGNORE) —
+#  by the window are only ever added to (DO NOTHING inserts) —
 #  the window covers a fortnight of them, which is not
 #  enough to rebuild them from.
 #
@@ -65,7 +65,8 @@ from bs4 import BeautifulSoup
 
 from django.db import connection, transaction
 
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now
+from knfapp.schedule.models import ScheduleLesson
 from knfapp.scraper.common import (
     HTML_CONTENT_TYPES,
     JSON_CONTENT_TYPES,
@@ -155,7 +156,7 @@ _COURSELESS_ABBREVS = frozenset({"BUS", "ISD"})
 
 # An EXPLICIT English-taught marker. A bare "angl" substring
 # also fires on the Lithuanian programme "Anglų ir kita
-# užsienio kalba" — every one of its groups was tagged "-EN"
+# užsienio kalba" — and would tag all of its groups "-EN"
 _LANG_EN_RE = re.compile(
     r"angl\w*\s+(?:kalb\w*|k\.)|in\s+english|english[-\s]taught|(?:^|[-\s(])en(?:[-\s)]|$)",
     re.IGNORECASE,
@@ -452,7 +453,7 @@ def _joined_link_texts(soup) -> str:
 # One event colour in the single shape the retake table is
 # written in: lowercase "#rrggbb". "#FF899D", "#ff899d",
 # "#f9d" and "rgb(255, 137, 157)" all collapse to the same
-# value, so a stylesheet that swaps notation no longer turns
+# value, so a stylesheet that swaps notation cannot turn
 # the exam filter off. Anything else (a named colour, a
 # gradient, something new) comes back stripped and lowercased
 # — never dropped, because the caller counts what it sees.
@@ -711,7 +712,7 @@ def scrape_group_schedule(slug: str, group_display_name: str,
         raise ValueError(f"Refusing the malformed group slug {slug!r}")
 
     url = EVENT_URL_TEMPLATE.format(slug=quote(slug, safe=""))
-    # The feed has been served as text/html before now, so both
+    # The feed sometimes arrives declared as text/html, so both
     # content types are accepted; the body is JSON either way
     result = fetch(url, SCHEDULE_HOSTS,
                    params={"start": start_date, "end": end_date},
@@ -737,9 +738,9 @@ def scrape_group_schedule(slug: str, group_display_name: str,
     # =======================================================
     for event in events:
         # A NULL start is not the same as an absent one: `"T" not
-        # in None` raises TypeError, and that escaped the whole
-        # function — one malformed event dropped every lesson the
-        # group had. A null collapses to "" and is dropped alone
+        # in None` raises TypeError, which would escape the whole
+        # function and cost the group every lesson it has. A null
+        # collapses to "" and is dropped alone
         start_str = event.get("start") or ""
         end_str = event.get("end", "")
 
@@ -803,8 +804,7 @@ def scrape_group_schedule(slug: str, group_display_name: str,
             room = _extract_room_from_html(raw_title)
 
         # Only surrounding whitespace and a trailing comma are
-        # trimmed — no academic titles are removed, whatever the
-        # original comment promised
+        # trimmed — academic titles are kept
         if teacher:
             teacher = teacher.strip().rstrip(",").strip()
 
@@ -867,7 +867,7 @@ def scrape_group_schedule(slug: str, group_display_name: str,
 #
 # Writes happen once, after every fetch, inside ONE
 # transaction.atomic() block — per-partition rewrites and
-# the neighbour INSERT OR IGNOREs land together or not at
+# the neighbour DO NOTHING inserts land together or not at
 # all. lessons_found sums every group's post-dedup
 # dicts; lessons_new counts rows that were NOT already
 # there, so an unchanged timetable pushes nothing.
@@ -1138,13 +1138,10 @@ def _run(run_id, forward_weeks, notify, deadline):
 def _reconcile_partition(group_name: str, semester: str, lessons: list[dict]):
     # STEP 1: what the table holds for this partition today
     # =====================================================
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """SELECT title, teacher, room, time_start, time_end, day_of_week
-               FROM schedule_lessons WHERE group_name = %s AND semester = %s""",
-            (group_name, semester),
-        )
-        existing = set(cursor.fetchall())
+    existing = set(
+        ScheduleLesson.objects.filter(group_name=group_name, semester=semester)
+        .values_list("title", "teacher", "room", "time_start", "time_end", "day_of_week")
+    )
 
     scraped = {
         (lesson["title"], lesson["teacher"], lesson["room"],
@@ -1157,11 +1154,7 @@ def _reconcile_partition(group_name: str, semester: str, lessons: list[dict]):
     # one-week room change stop haunting every following week
     # ==========================================================
     if existing != scraped:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                "DELETE FROM schedule_lessons WHERE group_name = %s AND semester = %s",
-                (group_name, semester),
-            )
+        ScheduleLesson.objects.filter(group_name=group_name, semester=semester).delete()
         _insert_lessons(lessons)
 
     return len(scraped - existing), len(existing - scraped)
@@ -1178,13 +1171,14 @@ def _reconcile_partition(group_name: str, semester: str, lessons: list[dict]):
 ############################################################
 #
 # Inserts a batch of scraped lesson dicts and returns how
-# many rows were actually added. INSERT OR IGNORE leans on
-# idx_schedule_lessons_natural instead of a SELECT per
-# candidate — a check-then-insert would scan the table per
-# row and still lose to a parallel run. The
-# spelling is SQLite's; it rewrites alongside the feed SQL
-# on a postgres move. created_at is stamped here — the
-# Django-built table carries no DDL default.
+# many rows were actually added — the per-row rowcount sums
+# only the rows the conflict clause let through. ON
+# CONFLICT DO NOTHING leans on idx_schedule_lessons_natural
+# instead of a SELECT per candidate — a check-then-insert
+# would scan the table per row and still lose to a parallel
+# run; the spelling runs on SQLite and Postgres alike.
+# created_at is stamped here — the Django-built table
+# carries no DDL default.
 #
 # Used by:
 #   - _reconcile_partition (above) — after the delete
@@ -1198,14 +1192,16 @@ def _insert_lessons(lessons: list[dict]) -> int:
     with connection.cursor() as cursor:
         for lesson in lessons:
             cursor.execute(
-                """INSERT OR IGNORE INTO schedule_lessons
+                """INSERT INTO schedule_lessons
                    (id, title, teacher, room, time_start, time_end,
                     day_of_week, group_name, semester, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (semester, group_name, day_of_week, time_start,
+                                time_end, title, teacher, room) DO NOTHING""",
                 (str(uuid.uuid4()), lesson["title"], lesson["teacher"],
                  lesson["room"], lesson["time_start"], lesson["time_end"],
                  lesson["day_of_week"], lesson["group_name"], lesson["semester"],
-                 utc_now_iso()),
+                 utc_now()),
             )
             added += cursor.rowcount
 
@@ -1226,9 +1222,9 @@ def _insert_lessons(lessons: list[dict]) -> int:
 # not one this scraper writes. Plain text sorting is WRONG
 # here: "2025-P" (spring 2026) sorts before "2025-R"
 # (autumn 2025) although it comes after it in the academic
-# year, so autumn is 0 and spring 1 within the year. The
-# legacy "2025-pavasaris" seed shape and anything hand-typed
-# return None and are left alone by the purge.
+# year, so autumn is 0 and spring 1 within the year. A
+# label in any other shape ("2025-pavasaris", anything
+# hand-typed) returns None and is left alone by the purge.
 #
 # Used by:
 #   - _purge_old_semesters (below)
@@ -1270,11 +1266,10 @@ def _purge_old_semesters(anchor_semester: str):
     if anchor_key is None:
         return
 
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT DISTINCT semester FROM schedule_lessons WHERE semester IS NOT NULL")
-        stale = [row[0] for row in cursor.fetchall()
-                 if _semester_key(row[0]) is not None and _semester_key(row[0]) < anchor_key]
+    semesters = ScheduleLesson.objects.values_list("semester", flat=True).distinct()
+    stale = [semester for semester in semesters
+             if _semester_key(semester) is not None and _semester_key(semester) < anchor_key]
 
-        for semester in stale:
-            cursor.execute("DELETE FROM schedule_lessons WHERE semester = %s", (semester,))
-            logger.info("Retired %d lesson(s) from the finished semester %s", cursor.rowcount, semester)
+    for semester in stale:
+        deleted, _ = ScheduleLesson.objects.filter(semester=semester).delete()
+        logger.info("Retired %d lesson(s) from the finished semester %s", deleted, semester)

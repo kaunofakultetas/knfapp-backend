@@ -65,19 +65,22 @@ class UrlHygieneTests(SimpleTestCase):
 
 class PublishedAtTests(SimpleTestCase):
 
-    def test_the_offset_is_applied_not_dropped(self):
+    def test_the_offset_is_applied_not_dropped_and_the_answer_is_aware(self):
         vilnius = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=3))) - timedelta(days=1)
         stored = common.sanitise_published_at(common.parse_source_datetime(vilnius.isoformat()))
-        expected = vilnius.astimezone(timezone.utc).replace(tzinfo=None)
-        self.assertAlmostEqual(datetime.fromisoformat(stored), expected, delta=timedelta(seconds=2))
+        # One stamp KIND for the whole published_at column — an
+        # aware UTC datetime, the same thing member posts write
+        self.assertEqual(stored.utcoffset(), timedelta(0))
+        self.assertAlmostEqual(stored, vilnius.astimezone(timezone.utc),
+                               delta=timedelta(seconds=2))
 
     def test_out_of_range_stamps_fall_back_to_now(self):
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = datetime.now(timezone.utc)
         for raw in ("2031-01-01T10:00:00", "1999-05-05T10:00:00",
                     "9999-12-31T23:59:59-05:00"):  # the OverflowError shape
             stored = common.sanitise_published_at(common.parse_source_datetime(raw))
-            self.assertAlmostEqual(datetime.fromisoformat(stored), now,
-                                   delta=timedelta(seconds=5), msg=raw)
+            self.assertEqual(stored.utcoffset(), timedelta(0))
+            self.assertAlmostEqual(stored, now, delta=timedelta(seconds=5), msg=raw)
         # Unparsable → now as well, via the None path
         self.assertIsNone(common.parse_source_datetime("rytoj"))
 
@@ -136,7 +139,7 @@ class SemesterTests(SimpleTestCase):
     def test_spring_sorts_after_its_autumn_despite_the_text_order(self):
         self.assertGreater(schedule_scraper._semester_key("2025-P"),
                            schedule_scraper._semester_key("2025-R"))
-        # Legacy seed labels are not this scraper's to purge
+        # An off-grammar label keys None — tolerated, never purged
         self.assertIsNone(schedule_scraper._semester_key("2025-pavasaris"))
 
 

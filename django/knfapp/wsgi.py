@@ -4,9 +4,9 @@
 #  The Django app wrapped in the Socket.IO layer: every
 #  /socket.io/* request goes to the chat transport
 #  (chat/socket.py — threading mode, polling only),
-#  everything else falls through to Django. Caddy proxies both prefixes to this
-#  one container, so the mobile app's wire protocol is
-#  byte-identical.
+#  everything else falls through to Django. Caddy proxies
+#  both prefixes to this one container, so REST and the
+#  socket wire share one origin.
 #
 #  Presence, rooms and the socket rate limiter are
 #  in-process state — gunicorn must run ONE worker (gthread;

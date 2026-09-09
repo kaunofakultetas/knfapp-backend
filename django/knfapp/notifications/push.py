@@ -28,8 +28,8 @@
 #  arms one daemon watcher thread in this process, which
 #  wakes every 15 minutes, trades what is due, and exits
 #  once the queue is empty (the next send re-arms it).
-#  Losing the queue on restart stays acceptable — receipts
-#  are diagnostics, not state.
+#  Losing the queue on restart is acceptable — receipts are
+#  diagnostics, not state.
 #
 #  Transport rules, all in one module-level requests.Session:
 #  3 retries with backoff on 429/5xx honouring Retry-After,
@@ -76,16 +76,18 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
 from typing import Optional
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
 from django.db import close_old_connections, connection
+from django.db.models import Exists, OuterRef
 
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now
 from knfapp.notifications.core import VALID_CHANNELS, token_digest
+from knfapp.notifications.models import NotificationChannel, PushToken
+from knfapp.users.models import Session
 
 logger = logging.getLogger(__name__)
 
@@ -120,9 +122,8 @@ _pace_lock = threading.Lock()
 _last_slice_at = 0.0
 
 # Tickets waiting for their receipt: (ticket id, token,
-# monotonic stamp), bounded and in memory only — losing the
-# queue on restart is acceptable for best-effort push, the
-# next send refills it
+# monotonic stamp), bounded and in memory only (the module
+# banner tells why)
 _RECEIPT_DELAY = 900
 _receipt_queue = deque(maxlen=20000)
 _receipt_lock = threading.Lock()
@@ -256,8 +257,7 @@ def _pace_slice():
 # next send starts a fresh one). The deque is bounded, so a
 # flood of sends drops the oldest ids instead of growing
 # without limit, and it never touches the database on the
-# way in — receipts are diagnostics, not state worth
-# persisting.
+# way in.
 #
 # Used by:
 #   - send_push_notification, _send_slice (below)
@@ -542,7 +542,7 @@ def _send_slice(batch: list[dict], deadline: float):
 # "ok" TICKETS; pass a `stats` dict to also receive
 # {"sent", "failed", "errors": {code: count}} for a caller
 # that reports more than a single number (admin's broadcast
-# route) — the int return stays the wire-facing value.
+# route) — the int return is the wire-facing value.
 # priority/ttl ride into every message when given: the
 # channel helpers set "high" + 1 h for chat and a day's ttl
 # for the rest. The same `data` object rides in every message
@@ -550,8 +550,6 @@ def _send_slice(batch: list[dict], deadline: float):
 #
 # Used by:
 #   - _send_by_language (below) — every notify_* path
-#   - chat/routes.py — _push_chat_message's standalone
-#     fallback (retires once notify_channel_users is in)
 ############################################################
 
 def send_push_batch(
@@ -654,11 +652,9 @@ def send_push_batch(
 # so each name moves at most one row. Rows are kept, not
 # deleted: the next POST /api/notifications/register from
 # that device sets active=1 again. updated_at is refreshed
-# so the row's age means something — in the naive-UTC
-# isoformat every push_tokens timestamp already carries.
-# Never raises; close_old_connections first, because this
-# can run on a fan-out thread whose connection has been
-# sitting idle.
+# so the row's age means something. Never raises;
+# close_old_connections first, because this can run on a
+# fan-out thread whose connection has been sitting idle.
 #
 # Used by:
 #   - send_push_notification, send_push_batch,
@@ -672,14 +668,7 @@ def _deactivate_tokens(tokens) -> int:
 
     try:
         close_old_connections()
-        now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-        placeholders = ",".join(["%s"] * len(unique))
-        with connection.cursor() as cursor:
-            cursor.execute(
-                f"UPDATE push_tokens SET active = 0, updated_at = %s WHERE token IN ({placeholders})",
-                [now, *unique],
-            )
-            changed = cursor.rowcount
+        changed = PushToken.objects.filter(token__in=unique).update(active=0, updated_at=utc_now())
     except Exception:
         logger.exception("Failed to deactivate tokens")
         return 0
@@ -817,9 +806,9 @@ def poll_push_receipts() -> int:
 # other phones (auth's logout deletes only the row for the
 # optional "pushToken" it is handed).
 #
-# sessions.expires_at is aware isoformat UTC everywhere, so
-# the plain string comparison against utc_now_iso() is
-# correct — exactly what the session sweep does.
+# sessions.expires_at is a datetime column, so the cutoff is
+# bound as a datetime — each engine compares in the column's
+# own type, exactly what the session sweep does.
 #
 # Used by:
 #   - scraper/management/commands/maintenance.py — daily
@@ -827,17 +816,9 @@ def poll_push_receipts() -> int:
 
 def prune_orphan_push_tokens() -> int:
     try:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                DELETE FROM push_tokens
-                WHERE user_id NOT IN (
-                    SELECT user_id FROM sessions WHERE expires_at > %s
-                )
-                """,
-                (utc_now_iso(),),
-            )
-            removed = cursor.rowcount
+        removed, _ = PushToken.objects.exclude(
+            user_id__in=Session.objects.filter(expires_at__gt=utc_now()).values("user_id"),
+        ).delete()
     except Exception:
         logger.exception("Failed to prune push tokens")
         return 0
@@ -909,11 +890,11 @@ def _send_by_language(channel, rows, title, body, data, title_en, body_en, stats
 # batch per language — the shape chat's fan-out needs, where
 # a per-recipient send would mean an Expo round-trip each.
 # Users with an explicit notification_channels row enabled=0
-# for the channel drop out in SQL (opt-out model: a missing
-# row means enabled). The id list is chunked so a huge
-# recipient set cannot hit SQLite's variable limit. Returns
-# accepted tickets (devices, not users); `stats` works as in
-# send_push_batch.
+# for the channel drop out in the query itself (opt-out
+# model: a missing row means enabled). The id list is
+# chunked so a huge recipient set cannot hit SQLite's
+# variable limit. Returns accepted tickets (devices, not
+# users); `stats` works as in send_push_batch.
 #
 # Used by:
 #   - chat/api/views.py — the message push fan-out
@@ -938,27 +919,17 @@ def notify_channel_users(channel: str, user_ids, title: str, body: str, data: Op
     # STEP 2: tokens minus the channel's opt-outs, one query
     # per chunk of recipients
     # ======================================================
+    opted_out = NotificationChannel.objects.filter(
+        user_id=OuterRef("user_id"), channel=channel, enabled=0,
+    )
     rows = []
-    with connection.cursor() as cursor:
-        for i in range(0, len(ids), _ID_CHUNK):
-            part = ids[i : i + _ID_CHUNK]
-            placeholders = ",".join(["%s"] * len(part))
-            cursor.execute(
-                f"""
-                SELECT pt.token, pt.language
-                FROM push_tokens pt
-                WHERE pt.active = 1
-                  AND pt.user_id IN ({placeholders})
-                  AND NOT EXISTS (
-                    SELECT 1 FROM notification_channels nc
-                    WHERE nc.user_id = pt.user_id
-                      AND nc.channel = %s
-                      AND nc.enabled = 0
-                  )
-                """,
-                [*part, channel],
-            )
-            rows.extend(cursor.fetchall())
+    for i in range(0, len(ids), _ID_CHUNK):
+        part = ids[i : i + _ID_CHUNK]
+        rows.extend(
+            PushToken.objects.filter(active=1, user_id__in=part)
+            .filter(~Exists(opted_out))
+            .values_list("token", "language")
+        )
 
     return _send_by_language(channel, rows, title, body, data, title_en, body_en, stats)
 
@@ -1006,8 +977,8 @@ def notify_channel_user(channel: str, user_id: str, title: str, body: str, data:
 # opted out of the channel: NOT EXISTS on a
 # notification_channels row with enabled=0, so users who
 # never touched their settings are included (opt-out model).
-# The exclude clause is appended after the NOT EXISTS
-# closes, so it ANDs at the top level as intended. An
+# exclude_user_id, when set, is one more filter on top —
+# the author of the action being announced stays quiet. An
 # unknown channel name has no opt-out rows at all, which
 # would silently mean "send to everyone", so it is refused
 # here and logged instead. The count is devices, not users;
@@ -1026,6 +997,7 @@ def notify_channel_user(channel: str, user_id: str, title: str, body: str, data:
 #   - scraper/vu_scraper.py — scrape_vu_news, "news"
 #   - scraper/schedule_scraper.py — scrape_knf_schedule,
 #     "schedule"
+#   - news/api/views.py — a public faculty post, "news"
 #   - admin/api/views.py — _run_broadcast, "admin"
 ############################################################
 
@@ -1042,28 +1014,17 @@ def notify_channel(channel: str, title: str, body: str, data: Optional[dict] = N
 
     # STEP 2: every active token minus this channel's opt-outs
     # ========================================================
-    # Opt-out model in SQL: a user is excluded only by an
-    # explicit enabled=0 row for this channel
-    query = """
-        SELECT pt.token, pt.language, pt.user_id
-        FROM push_tokens pt
-        WHERE pt.active = 1
-          AND NOT EXISTS (
-            SELECT 1 FROM notification_channels nc
-            WHERE nc.user_id = pt.user_id
-              AND nc.channel = %s
-              AND nc.enabled = 0
-          )
-    """
-    params: list = [channel]
-
+    # Opt-out model: a user is excluded only by an explicit
+    # enabled=0 row for this channel
+    tokens = PushToken.objects.filter(active=1).filter(
+        ~Exists(NotificationChannel.objects.filter(
+            user_id=OuterRef("user_id"), channel=channel, enabled=0,
+        )),
+    )
     if exclude_user_id:
-        query += " AND pt.user_id != %s"
-        params.append(exclude_user_id)
+        tokens = tokens.exclude(user_id=exclude_user_id)
 
-    with connection.cursor() as cursor:
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
+    rows = list(tokens.values_list("token", "language", "user_id"))
 
     # Tokens are devices, not people — one reader with nine
     # phones is nine tokens. The distinct-owner count rides in

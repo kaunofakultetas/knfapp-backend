@@ -2,7 +2,7 @@
 #  [*] Regression tests — likes, shares, comments
 #
 #  The counter law (recomputed from child rows, never ±1 —
-#  the drift that forced a production reset), the activity
+#  increments drift and lie), the activity
 #  rows that ride the same transaction (a withdrawn like
 #  takes its row back), the guest share, and the comment
 #  thread's deleted-user rendering.

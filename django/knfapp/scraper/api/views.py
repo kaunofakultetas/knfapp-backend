@@ -25,7 +25,7 @@
 #    409 — a run of that scraper was already going
 #    502 — the scrape failed (the scraper's "error" key)
 #  The body carries a stable slug plus the run id; the
-#  exception text stays in the log and (truncated) in
+#  exception text lives in the log and (truncated) in
 #  scraper_runs.error_message.
 #
 #  Result dicts are the scrapers' own, each with "runId":
@@ -95,11 +95,10 @@ _RUN_FIELDS = ("id", "source", "status", "articles_found", "articles_new",
 # {"runs": [...], "sources": [...]} — the 20 newest
 # scraper_runs rows, all sources mixed ('knf.vu.lt',
 # 'vu.lt', 'tvarkarasciai.vu.lt', 'knf.vu.lt/info'),
-# started_at DESC. started_at is ISO-8601 UTC text stamped
-# by the scraper, so the string sort IS chronological, and
-# rows older than 30 days are pruned at the end of every run
-# — except each source's newest, which is kept whatever its
-# age.
+# started_at DESC — a datetime column, so the sort is
+# chronological on both engines — and rows older than 30
+# days are pruned at the end of every run, except each
+# source's newest, which is kept whatever its age.
 #
 # "sources" is one entry per source with its latest run, its
 # latest SUCCESS and its latest FAILURE. Twenty mixed rows
@@ -159,7 +158,7 @@ def scraper_status(request):
             "lastFailure": _latest_run(source, "failed"),
         })
 
-    return json_response({"runs": runs, "sources": sources})
+    return json_response({"runs": runs, "sources": sources}, naive_stamps=True)
 
 
 def _run_row(r) -> dict:
@@ -170,10 +169,12 @@ def _run_row(r) -> dict:
         "articlesFound": r["articles_found"],
         "articlesNew": r["articles_new"],
         # Same numbers, source-neutral names — the two
-        # above stay for the existing consumers
+        # above serve the existing consumers
         "itemsFound": r["articles_found"],
         "itemsNew": r["articles_new"],
         "error": r["error_message"],
+        # The status wire's stamp shape is NAIVE UTC — the
+        # naive_stamps encoder strips the offsets
         "startedAt": r["started_at"],
         "finishedAt": r["finished_at"],
     }
@@ -204,9 +205,9 @@ def _latest_run(source: str, status: str = ""):
 # the full timetable import with its default rolling window.
 # POST /api/scraper/info — contacts/programs/structure. The
 # page counts are the cron run's on purpose — a manual
-# trigger reaching one page deeper than the schedule made
-# "did the trigger work?" unanswerable — and every trigger
-# runs with notify=False.
+# trigger reaching one page deeper than the schedule would
+# make "did the trigger work?" unanswerable — and every
+# trigger runs with notify=False.
 #
 # _public_result turns a raw "error" into the stable slug
 # (the counts pass through); _trigger_status maps the

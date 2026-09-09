@@ -2,7 +2,7 @@
 #  [*] scrape_schedule — the 6-hour timetable tick
 #
 #  The full tvarkarasciai.vu.lt import with its default
-#  rolling window. Push stays ON — this is the scheduled
+#  rolling window. Push is ON — this is the scheduled
 #  run. The scraper records its own outcome in scraper_runs
 #  and never raises; the guard here only catches what
 #  escapes it.

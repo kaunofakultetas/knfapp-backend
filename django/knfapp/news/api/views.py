@@ -25,14 +25,16 @@ import uuid
 from datetime import datetime, timezone
 
 
-from django.db import IntegrityError, connection, models, transaction
+from django.db import IntegrityError, models, transaction
+from django.db.models.functions import Coalesce, Greatest, Least
 from django.http import HttpResponse
 from django.views.decorators.http import require_POST
 
 
 from knfapp.common import ratelimit
+from knfapp.common.expressions import JulianDay, JulianDayNow
 from knfapp.common.http import client_ip, get_json_object, json_error, json_response, parse_pagination
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now
 from knfapp.news import core
 from knfapp.news.models import (
     SCRAPED_SOURCES,
@@ -58,23 +60,31 @@ logger = logging.getLogger(__name__)
 # no one can mint a poll card with no poll behind it
 CLIENT_POST_TYPES = ("article", "social", "announcement", "link")
 
-# The ranking term, kept as raw SQL: recency decays on
-# julianday (SQLite — a postgres move rewrites this in the
-# same breath as DATABASE_URL), engagement is capped so a
-# viral post cannot pin the feed, and the source bonus keeps
-# faculty word above the scrapers
-FEED_SCORE_SQL = """
-                COALESCE(
-                    (1.0 / (1.0 + MAX(0, {ref} - julianday(published_at)))) * 100
-                    + MIN(likes_count + comments_count * 2 + shares_count * 3, 100) * 0.5
-                    + (CASE source
-                        WHEN 'faculty' THEN 20
-                        WHEN 'knf.vu.lt' THEN 15
-                        WHEN 'vu.lt' THEN 10
-                        WHEN 'app' THEN 5
-                        ELSE 0
-                    END), 0)
-"""
+# The ranking, as one ORM annotation: recency decays on the
+# Julian day (the vendor-split JulianDay expressions carry
+# the engine spelling), engagement is capped so a viral post
+# cannot pin the feed, and the source bonus keeps faculty
+# word above the scrapers. COALESCE floors the whole score
+# at 0 when the recency term goes NULL over an unparsable
+# stamp.
+def _feed_score(ref):
+    recency = 1.0 / (1.0 + Greatest(models.Value(0.0), ref - JulianDay(models.F("published_at")))) * 100.0
+    engagement = Least(
+        models.F("likes_count") + models.F("comments_count") * 2 + models.F("shares_count") * 3,
+        models.Value(100),
+    ) * 0.5
+    bonus = models.Case(
+        models.When(source="faculty", then=models.Value(20.0)),
+        models.When(source="knf.vu.lt", then=models.Value(15.0)),
+        models.When(source="vu.lt", then=models.Value(10.0)),
+        models.When(source="app", then=models.Value(5.0)),
+        default=models.Value(0.0),
+        output_field=models.FloatField(),
+    )
+    return Coalesce(
+        models.ExpressionWrapper(recency + engagement + bonus, output_field=models.FloatField()),
+        models.Value(0.0),
+    )
 
 
 def _gate_row(post_id):
@@ -89,16 +99,6 @@ def _post_row(post_id):
         .annotate(live_author_name=models.F("author__display_name"))
         .values(*core.POST_FIELDS, "live_author_name")
         .first()
-    )
-
-
-def _recount_comments(post_id):
-    NewsPost.objects.filter(id=post_id).update(
-        comments_count=models.Subquery(
-            NewsComment.objects.filter(post_id=models.OuterRef("id"))
-            .values("post_id").annotate(c=models.Count("id")).values("c")[:1],
-            output_field=models.IntegerField(),
-        ) or 0,
     )
 
 
@@ -126,10 +126,10 @@ def _cacheable(response, tag, shared):
 # public non-wall rows; members add their own rows and
 # their friends' wall posts, and non-staff never see a
 # private faculty draft. The ranking runs on a NARROW
-# id-only query; only the page of ids is joined out to full
-# rows. Every answer carries a weak ETag over the watermark
-# plus the caller, their friend set and the query — a 304
-# is decided before any ranking work.
+# id-only query; only the page of ids is joined out to
+# full rows. Every answer carries a weak ETag over the
+# feed fingerprint plus the caller, their friend set and
+# the query — a 304 is decided before any ranking work.
 #
 # Used by:
 #   - services/api/news.ts fetchNewsFeed — the news tab's
@@ -152,53 +152,44 @@ def get_feed(request):
         pinned = core.as_utc(core.parse_iso(before))
         if pinned is None:
             return json_error("before must be an ISO-8601 timestamp", 400)
-        before = pinned.isoformat()
+        before = pinned
 
     offset = (page - 1) * per_page
     user = get_current_user(request)
 
 
-    # STEP 2: the WHERE clause — raw fragments because the ranking
-    # query is raw (the score runs on julianday)
-    # ============================================================
-    where_clauses = ["1=1"]
-    params = []
+    # STEP 2: the visibility filter, as composable Q objects
+    # ======================================================
+    visibility = models.Q()
 
     if source_filter:
-        where_clauses.append("source = %s")
-        params.append(source_filter)
+        visibility &= models.Q(source=source_filter)
     if before:
-        where_clauses.append("published_at <= %s")
-        params.append(before)
+        visibility &= models.Q(published_at__lte=before)
 
     friend_ids = []
     if not user:
-        where_clauses.append("is_public = 1")
-        where_clauses.append("source != 'user'")
+        visibility &= models.Q(is_public=1) & ~models.Q(source="user")
     else:
         friend_ids = list(
             Friendship.objects.filter(user_id=user["id"]).values_list("friend_id", flat=True)
         )
         visible_ids = [user["id"]] + friend_ids
         if not source_filter or source_filter == "user":
-            placeholders = ",".join(["%s"] * len(visible_ids))
-            where_clauses.append(f"(source != 'user' OR author_id IN ({placeholders}))")
-            params.extend(visible_ids)
+            visibility &= ~models.Q(source="user") | models.Q(author_id__in=visible_ids)
         if user["role"] not in core.STAFF_ROLES:
-            where_clauses.append("(is_public = 1 OR source = 'user' OR author_id = %s)")
-            params.append(user["id"])
-
-    where_sql = " AND ".join(where_clauses)
+            visibility &= (models.Q(is_public=1) | models.Q(source="user")
+                           | models.Q(author_id=user["id"]))
 
 
-    # STEP 3: the fingerprint — watermark + caller + friend set +
+    # STEP 3: the ETag seed — fingerprint + caller + friend set +
     # query; a matching If-None-Match ends the request here
     # ===========================================================
     seed = "|".join((
         core.feed_version(),
         user["id"] if user else "guest",
         hashlib.sha256(",".join(sorted(friend_ids)).encode("utf-8")).hexdigest()[:16] if user else "-",
-        str(page), str(per_page), source_filter or "-", before or "-",
+        str(page), str(per_page), source_filter or "-", core.feed_stamp(before),
     ))
     tag = core.etag_for(seed)
 
@@ -208,21 +199,14 @@ def get_feed(request):
 
     # STEP 4: the ranked ids — narrow on purpose
     # ==========================================
-    score_sql = FEED_SCORE_SQL.format(ref="julianday(%s)" if before else "julianday('now')")
-    rank_params = params + ([before] if before else []) + [per_page, offset]
-
-    with connection.cursor() as cursor:
-        cursor.execute(
-            f"""SELECT id FROM news_posts
-                WHERE {where_sql}
-                ORDER BY {score_sql} DESC, published_at DESC, id DESC
-                LIMIT %s OFFSET %s""",
-            rank_params,
-        )
-        post_ids = [r[0] for r in cursor.fetchall()]
-
-        cursor.execute(f"SELECT COUNT(*) FROM news_posts WHERE {where_sql}", params)
-        total = cursor.fetchone()[0]
+    ref = JulianDay(models.Value(before)) if before else JulianDayNow()
+    post_ids = list(
+        NewsPost.objects.filter(visibility)
+        .annotate(feed_score=_feed_score(ref))
+        .order_by("-feed_score", "-published_at", "-id")
+        .values_list("id", flat=True)[offset:offset + per_page]
+    )
+    total = NewsPost.objects.filter(visibility).count()
 
 
     # STEP 5: the page rows by id, back into ranked order
@@ -288,8 +272,8 @@ def get_feed(request):
 # be a relative /api/uploads/ path (a foreign host would
 # beacon every reader to an attacker-chosen server). The 201
 # re-reads the row through post_to_dict + liked=False, and a
-# public faculty post rings the 'news' push channel after
-# the commit (guarded hook until notifications' push ports).
+# public faculty post rings the 'news' push channel (import-
+# guarded; a push failure never fails the 201).
 #
 # Used by:
 #   - services/api/news.ts createPost — the create-post
@@ -353,12 +337,12 @@ def create_post(request):
     # shape every read path serves
     # ===========================================================
     post_id = str(uuid.uuid4())
-    now = utc_now_iso()
+    now = utc_now()
     NewsPost.objects.create(
         id=post_id, title=title, content=content, summary=content[:core.SUMMARY_LENGTH],
         image_url=image_url, author_id=request.user["id"], author_name=request.user["display_name"],
         source=source, source_url=None, post_type=post_type,
-        is_public=1 if is_public else 0, published_at=now, created_at=now, updated_at=now,
+        is_public=is_public, published_at=now, created_at=now, updated_at=now,
     )
     logger.info("News post %s created by %s (source=%s, post_type=%s, public=%s)",
                 post_id, request.user["id"], source, post_type, is_public)
@@ -366,8 +350,8 @@ def create_post(request):
 
 
     # STEP 4: a public faculty announcement rings the 'news'
-    # channel — a guarded hook until notifications' push ports;
-    # a failure is logged and never fails the 201
+    # channel — the import is guarded so the route stands even
+    # without the push module; a failure is logged, never a 500
     # =========================================================
     if source == "faculty" and is_public:
         try:
@@ -447,7 +431,7 @@ def delete_post(request, post_id):
     if post["source_url"]:
         DeletedSourceUrl.objects.get_or_create(
             source_url=post["source_url"],
-            defaults={"deleted_by_id": user["id"], "deleted_at": utc_now_iso()},
+            defaults={"deleted_by_id": user["id"], "deleted_at": utc_now()},
         )
 
 
@@ -490,9 +474,9 @@ def delete_post(request, post_id):
 ############################################################
 #
 # The like flips the caller's news_likes row on a post they
-# may SEE (get_or_create absorbs the PK race the old
-# SELECT-then-INSERT lost) and RECOMPUTES likes_count from
-# the rows; the author's activity row rides the same
+# may SEE (get_or_create absorbs the concurrent-toggle PK
+# race) and RECOMPUTES likes_count from the rows; the
+# author's activity row rides the same
 # transaction — a like lands one, an unlike takes it back.
 # The share bumps shares_count with no auth (guests share
 # too) but the same visibility gate — a 200-vs-404 split on
@@ -515,7 +499,7 @@ def toggle_like(request, post_id):
 
     _, created = NewsLike.objects.get_or_create(
         user_id=request.user["id"], post_id=post_id,
-        defaults={"created_at": utc_now_iso()},
+        defaults={"created_at": utc_now()},
     )
     if created:
         liked = True
@@ -570,12 +554,12 @@ def share_post(request, post_id):
 # get_comments / add_comment / delete_comment
 ############################################################
 #
-# The thread under one visible post (the parent gates every
-# route — a private post's comments were once readable with
-# no auth at all). Pages are newest-first with id breaking
+# The thread under one visible post (the parent gates
+# every route — the thread is exactly as private as its
+# post). Pages are newest-first with id breaking
 # created_at ties, the users JOIN is LEFT so an orphaned
 # comment still counts AND renders ('Deleted user'), and
-# legacy stamps go out through to_utc_iso. add_comment
+# stamps go out through to_utc_iso. add_comment
 # recomputes comments_count in its transaction and answers
 # the row it wrote with ONE clock read; delete_comment is
 # comment-author / post-author / admin, and the comment
@@ -635,7 +619,7 @@ def add_comment(request, post_id):
         return json_error("Post not found", 404)
 
     comment_id = str(uuid.uuid4())
-    now = utc_now_iso()
+    now = utc_now()
     NewsComment.objects.create(id=comment_id, post_id=post_id, user_id=request.user["id"],
                                text=comment_text, created_at=now)
     NewsPost.objects.filter(id=post_id).update(
@@ -705,8 +689,9 @@ def delete_comment(request, post_id, comment_id):
 # normalised to explicit UTC at the door. delete restores
 # the post_type its source implies. vote casts or moves via
 # an ON CONFLICT upsert; re-voting the held option is the
-# 409 the client treats as a no-op; option and poll counters
-# are RECOMPUTED from the rows.
+# 409 the client treats as a no-op; the option counters are
+# RECOMPUTED from the rows (the poll total is derived from
+# them at shape time, never stored).
 #
 # Used by:
 #   - services/api/news.ts fetchPoll / createPollApi /
@@ -720,7 +705,7 @@ def get_poll(request, post_id):
         return json_error("No poll found for this post", 404)
 
     poll = Poll.objects.filter(post_id=post_id).values(
-        "id", "post_id", "title", "end_date", "total_votes", "created_at",
+        "id", "post_id", "title", "end_date", "created_at",
     ).first()
     if not poll:
         return json_error("No poll found for this post", 404)
@@ -770,7 +755,7 @@ def create_poll(request, post_id):
         pinned = core.as_utc(core.parse_iso(end_date))
         if pinned is None:
             return json_error("end_date must be an ISO-8601 timestamp", 400)
-        end_date = pinned.isoformat()
+        end_date = pinned
 
 
     # STEP 4: visible + owned (or admin) + not scraped + not
@@ -793,7 +778,7 @@ def create_poll(request, post_id):
     # guard, its IntegrityError answering the racing twin's 409
     # =========================================================
     poll_id = str(uuid.uuid4())
-    now = utc_now_iso()
+    now = utc_now()
     try:
         with transaction.atomic():
             Poll.objects.create(id=poll_id, post_id=post_id, title=title, end_date=end_date, created_at=now)
@@ -812,7 +797,7 @@ def create_poll(request, post_id):
     logger.info("Poll %s (%d options) attached to post %s by %s", poll_id, len(options), post_id, user["id"])
 
     poll = Poll.objects.filter(id=poll_id).values(
-        "id", "post_id", "title", "end_date", "total_votes", "created_at",
+        "id", "post_id", "title", "end_date", "created_at",
     ).first()
     return json_response(core.poll_to_dict(poll, user["id"]), status=201)
 
@@ -901,39 +886,42 @@ def vote_poll(request, post_id):
 
 
     # STEP 5: cast or move — the held option answers the 409 the
-    # client treats as a no-op; the write itself is the same
-    # ON CONFLICT upsert, so a racing pair cannot collide or
-    # double-count (the counters are recomputed either way)
+    # client treats as a no-op; the write is an ON CONFLICT
+    # upsert on the (user, poll) PK, so a racing pair cannot
+    # collide or double-count (the counters are recomputed
+    # either way). unique_fields must name the PK's COMPONENT
+    # columns — ["pk"] raises on a composite-PK model
     # ==========================================================
     existing = PollVote.objects.filter(user_id=user_id, poll_id=poll_id).values("option_id").first()
     if existing and existing["option_id"] == option_id:
         return json_error("Already voted for this option", 409)
 
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """INSERT INTO poll_votes (user_id, poll_id, option_id, created_at)
-               VALUES (%s, %s, %s, %s)
-               ON CONFLICT(user_id, poll_id)
-               DO UPDATE SET option_id = excluded.option_id, created_at = excluded.created_at""",
-            (user_id, poll_id, option_id, utc_now_iso()),
-        )
+    PollVote.objects.bulk_create(
+        [PollVote(user_id=user_id, poll_id=poll_id, option_id=option_id, created_at=utc_now())],
+        update_conflicts=True,
+        unique_fields=["user_id", "poll_id"],
+        update_fields=["option_id", "created_at"],
+    )
 
 
-    # STEP 6: counters recomputed from the rows, never ±1
-    # ===================================================
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """UPDATE poll_options
-               SET votes = (SELECT COUNT(*) FROM poll_votes WHERE poll_votes.option_id = poll_options.id)
-               WHERE poll_id = %s""",
-            (poll_id,),
-        )
-    Poll.objects.filter(id=poll_id).update(total_votes=PollVote.objects.filter(poll_id=poll_id).count())
+    # STEP 6: counters recomputed from the rows, never ±1 —
+    # COALESCE lands a zero-vote option on 0, not NULL
+    # =====================================================
+    PollOption.objects.filter(poll_id=poll_id).update(
+        votes=Coalesce(
+            models.Subquery(
+                PollVote.objects.filter(option_id=models.OuterRef("id"))
+                .values("option_id").annotate(c=models.Count("option_id")).values("c")[:1],
+                output_field=models.IntegerField(),
+            ),
+            models.Value(0),
+        ),
+    )
 
 
     # STEP 7: the fresh poll state
     # ============================
     fresh = Poll.objects.filter(id=poll_id).values(
-        "id", "post_id", "title", "end_date", "total_votes", "created_at",
+        "id", "post_id", "title", "end_date", "created_at",
     ).first()
     return json_response(core.poll_to_dict(fresh, user_id))

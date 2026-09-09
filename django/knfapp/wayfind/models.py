@@ -1,9 +1,8 @@
 ############################################################
 #  [*] wayfind — the indoor-map tables
 #
-#  Eight tables matching the production database
-#  byte-for-byte. Two id schemes worth knowing before the
-#  banners below: panoramas and plans are content-addressed
+#  Two id schemes worth knowing before the banners below:
+#  panoramas and plans are content-addressed
 #  (the row id IS the sha256 of the stored bytes), while
 #  ops and captures carry client-minted ids scoped
 #  '<building>:<client id>' so idempotency holds per
@@ -60,8 +59,8 @@ class WfBuilding(models.Model):
     entrance_node_id = models.TextField(null=True, blank=True)
     draft_revision = models.IntegerField(default=0)
     published_revision = models.IntegerField(null=True, blank=True)
-    created_at = models.TextField()
-    updated_at = models.TextField()
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -88,17 +87,19 @@ class WfBuilding(models.Model):
 # -----------------------------------------------------------
 
 class WfEntity(models.Model):
-    # Columns
+    # Columns — building_id leads the composite PK and the
+    # revision index, so its FK auto-index would be a third
+    # copy on the hottest wayfind write table
     pk = models.CompositePrimaryKey("building_id", "kind", "id")
-    building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE,
+    building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE, db_index=False,
                                  db_column="building_id", related_name="entities")
     kind = models.TextField()
     id = models.TextField()
-    data = models.TextField()
+    data = models.JSONField()
     revision = models.IntegerField()
-    updated_at = models.TextField()
+    updated_at = models.DateTimeField()
     updated_by = models.TextField(null=True, blank=True)
-    deleted = models.IntegerField(default=0)
+    deleted = models.BooleanField(default=False)
 
     # Table metadata
     class Meta:
@@ -131,14 +132,15 @@ class WfEntity(models.Model):
 # -----------------------------------------------------------
 
 class WfOp(models.Model):
-    # Columns
+    # Columns — building_id leads idx_wf_ops_building, so
+    # the FK auto-index would be a duplicate
     id = models.TextField(primary_key=True)
-    building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE,
+    building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE, db_index=False,
                                  db_column="building_id", related_name="ops")
     revision = models.IntegerField(null=True, blank=True)
     op = models.TextField()
     author_id = models.TextField(null=True, blank=True)
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
     status = models.TextField()
     reason = models.TextField(null=True, blank=True)
 
@@ -173,16 +175,17 @@ class WfOp(models.Model):
 # -----------------------------------------------------------
 
 class WfVersion(models.Model):
-    # Columns
+    # Columns — building_id leads the composite PK, so the
+    # FK auto-index would be a duplicate
     pk = models.CompositePrimaryKey("building_id", "revision")
-    building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE,
+    building = models.ForeignKey(WfBuilding, on_delete=models.CASCADE, db_index=False,
                                  db_column="building_id", related_name="versions")
     revision = models.IntegerField()
     document = models.TextField()
     etag = models.TextField()
     note = models.TextField(null=True, blank=True)
     published_by = models.TextField(null=True, blank=True)
-    published_at = models.TextField()
+    published_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -222,7 +225,7 @@ class WfPanorama(models.Model):
     heading_raw_deg = models.FloatField(null=True, blank=True)
     heading_source = models.TextField(null=True, blank=True)
     uploaded_by = models.TextField(null=True, blank=True)
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -254,7 +257,7 @@ class WfPlan(models.Model):
     level_id = models.TextField(null=True, blank=True)
     bytes = models.IntegerField()
     uploaded_by = models.TextField(null=True, blank=True)
-    created_at = models.TextField()
+    created_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -289,15 +292,15 @@ class WfCapture(models.Model):
     node_id = models.TextField(null=True, blank=True)
     mode = models.TextField()
     frame_hfov_deg = models.FloatField()
-    targets = models.TextField()
+    targets = models.JSONField()
     expected = models.IntegerField()
     status = models.TextField()
     progress_pct = models.IntegerField(default=0)
-    report = models.TextField(null=True, blank=True)
+    report = models.JSONField(null=True, blank=True)
     pano_id = models.TextField(null=True, blank=True)
     created_by = models.TextField(null=True, blank=True)
-    created_at = models.TextField()
-    updated_at = models.TextField()
+    created_at = models.DateTimeField()
+    updated_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
@@ -333,9 +336,10 @@ class WfCapture(models.Model):
 # -----------------------------------------------------------
 
 class WfCaptureFrame(models.Model):
-    # Columns
+    # Columns — capture_id leads the composite PK, so the
+    # FK auto-index would be a duplicate
     pk = models.CompositePrimaryKey("capture_id", "target_id")
-    capture = models.ForeignKey(WfCapture, on_delete=models.CASCADE,
+    capture = models.ForeignKey(WfCapture, on_delete=models.CASCADE, db_index=False,
                                 db_column="capture_id", related_name="frames")
     target_id = models.TextField()
     yaw_deg = models.FloatField()
@@ -344,7 +348,7 @@ class WfCaptureFrame(models.Model):
     bytes = models.IntegerField()
     width = models.IntegerField()
     height = models.IntegerField()
-    updated_at = models.TextField()
+    updated_at = models.DateTimeField()
 
     # Table metadata
     class Meta:
