@@ -345,9 +345,12 @@ def serialize_user(u):
 # equal its prefix), must not contain the username or the
 # email's local part (case-insensitive; local parts under 3
 # chars are too noisy to check), and must not be one of the
-# embedded common passwords. Returns the English error
-# prose or None; callers answer 400 with code weak_password
-# — the slug the app translates.
+# embedded common passwords. Returns a (code, prose) pair
+# or None; callers answer 400 with that code — one stable
+# slug PER reason, so the app can translate the actual
+# rejection instead of guessing (a 10-char password refused
+# for containing the username used to surface as "must be
+# at least 6 characters").
 #
 # Used by:
 #   - api/auth_views.py — register, change_password
@@ -355,17 +358,17 @@ def serialize_user(u):
 
 def validate_new_password(password, username, email):
     if len(password) < 6:
-        return "Password must be at least 6 characters"
+        return ("password_too_short", "Password must be at least 6 characters")
     if len(password.encode("utf-8")) > PASSWORD_MAX_BYTES:
-        return "Password must be at most 72 bytes"
+        return ("password_too_long", "Password must be at most 72 bytes")
 
     lowered = password.lower()
     if username and username.lower() in lowered:
-        return "Password must not contain your username"
+        return ("password_contains_username", "Password must not contain your username")
     local_part = (email or "").split("@", 1)[0].lower()
     if len(local_part) >= 3 and local_part in lowered:
-        return "Password must not contain your email"
+        return ("password_contains_email", "Password must not contain your email")
 
     if lowered in COMMON_PASSWORDS:
-        return "Password is too common"
+        return ("password_too_common", "Password is too common")
     return None

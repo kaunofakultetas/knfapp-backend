@@ -262,9 +262,10 @@ paths:
                 $ref: "#/components/schemas/AuthResponse"
         "400":
           description: >
-            Invalid input or invitation code (codes: weak_password,
-            invalid_username, invalid_email, invite_invalid, invite_exhausted,
-            invite_expired)
+            Invalid input or invitation code (codes: password_too_short,
+            password_too_long, password_contains_username,
+            password_contains_email, password_too_common, invalid_username,
+            invalid_email, invite_invalid, invite_exhausted, invite_expired)
         "409":
           description: Username or email already exists
         "429":
@@ -529,8 +530,8 @@ paths:
           description: Password changed; other sessions revoked
         "400":
           description: >
-            Missing fields, a new password failing the policy (code
-            weak_password), or a wrong old password (code invalid_credentials —
+            Missing fields, a new password failing the policy (the per-reason
+            password_* codes), or a wrong old password (code invalid_credentials —
             a 400 on purpose, so the client does not tear the session down over
             a typo)
         "401":
@@ -4844,7 +4845,9 @@ components:
         Every error body the API sends. `error` is human-readable and its
         wording is NOT contract — never match on it. `code` is the stable
         machine slug and is present only where a route sets one
-        (rate_limited, weak_password, invalid_username, invalid_email,
+        (rate_limited, password_too_short, password_too_long,
+        password_contains_username, password_contains_email,
+        password_too_common, invalid_username, invalid_email,
         invite_invalid, invite_exhausted, invite_expired, unknown_section,
         bad_filename, invalid_credentials, friend_request_cooldown,
         file_too_large, database_busy); older error paths still answer with

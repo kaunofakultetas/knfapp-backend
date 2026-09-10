@@ -110,7 +110,7 @@ class ChangePasswordTests(TestCase):
 
     def test_the_new_password_passes_the_register_policy(self):
         response = self._change(PASSWORD, "123456")
-        self.assertEqual((response.status_code, response.json()["code"]), (400, "weak_password"))
+        self.assertEqual((response.status_code, response.json()["code"]), (400, "password_too_common"))
 
     def test_failures_only_fill_the_budget(self):
         for _ in range(ratelimit.MAX_ATTEMPTS):

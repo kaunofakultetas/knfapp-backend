@@ -58,8 +58,8 @@ class AuthFlowTests(TestCase):
         cases = [
             (_register_body(username="x"), "invalid_username"),
             (_register_body(email="ne-pastas"), "invalid_email"),
-            (_register_body(password="12345"), "weak_password"),
-            (_register_body(password="Jonas-slaptas"), "weak_password"),   # contains the username
+            (_register_body(password="12345"), "password_too_short"),
+            (_register_body(password="Jonas-slaptas"), "password_contains_username"),
         ]
         for body, slug in cases:
             response = self.client.post("/api/auth/register", data=body, content_type="application/json")

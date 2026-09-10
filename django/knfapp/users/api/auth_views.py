@@ -179,9 +179,12 @@ def validate_code(request):
 # IntegrityError answering the same 409 for the race.
 #
 # Error bodies carry the stable machine `code` next to the
-# English prose: rate_limited, weak_password,
-# invalid_username, invalid_email, invite_invalid,
-# invite_exhausted, invite_expired, username_taken.
+# English prose: rate_limited, invalid_username,
+# invalid_email, invite_invalid, invite_exhausted,
+# invite_expired, username_taken, and the per-reason
+# password codes from validate_new_password
+# (password_too_short/_too_long/_contains_username/
+# _contains_email/_too_common).
 #
 # Used by:
 #   - services/api/auth.ts — registerApi
@@ -224,7 +227,8 @@ def register(request):
 
     password_error = validate_new_password(data["password"], username, email)
     if password_error:
-        return json_error(password_error, 400, code="weak_password")
+        slug, prose = password_error
+        return json_error(prose, 400, code=slug)
 
     display_name = data["display_name"].strip()
     if not display_name:
@@ -737,7 +741,8 @@ def change_password(request):
 
     password_error = validate_new_password(new_password, request.user.get("username"), request.user.get("email"))
     if password_error:
-        return json_error(password_error, 400, code="weak_password")
+        slug, prose = password_error
+        return json_error(prose, 400, code=slug)
 
 
     # STEP 3: verify against a fresh hash read, rewrite, and drop

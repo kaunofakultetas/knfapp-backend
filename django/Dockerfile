@@ -18,7 +18,7 @@ WORKDIR /app
 # Django + configuration + the postgres driver (the engine
 # is a DATABASE_URL choice — the image carries both)
 RUN pip install --no-cache-dir                  \
-    django==5.2.15                              \
+    django==5.2.17                              \
     django-environ==0.13.0                      \
     "psycopg[binary]==3.3.5"
 

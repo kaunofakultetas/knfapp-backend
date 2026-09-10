@@ -1,33 +1,7 @@
-############################################################
-#  [*] Caddyfile — the knfapp public ingress (knfapp-caddy)
-#
-#  One :80 site behind the hosting proxy that terminates TLS.
-#  Everything the outside world reaches goes through here:
-#
-#    /api/*        → knfapp-backend:8000   (Flask REST)
-#    /socket.io/*  → knfapp-backend:8000   (polling chat)
-#    /swagger*     → knfapp-swagger:8080   (published contract)
-#    /dbgate/*     → knfapp-dbgate:3000    (admin DB console)
-#    /adminpanel/* → knfapp-vite:80        (admin web panel)
-#    everything    → knfapp-mobile:8081    (Expo web app)
-#
-#  Trust model — X-Forwarded-For is NOT echoed from the client
-#  any more. Caddy appends the real peer address itself, so the
-#  last hop Flask's ProxyFix(x_for=1) reads is trustworthy and
-#  the auth rate-limit buckets cannot be poisoned with a
-#  spoofed header. X-Forwarded-Prefix is stripped on both
-#  backend hops: nothing here sets it and ProxyFix must not
-#  trust a client-supplied one.
-############################################################
-
 :80 {
-    # Every upstream benefits: JSON list payloads, socket.io
-    # polling frames and the swagger bundle all cross the wire
-    # compressed
     encode zstd gzip
 
     route {
-
 
         # Uploads: the one route that may carry a video (50 MB
         # + the multipart envelope — Flask's MAX_CONTENT_LENGTH)
@@ -35,7 +9,7 @@
             request_body {
                 max_size 52MB
             }
-            reverse_proxy knfapp-backend:8000 {
+            reverse_proxy knfapp-django:8000 {
                 header_up -X-Forwarded-Prefix
             }
         }
@@ -49,7 +23,7 @@
             request_body {
                 max_size 6MB
             }
-            reverse_proxy knfapp-backend:8000 {
+            reverse_proxy knfapp-django:8000 {
                 header_up -X-Forwarded-Prefix
             }
         }
@@ -58,7 +32,7 @@
         # Socket.IO realtime chat (same Flask backend; Caddy
         # passes WebSocket upgrades through automatically)
         handle /socket.io/* {
-            reverse_proxy knfapp-backend:8000 {
+            reverse_proxy knfapp-django:8000 {
                 header_up -X-Forwarded-Prefix
             }
         }
