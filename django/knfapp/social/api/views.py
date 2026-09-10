@@ -1024,10 +1024,13 @@ def block_user(request):
     Friendship.objects.filter(
         models.Q(user_id=my_id, friend_id=target_id) | models.Q(user_id=target_id, friend_id=my_id),
     ).delete()
-    FriendRequest.objects.filter(status="pending").filter(
-        models.Q(from_user_id=my_id, to_user_id=target_id)
-        | models.Q(from_user_id=target_id, to_user_id=my_id),
-    ).delete()
+    # One delete per direction, NOT one OR'd delete: SQLite's
+    # planner answers "internal query planner error" when an
+    # OR'd DELETE meets the pending partial unique index (the
+    # test suite's engine — see runTests.sh); two indexed
+    # deletes are the same rows on both engines
+    FriendRequest.objects.filter(status="pending", from_user_id=my_id, to_user_id=target_id).delete()
+    FriendRequest.objects.filter(status="pending", from_user_id=target_id, to_user_id=my_id).delete()
 
     return json_response({"status": "blocked"})
 

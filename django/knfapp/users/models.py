@@ -72,6 +72,13 @@ class User(models.Model):
     study_program = models.TextField(null=True, blank=True)
     active = models.BooleanField(default=True)
     chat_push_preview = models.BooleanField(default=True)
+    # Stamped by the chat socket on connect and disconnect —
+    # what "matytas (-a) prieš X" in a direct chat's header
+    # reads. NULL means the account never held a socket (or
+    # predates the column); revealed ONLY through the
+    # relationship-gated online-status route, never serialized
+    # with the public profile
+    last_active_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField()
     updated_at = models.DateTimeField()
 

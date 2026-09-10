@@ -2183,8 +2183,11 @@ paths:
         on this server. Presence is revealed ONLY for users who share at least one
         conversation with the caller — everybody else reads false, exactly like a
         genuinely offline user, so the route is no source of presence about
-        strangers. The list is silently truncated to the first 200 ids (no error)
-        and non-string elements are dropped from both the lookup and the answer.
+        strangers. Beside the boolean, lastSeen carries the user's last socket
+        activity (users.last_active_at, ISO 8601) under the SAME gate — an
+        ungated or never-connected user reads null. The list is silently
+        truncated to the first 200 ids (no error) and non-string elements are
+        dropped from both the lookup and the answer.
       security:
         - bearerAuth: []
       requestBody:
@@ -2202,7 +2205,7 @@ paths:
                     type: string
       responses:
         "200":
-          description: Presence map keyed by the requested user ids
+          description: Presence and last-seen maps keyed by the requested user ids
           content:
             application/json:
               schema:
@@ -2212,6 +2215,12 @@ paths:
                     type: object
                     additionalProperties:
                       type: boolean
+                  lastSeen:
+                    type: object
+                    description: ISO 8601 last socket activity, null when gated or never seen
+                    additionalProperties:
+                      type: string
+                      nullable: true
         "400":
           description: Body is not a JSON object, or userIds is missing/not an array
 

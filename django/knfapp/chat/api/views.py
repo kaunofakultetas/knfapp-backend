@@ -2764,13 +2764,16 @@ def search_messages(request, conv_id):
 # online_status / search_users
 ############################################################
 #
-# online_status: body {userIds[]} → {online: {id: bool}} —
-# whether each id currently has a socket in THIS process,
-# but ONLY for users who share at least one conversation
-# with the caller. Everyone else answers false, exactly like
-# a genuinely offline user, so the route is not a free
-# live-presence oracle over arbitrary ids. Silently
-# truncated to the first 200 ids; non-string ids dropped.
+# online_status: body {userIds[]} →
+# {online: {id: bool}, lastSeen: {id: iso|null}} — whether
+# each id currently has a socket in THIS process and when
+# they last held one (users.last_active_at, stamped on both
+# socket edges), but ONLY for users who share at least one
+# conversation with the caller. Everyone else answers
+# false/null, exactly like a genuinely offline user nobody
+# ever saw, so the route is not a free presence-or-history
+# oracle over arbitrary ids. Silently truncated to the
+# first 200 ids; non-string ids dropped.
 #
 # search_users: ?q substring match on username OR
 # display_name (LIKE: ASCII-only case folding; escaped so
@@ -2835,8 +2838,19 @@ def online_status(request):
     except Exception:
         online_set = set()
 
+
+    # STEP 4: last-seen rides the SAME gate — an ungated id
+    # answers null exactly like an account that never held a
+    # socket, so history leaks nothing presence would not
+    # =====================================================
+    stamps = dict(User.objects.filter(id__in=shared).values_list("id", "last_active_at")) if shared else {}
+
     result = {uid: (uid in shared and uid in online_set) for uid in user_ids}
-    return json_response({"online": result})
+    last_seen = {
+        uid: stamps[uid].isoformat() if uid in shared and stamps.get(uid) else None
+        for uid in user_ids
+    }
+    return json_response({"online": result, "lastSeen": last_seen})
 
 
 @transaction.non_atomic_requests

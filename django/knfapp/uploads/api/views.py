@@ -21,6 +21,7 @@ import io
 import logging
 import mimetypes
 import os
+import re
 import uuid
 
 
@@ -254,10 +255,42 @@ def delete_file(request, filename):
 # photos share this route, and a shared proxy cache has no
 # business holding them.
 #
+# Byte ranges are honoured (single range only): the mobile
+# video player refuses a file it cannot seek — iOS AVPlayer
+# probes with Range and needs a 206 back, which the old
+# Flask send_file gave it and FileResponse alone does not.
+# A malformed Range falls back to the full 200 per spec; an
+# unsatisfiable one answers 416.
+#
 # Used by:
 #   - services/api/client.ts getUploadUrl — every rendered
-#     avatar and post/chat image
+#     avatar and post/chat image, and the chat video/audio
+#     players (the Range consumers)
 ############################################################
+
+# "bytes=start-end", either side optional but not both
+_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+# A file opened at an offset that stops read() at the range
+# end — what FileResponse streams for a 206
+class _RangeReader:
+    def __init__(self, handle, remaining):
+        self._handle = handle
+        self._remaining = remaining
+
+    def read(self, size=-1):
+        if self._remaining <= 0:
+            return b""
+        if size is None or size < 0 or size > self._remaining:
+            size = self._remaining
+        chunk = self._handle.read(size)
+        self._remaining -= len(chunk)
+        return chunk
+
+    def close(self):
+        self._handle.close()
+
 
 def serve_file(request, filename):
     safe_name = safe_upload_name(filename)
@@ -274,6 +307,41 @@ def serve_file(request, filename):
         return json_error("File not found", 404)
 
     content_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+    size = os.path.getsize(file_path)
+
+
+    # STEP 1: a valid single range answers 206 with just that
+    # window; suffix form ("bytes=-N") means the last N bytes
+    # =======================================================
+    match = _RANGE_RE.match(request.headers.get("Range", "").strip())
+    if match and (match.group(1) or match.group(2)) and size > 0:
+        if match.group(1):
+            start = int(match.group(1))
+            end = min(int(match.group(2)), size - 1) if match.group(2) else size - 1
+        else:
+            start = max(size - int(match.group(2)), 0)
+            end = size - 1
+
+        if start >= size or start > end:
+            response = json_error("Range not satisfiable", 416)
+            response["Content-Range"] = f"bytes */{size}"
+            return response
+
+        handle = open(file_path, "rb")
+        handle.seek(start)
+        response = FileResponse(_RangeReader(handle, end - start + 1),
+                                content_type=content_type, status=206)
+        response["Content-Range"] = f"bytes {start}-{end}/{size}"
+        response["Content-Length"] = str(end - start + 1)
+        response["Accept-Ranges"] = "bytes"
+        response["Cache-Control"] = "private, max-age=86400"
+        return response
+
+
+    # STEP 2: no (or malformed) range — the whole file, with
+    # Accept-Ranges advertising that seeking works here
+    # ======================================================
     response = FileResponse(open(file_path, "rb"), content_type=content_type)
+    response["Accept-Ranges"] = "bytes"
     response["Cache-Control"] = "private, max-age=86400"
     return response

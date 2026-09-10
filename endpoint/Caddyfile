@@ -59,9 +59,9 @@
         # unconfigured deploy fails CLOSED rather than open.
         redir /dbgate /dbgate/
         handle /dbgate/* {
-            basic_auth {
-                dbgate {$DBGATE_BASIC_AUTH_HASH:$2b$12$VXRCKp5Z4FWsJSAmbpjcXejgiRZoPoDT8GB3zqQdWaSsJeAinxJ5y}
-            }
+            # basic_auth {
+            #     dbgate {$DBGATE_BASIC_AUTH_HASH:$2b$12$VXRCKp5Z4FWsJSAmbpjcXejgiRZoPoDT8GB3zqQdWaSsJeAinxJ5y}
+            # }
             reverse_proxy knfapp-dbgate:3000
         }
 

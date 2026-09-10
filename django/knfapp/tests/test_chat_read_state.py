@@ -155,6 +155,94 @@ class PresenceTests(ReadStateTestCase):
         self.assertTrue(online[self.ona.id])
         self.assertFalse(online[stranger.id])
 
+    def test_an_offline_roommate_reads_false(self):
+        # The gate passing must not imply presence: ona shares
+        # the room but holds no socket. Without this case the
+        # stranger test alone conflates "gated" with "offline"
+        response = bearer(self.client.post, "/api/chat/online-status", self.tomas_token,
+                          data=json.dumps({"userIds": [self.ona.id]}),
+                          content_type="application/json")
+        self.assertFalse(json.loads(response.content)["online"][self.ona.id])
+
+    def test_disconnect_takes_one_socket_never_the_whole_user(self):
+        # Two devices, one closes: the user must stay online
+        # until the LAST sid leaves the table — asserted through
+        # the endpoint, with the REAL disconnect handler
+        handlers = {}
+
+        class _Sio:
+            def on(self, event, handler=None):
+                handlers[event] = handler
+
+            def enter_room(self, sid, room_name):
+                pass
+
+            def emit(self, event, payload=None, to=None, **kwargs):
+                pass
+
+        events.register_socket_events(_Sio())
+        self.addCleanup(events.reset_socket_state)
+        events._connected_users["sid-phone"] = self.ona.id
+        events._connected_users["sid-tab"] = self.ona.id
+
+        def ona_online():
+            response = bearer(self.client.post, "/api/chat/online-status", self.tomas_token,
+                              data=json.dumps({"userIds": [self.ona.id]}),
+                              content_type="application/json")
+            return json.loads(response.content)["online"][self.ona.id]
+
+        handlers["disconnect"]("sid-phone")
+        self.assertTrue(ona_online())
+        handlers["disconnect"]("sid-tab")
+        self.assertFalse(ona_online())
+        # A sid the table never held is a no-op, not an error
+        handlers["disconnect"]("sid-nezinomas")
+        # The disconnect edge stamped the last-seen column
+        self.ona.refresh_from_db()
+        self.assertIsNotNone(self.ona.last_active_at)
+
+    def test_last_seen_rides_the_same_gate(self):
+        # ona (roommate) carries a stamp, the stranger carries
+        # one too — only the roommate's is revealed; a stamped
+        # stranger reads null exactly like a never-seen account
+        stranger = create_user(username="svetimas")
+        from knfapp.common.timestamps import utc_now
+        from knfapp.users.models import User
+        stamp = utc_now()
+        User.objects.filter(id__in=[self.ona.id, stranger.id]).update(last_active_at=stamp)
+
+        response = bearer(self.client.post, "/api/chat/online-status", self.tomas_token,
+                          data=json.dumps({"userIds": [self.ona.id, stranger.id]}),
+                          content_type="application/json")
+        body = json.loads(response.content)
+        self.assertEqual(body["lastSeen"][self.ona.id], stamp.isoformat())
+        self.assertIsNone(body["lastSeen"][stranger.id])
+
+    def test_a_never_connected_roommate_reads_null_last_seen(self):
+        response = bearer(self.client.post, "/api/chat/online-status", self.tomas_token,
+                          data=json.dumps({"userIds": [self.ona.id]}),
+                          content_type="application/json")
+        self.assertIsNone(json.loads(response.content)["lastSeen"][self.ona.id])
+
+    def test_input_hygiene_drops_junk_and_truncates_at_200(self):
+        # A non-array body is the one shape that earns a 400
+        response = bearer(self.client.post, "/api/chat/online-status", self.tomas_token,
+                          data=json.dumps({"userIds": "ne-sarasas"}),
+                          content_type="application/json")
+        self.assertEqual(response.status_code, 400)
+
+        # Non-string ids are dropped FIRST, then the list is cut
+        # to 200 — ona rides in position 201 and must fall off,
+        # and the strangers that remain all read false
+        ids = [7, None] + [f"id-{i}" for i in range(200)] + [self.ona.id]
+        response = bearer(self.client.post, "/api/chat/online-status", self.tomas_token,
+                          data=json.dumps({"userIds": ids}),
+                          content_type="application/json")
+        online = json.loads(response.content)["online"]
+        self.assertEqual(len(online), 200)
+        self.assertNotIn(self.ona.id, online)
+        self.assertFalse(any(online.values()))
+
 
 class PeoplePickerTests(ReadStateTestCase):
 

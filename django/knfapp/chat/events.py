@@ -206,6 +206,38 @@ def reset_socket_state():
 
 
 ############################################################
+# _stamp_last_active
+############################################################
+#
+# users.last_active_at ← now, best effort: the "matytas (-a)
+# prieš X" a direct chat's header shows through the gated
+# online-status route. Called on BOTH socket edges — connect
+# and disconnect — so the stored stamp is never older than
+# the start of the user's latest online stretch even if the
+# process dies mid-session. Presence plumbing must never
+# take a socket down, so a database hiccup logs and yields.
+#
+# Used by:
+#   - register_socket_events (below) — handle_connect and
+#     handle_disconnect
+############################################################
+
+def _stamp_last_active(user_id):
+    try:
+        from knfapp.common.timestamps import utc_now
+        from knfapp.users.models import User
+        User.objects.filter(id=user_id).update(last_active_at=utc_now())
+    except Exception:
+        logger.exception("Could not stamp last_active_at for user=%s", user_id)
+
+
+
+
+
+
+
+
+############################################################
 # _authenticate_socket
 ############################################################
 #
@@ -409,6 +441,7 @@ def register_socket_events(sio):
 
             _connected_users[sid] = user_id
             _connected_names[sid] = user["display_name"] or "Unknown"
+            _stamp_last_active(user_id)
 
             logger.info("Socket connected: user=%s sid=%s rooms=%d", user_id, sid, len(room_ids))
             sio.emit("connected", {"userId": user_id}, to=sid)
@@ -436,12 +469,18 @@ def register_socket_events(sio):
     # python-socketio clears them for a closed socket itself.
     # The user stays "online" for /online-status and the push
     # skip as long as ANY other sid of theirs is in the table.
+    # last_active_at is stamped HERE (and on connect): the two
+    # socket edges bracket every online stretch, and a crashed
+    # client's missing disconnect still fires through the
+    # engine's ping timeout.
     ############################################################
 
     def handle_disconnect(sid, reason=None):
         user_id = _connected_users.pop(sid, None)
         _connected_names.pop(sid, None)
         if user_id:
+            _stamp_last_active(user_id)
+            close_old_connections()
             logger.info("Socket disconnected: user=%s sid=%s reason=%s", user_id, sid, reason)
 
     sio.on("disconnect", handler=handle_disconnect)
