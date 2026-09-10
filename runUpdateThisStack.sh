@@ -24,7 +24,23 @@ fi
 
 
 
-# STEP 3: Run the stack
+# STEP 3: Generate DBGate credentials if they don't exist
+# =======================================================
+if [ ! -f .env ] || ! grep -q "^DBGATE_PASSWORD=" .env; then
+    echo "Generating DBGATE credentials..."
+    DBGATE_PASSWORD="$(openssl rand -hex 32)"
+    DBGATE_AUTH_HEADER="$(echo -n "dbgate:$DBGATE_PASSWORD" | base64 -w 0)"
+
+    # Only add newline if file doesn't end with one
+    [ -f .env ] && [ -n "$(tail -c1 .env 2>/dev/null)" ] && echo "" >> .env
+    echo "DBGATE_PASSWORD=$DBGATE_PASSWORD" >> .env
+    echo "DBGATE_AUTH_HEADER=$DBGATE_AUTH_HEADER" >> .env
+    echo "DBGATE credentials added to .env"
+fi
+
+
+
+# STEP 4: Run the stack
 # =====================
 sudo docker compose down
 sudo docker compose up -d --build
