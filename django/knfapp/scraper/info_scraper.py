@@ -67,13 +67,18 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://knf.vu.lt"
 
-# Only the five pages something actually reads
+# Only the five pages something actually reads. Paths follow
+# the 2026 site restructure (fakultetas/* → apie-fakulteta/*,
+# studijos/* → stojantiesiems/*); the old contacts page is
+# gone, the dekanatas page is its nearest successor — note the
+# new CMS cloaks e-mail addresses, so contacts may parse
+# names and phones only.
 INFO_PAGES = [
     {"url": f"{BASE_URL}", "type": "main"},
-    {"url": f"{BASE_URL}/fakultetas/struktura", "type": "structure"},
-    {"url": f"{BASE_URL}/fakultetas/kontaktai", "type": "contacts"},
-    {"url": f"{BASE_URL}/studijos/bakalauro-studijos", "type": "bachelor"},
-    {"url": f"{BASE_URL}/studijos/magistranturos-studijos", "type": "master"},
+    {"url": f"{BASE_URL}/apie-fakulteta/struktura", "type": "structure"},
+    {"url": f"{BASE_URL}/apie-fakulteta/struktura/dekanatas", "type": "contacts"},
+    {"url": f"{BASE_URL}/stojantiesiems/bakalauro-studijos", "type": "bachelor"},
+    {"url": f"{BASE_URL}/stojantiesiems/magistranturos-studijos", "type": "master"},
 ]
 
 # The floor under general_contact: a scraped field wins over
@@ -575,7 +580,11 @@ def _scrape_programs(bachelor_soup: BeautifulSoup | None,
         for link in content_el.find_all("a", href=True):
             href = link["href"]
             text = link.get_text(strip=True)
-            if ("/studij" in href or "/program" in href) and len(text) > 8:
+            # "-studijos/<slug>" is the 2026 site's programme URL
+            # shape (/stojantiesiems/bakalauro-studijos/<slug>);
+            # the slash-prefixed forms are the pre-restructure ones
+            if ("/studij" in href or "/program" in href or re.search(r"-studijos/.+", href)) \
+                    and len(text) > 8:
                 name = text.strip()
                 if name.lower() not in seen_names and "daugiau" not in name.lower():
                     seen_names.add(name.lower())

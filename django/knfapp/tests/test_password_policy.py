@@ -38,4 +38,8 @@ class PasswordPolicyTests(SimpleTestCase):
             if expected is None:
                 self.assertIsNone(error, password)
             else:
-                self.assertIn(expected, error or "", password)
+                # A rejection is a (slug, prose) pair — the slug is
+                # the app's translation key, the prose the fragment
+                slug, prose = error
+                self.assertTrue(slug.startswith("password_"), password)
+                self.assertIn(expected, prose, password)

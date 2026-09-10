@@ -54,13 +54,16 @@ from knfapp.scraper.common import (
     MAX_SUMMARY_LENGTH,
     MAX_TITLE_LENGTH,
     VU_HOSTS,
+    cap_markdown,
     check_yield_drop,
     close_run,
     deadline_passed,
+    element_to_markdown,
     fetch,
     host_allowed,
     load_deleted_urls,
     mark_run_failed,
+    markdown_to_plain,
     normalise_url,
     open_run,
     parse_source_datetime,
@@ -584,9 +587,11 @@ def _fetch_vu_article(url):
 
 
     # STEP 3: content — the first region left with text once its
-    # chrome is decompose()d out of the SHARED soup, then the
-    # teaser. An empty <article> in front of a populated <main>
-    # is the same bs4 truthiness trap as the title ladder
+    # chrome is decompose()d out of the SHARED soup, rendered as
+    # the light markdown the app displays (paragraphs, headings,
+    # lists, bold, links), then the teaser. An empty <article>
+    # in front of a populated <main> is the same bs4 truthiness
+    # trap as the title ladder
     # ============================================================
     content = ""
     for selector in ["article", "main article", "[class*='content']", "main"]:
@@ -597,12 +602,13 @@ def _fetch_vu_article(url):
         for tag in el.find_all(["script", "style", "nav", "header", "footer", "aside"]):
             tag.decompose()
 
-        text = el.get_text(separator="\n", strip=True)
+        text = element_to_markdown(el, final_url)
         if text:
             content = text
             break
 
-    summary = _article_summary(soup, content, title)
+    # The summary is prose — markers stripped before the cut
+    summary = _article_summary(soup, markdown_to_plain(content), title)
 
 
     # STEP 4: image — og:image wins (the reliable one on a
@@ -653,7 +659,7 @@ def _fetch_vu_article(url):
     return {
         "url": normalise_url(final_url),
         "title": title[:MAX_TITLE_LENGTH],
-        "content": content[:MAX_CONTENT_LENGTH],
+        "content": cap_markdown(content, MAX_CONTENT_LENGTH),
         "summary": summary[:MAX_SUMMARY_LENGTH],
         "image_url": image_url,
         "date": published_at,

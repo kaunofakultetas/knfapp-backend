@@ -154,3 +154,52 @@ class RetakeTests(SimpleTestCase):
         self.assertTrue(schedule_scraper._labelled_retake(
             {"title": "Programavimas (PERLAIKYMAS)"}))
         self.assertFalse(schedule_scraper._labelled_retake({"title": "Programavimas"}))
+
+
+
+
+
+
+class ArticleMarkdownTests(SimpleTestCase):
+
+    def _markdown(self, html):
+        from bs4 import BeautifulSoup
+        el = BeautifulSoup(html, "lxml").select_one("div")
+        return common.element_to_markdown(el, "https://knf.vu.lt/aktualijos/x")
+
+    def test_paragraphs_survive_and_inline_tags_stop_chopping_sentences(self):
+        md = self._markdown(
+            "<div><p>Stojantieji į <a href='/studijos/mag'>magistrantūros programas</a> "
+            "vis dar gali .</p><p>Antra pastraipa.</p></div>")
+        self.assertEqual(md.split("\n\n"), [
+            "Stojantieji į [magistrantūros programas](https://knf.vu.lt/studijos/mag) vis dar gali.",
+            "Antra pastraipa.",
+        ])
+
+    def test_headings_lists_bold_and_loose_br_text_become_blocks(self):
+        md = self._markdown(
+            "<div><h2>Antraštė</h2><p><b>Svarbu</b>: taip.</p>"
+            "<ul><li>Vienas</li><li>Du</li></ul>"
+            "Palaida eilutė<br>ir dar viena<script>x()</script></div>")
+        self.assertEqual(md.split("\n\n"), [
+            "## Antraštė",
+            "**Svarbu**: taip.",
+            "- Vienas\n- Du",
+            "Palaida eilutė",
+            "ir dar viena",
+        ])
+
+    def test_a_link_off_https_or_with_nested_markup_stays_prose(self):
+        md = self._markdown(
+            "<div><p><a href='javascript:alert(1)'>blogas</a> ir "
+            "<a href='/geras'>geras <b>storas</b></a></p></div>")
+        self.assertEqual(md, "blogas ir [geras storas](https://knf.vu.lt/geras)")
+
+    def test_markdown_to_plain_leaves_prose_only(self):
+        plain = common.markdown_to_plain("## A\n\n[t](https://x.lt) ir **b** ir *k*\n\n- vienas")
+        self.assertEqual(plain, "A\n\nt ir b ir k\n\nvienas")
+
+    def test_cap_markdown_cuts_at_a_paragraph_boundary(self):
+        text = "Pirma pastraipa.\n\nAntra pastraipa."
+        self.assertEqual(common.cap_markdown(text, len(text) - 1), "Pirma pastraipa.")
+        self.assertEqual(common.cap_markdown(text, len(text)), text)

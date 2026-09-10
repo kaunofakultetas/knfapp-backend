@@ -62,11 +62,14 @@
 
 
 import logging
+import re
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+
+from bs4 import NavigableString
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -865,6 +868,268 @@ def validate_image_url(page_url: str, src: str):
         return None
 
     return resolved
+
+
+
+
+
+
+
+
+############################################################
+# _tidy_inline
+############################################################
+#
+# One inline run made presentable: whitespace runs collapsed
+# to single spaces (the walk joins inline elements with
+# spaces, never newlines — that is the whole point), then no
+# space left before closing punctuation or after an opening
+# bracket, so "programas ." from an inline <a> boundary
+# reads "programas.".
+#
+# Used by:
+#   - _inline_markdown, _emit_blocks (below)
+############################################################
+
+def _tidy_inline(text: str) -> str:
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+([,.;:!?)\]])", r"\1", text)
+    text = re.sub(r"([(\[])\s+", r"\1", text)
+    return text
+
+
+
+
+
+
+
+############################################################
+# _inline_markdown
+############################################################
+#
+# One node rendered as inline markdown text: plain strings
+# pass through, <strong>/<b> become **bold**, <em>/<i>
+# *italic*, and <a href> becomes [text](absolute url) — the
+# href resolved against the article page, kept only when it
+# lands on http(s) and under the URL length cap; a refused
+# link keeps its text and loses the link. <br> is a plain
+# space here — a break INSIDE a paragraph is not a
+# paragraph. Square brackets are dropped from link text so a
+# page cannot fake nested markdown.
+#
+# Used by:
+#   - _emit_blocks (below) — per block and for loose inline
+#     runs
+############################################################
+
+def _inline_markdown(node, base_url: str) -> str:
+    if isinstance(node, NavigableString):
+        return str(node)
+
+    name = getattr(node, "name", None)
+    if name in ("script", "style"):
+        return ""
+
+    inner = "".join(_inline_markdown(child, base_url) for child in node.children)
+
+    if name in ("strong", "b"):
+        inner = _tidy_inline(inner).strip()
+        return f" **{inner}** " if inner else ""
+
+    if name in ("em", "i"):
+        inner = _tidy_inline(inner).strip()
+        return f" *{inner}* " if inner else ""
+
+    if name == "a":
+        # Link text is PLAIN — nested bold/italic inside an <a>
+        # must not leave ** markers inside the [text](url) form
+        inner = _tidy_inline(node.get_text(" ", strip=True)).strip().replace("[", "").replace("]", "")
+        target = urljoin(base_url, (node.get("href") or "").strip())
+        if inner and target.startswith(("http://", "https://")) and len(target) <= MAX_IMAGE_URL_LENGTH:
+            return f" [{inner}]({target}) "
+        return f" {inner} " if inner else ""
+
+    if name == "br":
+        return " "
+
+    return inner
+
+
+
+
+
+
+
+############################################################
+# _emit_blocks
+############################################################
+#
+# The block walk behind element_to_markdown: children are
+# consumed in document order, block tags each become one
+# markdown block, and everything between them (text nodes,
+# inline tags) accumulates into a pending run that flushes
+# as a paragraph at the next block boundary — old Joomla
+# bodies write text straight into the container with <br>
+# separators, and this is what keeps those readable. A bare
+# <br> at this level IS a paragraph break (unlike inside a
+# paragraph); chrome tags are skipped even when the caller
+# already decompose()d — the fallback selectors are broad.
+#
+# Used by:
+#   - element_to_markdown (below) — and itself, recursing
+#     into container tags
+############################################################
+
+_SKIP_TAGS = frozenset({"script", "style", "nav", "header", "footer", "aside", "iframe", "form", "button"})
+_CONTAINER_TAGS = frozenset({"div", "section", "article", "main", "figure", "figcaption", "table", "tbody", "thead", "tr"})
+
+def _emit_blocks(el, base_url: str, blocks: list) -> None:
+    pending = []
+
+    def flush():
+        text = _tidy_inline("".join(pending)).strip()
+        pending.clear()
+        if text:
+            blocks.append(text)
+
+    for child in el.children:
+        name = getattr(child, "name", None)
+
+        if name in _SKIP_TAGS:
+            continue
+
+        if name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            flush()
+            text = _tidy_inline(_inline_markdown(child, base_url)).strip()
+            if text:
+                blocks.append(("## " if name in ("h1", "h2") else "### ") + text)
+
+        elif name in ("p", "blockquote"):
+            flush()
+            text = _tidy_inline(_inline_markdown(child, base_url)).strip()
+            if text:
+                blocks.append(text)
+
+        elif name in ("ul", "ol"):
+            flush()
+            items = []
+            for li in child.find_all("li", recursive=False):
+                text = _tidy_inline(_inline_markdown(li, base_url)).strip()
+                if text:
+                    items.append(f"- {text}")
+            if items:
+                blocks.append("\n".join(items))
+
+        elif name == "br":
+            flush()
+
+        elif name in _CONTAINER_TAGS:
+            flush()
+            _emit_blocks(child, base_url, blocks)
+
+        else:
+            pending.append(_inline_markdown(child, base_url))
+
+    flush()
+
+
+
+
+
+
+
+############################################################
+# element_to_markdown
+############################################################
+#
+#   element_to_markdown(el, base_url) — article body as a
+#                                       light markdown string
+#
+# The block-aware replacement for get_text("\n"): that call
+# put a newline at EVERY element boundary, so an inline link
+# chopped its sentence mid-thought and a real paragraph
+# break was indistinguishable from an accidental one. This
+# walks the block structure instead and emits the small
+# markdown subset the mobile app renders (NewsBody):
+# paragraphs separated by ONE blank line, "## " / "### "
+# headings, "- " list lines, **bold**, *italic* and
+# [text](url) links. The caller decides which element to
+# hand over and has usually decompose()d its chrome first.
+#
+# Used by:
+#   - knf_scraper._fetch_article — both body paths
+#   - vu_scraper._fetch_article — the body ladder
+############################################################
+
+def element_to_markdown(el, base_url: str) -> str:
+    blocks = []
+    _emit_blocks(el, base_url, blocks)
+    return "\n\n".join(blocks)
+
+
+
+
+
+
+
+############################################################
+# markdown_to_plain
+############################################################
+#
+#   markdown_to_plain(text) — the same body with every
+#                             markdown marker removed
+#
+# Links keep their text and lose the URL, bold/italic keep
+# their text, heading and list markers drop. This is what
+# summaries are cut from — a summary is prose, and 200
+# chars of prose with a raw "[Vilnius](https://…)" in the
+# middle is not.
+#
+# Used by:
+#   - knf_scraper._fetch_article — the summary cut
+#   - vu_scraper._fetch_article — the _article_summary input
+############################################################
+
+def markdown_to_plain(text: str) -> str:
+    text = re.sub(r"\[([^\]]*)\]\([^)\s]*\)", r"\1", text)
+    text = re.sub(r"\*{1,2}([^*\n]+)\*{1,2}", r"\1", text)
+    text = re.sub(r"^#{2,3} ", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^- ", "", text, flags=re.MULTILINE)
+    return text
+
+
+
+
+
+
+
+############################################################
+# cap_markdown
+############################################################
+#
+#   cap_markdown(text, limit) — the body under the storage
+#                               cap without a torn tail
+#
+# A plain [:limit] slice can cut through the middle of a
+# link and leave "[Vilniaus universi" as the article's last
+# words. Over-limit bodies are cut back to the last
+# paragraph boundary inside the limit instead; a single
+# paragraph longer than the whole limit (no boundary to cut
+# at) falls back to the last word boundary.
+#
+# Used by:
+#   - knf_scraper._fetch_article, vu_scraper._fetch_article
+#     — the stored content field
+############################################################
+
+def cap_markdown(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+
+    cut = text[:limit]
+    if "\n\n" in cut:
+        return cut.rsplit("\n\n", 1)[0]
+    return cut.rsplit(" ", 1)[0]
 
 
 

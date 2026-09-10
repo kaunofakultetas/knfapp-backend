@@ -65,9 +65,11 @@ from knfapp.scraper.common import (
     MAX_CONTENT_LENGTH,
     MAX_SUMMARY_LENGTH,
     MAX_TITLE_LENGTH,
+    cap_markdown,
     check_yield_drop,
     close_run,
     deadline_passed,
+    element_to_markdown,
     fetch,
     host_allowed,
     load_deleted_urls,
@@ -75,6 +77,7 @@ from knfapp.scraper.common import (
     normalise_url,
     open_run,
     parse_source_datetime,
+    markdown_to_plain,
     prune_scraper_runs,
     push_allowed,
     run_deadline,
@@ -471,11 +474,13 @@ def _listing_links(soup):
 #   title   — og:title minus the "VU Kauno fakultetas - "
 #             site prefix (hyphen and en-dash variants),
 #             else the first <h1> that is not a section name
-#   content — text of .article-content (or two older
-#             selectors) with script/style/nav/header/footer
-#             removed; the broad fallback drops leading nav
-#             crumbs by skipping to the first line over 30
-#             characters
+#   content — .article-content (or two older selectors)
+#             with script/style/nav/header/footer removed,
+#             rendered as light markdown (paragraphs,
+#             headings, lists, bold, links — see
+#             common.element_to_markdown); the broad
+#             fallback drops leading nav crumbs by skipping
+#             to the first block over 30 characters
 #   summary — first 200 chars cut back to a word boundary
 #   image   — og:image, else the first <img> not looking
 #             like a logo/icon/banner/pixel; every candidate
@@ -531,9 +536,11 @@ def _fetch_article(url):
                 break
 
 
-    # STEP 3: content — the clean article body first; the broad
-    # fallback also has to shed leading navigation crumbs
-    # =========================================================
+    # STEP 3: content — the clean article body first, as the
+    # light markdown the app renders (paragraphs, headings,
+    # lists, bold, links); the broad fallback also has to shed
+    # leading navigation crumbs
+    # ========================================================
     content = ""
     for selector in [".article-content", ".item-page .article-body", ".item-content"]:
         el = soup.select_one(selector)
@@ -542,33 +549,35 @@ def _fetch_article(url):
             # author lookups below never see the tags removed here
             for tag in el.find_all(["script", "style", "nav", "header", "footer"]):
                 tag.decompose()
-            content = el.get_text(separator="\n", strip=True)
+            content = element_to_markdown(el, page_url)
             break
 
-    # STEP 3.1: broad selectors — skip to the first line over 30 chars
+    # STEP 3.1: broad selectors — skip to the first BLOCK whose
+    # prose runs over 30 chars
     if not content:
         for selector in [".item-page", "article", "#content .content"]:
             el = soup.select_one(selector)
             if el:
                 for tag in el.find_all(["script", "style", "nav", "header", "footer"]):
                     tag.decompose()
-                text = el.get_text(separator="\n", strip=True)
-                lines = text.split("\n")
-                # start stays 0 when no line qualifies — the whole
-                # text, crumbs included, is kept
+                blocks = element_to_markdown(el, page_url).split("\n\n")
+                # start stays 0 when no block qualifies — the whole
+                # body, crumbs included, is kept
                 start = 0
-                for i, line in enumerate(lines):
-                    if len(line.strip()) > 30 and line.strip().lower() not in ("aktualijos", "naujienos"):
+                for i, block in enumerate(blocks):
+                    prose = markdown_to_plain(block).strip()
+                    if len(prose) > 30 and prose.lower() not in ("aktualijos", "naujienos"):
                         start = i
                         break
-                content = "\n".join(lines[start:])
+                content = "\n\n".join(blocks[start:])
                 break
 
 
-    # STEP 4: summary — 200 chars cut back to the last space,
-    # or the whole content when it is short enough
-    # =======================================================
-    summary = content[:200].rsplit(" ", 1)[0] + "..." if len(content) > 200 else content
+    # STEP 4: summary — prose only (markers stripped), 200 chars
+    # cut back to the last space when longer
+    # ==========================================================
+    plain = " ".join(markdown_to_plain(content).split())
+    summary = plain[:200].rsplit(" ", 1)[0] + "..." if len(plain) > 200 else plain
 
 
     # STEP 5: image — og:image, else the first <img> that does
@@ -656,7 +665,7 @@ def _fetch_article(url):
     # link text to fall back on
     return {
         "title": title[:MAX_TITLE_LENGTH],
-        "content": content[:MAX_CONTENT_LENGTH],
+        "content": cap_markdown(content, MAX_CONTENT_LENGTH),
         "summary": summary[:MAX_SUMMARY_LENGTH],
         "image_url": image_url,
         "date": published_at,
