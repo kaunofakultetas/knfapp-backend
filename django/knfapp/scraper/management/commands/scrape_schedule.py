@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
-    help = "Scrape tvarkarasciai.vu.lt timetables into schedule_lessons"
+    help = "Scrape tvarkarasciai.vu.lt timetables into the dated schedule_events tables"
 
     def handle(self, *args, **options):
         try:

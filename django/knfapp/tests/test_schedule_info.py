@@ -11,25 +11,47 @@
 ############################################################
 
 
+import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 
 from django.test import Client, TestCase
 
 
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now, utc_now_iso
 from knfapp.info.models import FacultyInfo
-from knfapp.schedule.models import ScheduleLesson
+from knfapp.schedule.models import ScheduleEvent, ScheduleEventGroup, ScheduleGroup
 from .utils import create_user  # noqa: F401 — parity import for suite conventions
 
 
+def _monday_of(semester):
+    # A deterministic Monday INSIDE the labelled semester, so a
+    # fixture's (day, time, title) twins in different semesters
+    # never collide on the dated natural key
+    match = re.fullmatch(r"(\d{4})-([RP])", semester or "")
+    if match:
+        year, season = int(match.group(1)), match.group(2)
+        anchor = date(year, 9, 1) if season == "R" else date(year + 1, 2, 1)
+    else:
+        anchor = date(2020, 1, 1)
+    return anchor + timedelta(days=(7 - anchor.weekday()) % 7)
+
+
 def _lesson(semester, group="IS-1", day=0, time="09:00", title="Programavimas"):
-    return ScheduleLesson.objects.create(
+    # One dated event on the semester's fixture week, linked to
+    # its group — the shape the legacy fold and the filters read
+    stamp = utc_now()
+    event = ScheduleEvent.objects.create(
         id=str(uuid.uuid4()), title=title, teacher="J. Jonaitis", room="301",
-        time_start=time, time_end="10:30", day_of_week=day, group_name=group,
-        semester=semester, created_at=utc_now_iso(),
+        date=_monday_of(semester) + timedelta(days=day),
+        time_start=time, time_end="10:30",
+        semester=semester, last_seen_at=stamp, created_at=stamp,
     )
+    group_row, _ = ScheduleGroup.objects.get_or_create(
+        slug=f"slug-{group}", defaults={"group_name": group, "last_seen_at": stamp})
+    ScheduleEventGroup.objects.create(event=event, group=group_row, last_seen_at=stamp)
+    return event
 
 
 def _seed_semester(label, lessons=5, group="IS-1"):
@@ -47,8 +69,10 @@ class ScheduleTests(TestCase):
         _seed_semester("2025-R")
         _lesson("2026-P")   # a stray single row — below the threshold
 
+        # SEASONAL order: "2025-P" is spring of calendar 2026 and
+        # outranks "2025-R" (autumn 2025) though text sorts it lower
         served = {r["semester"] for r in self.client.get("/api/schedule").json()["lessons"]}
-        self.assertEqual(served, {"2025-R"})
+        self.assertEqual(served, {"2025-P"})
 
     def test_all_is_the_explicit_opt_out(self):
         _seed_semester("2025-P")
@@ -71,10 +95,11 @@ class ScheduleTests(TestCase):
         _lesson("2026-P", group="XX-9")   # stray — no picker entry
 
         body = self.client.get("/api/schedule/filters").json()
-        self.assertEqual(body["semesters"], ["2025-R", "2025-P"])
+        # Seasonal order — the label year's spring is the newer term
+        self.assertEqual(body["semesters"], ["2025-P", "2025-R"])
         self.assertEqual(body["semesterGroups"],
-                         [{"semester": "2025-R", "groups": ["IS-1"]},
-                          {"semester": "2025-P", "groups": ["VV-2"]}])
+                         [{"semester": "2025-P", "groups": ["VV-2"]},
+                          {"semester": "2025-R", "groups": ["IS-1"]}])
         self.assertNotIn("2026-P", body["semesters"])
 
     def test_the_public_etag_cycle(self):
@@ -86,6 +111,47 @@ class ScheduleTests(TestCase):
         _lesson("2025-R", title="Nauja paskaita")
         changed = self.client.get("/api/schedule", HTTP_IF_NONE_MATCH=first["ETag"])
         self.assertEqual(changed.status_code, 200)
+
+    def test_dated_events_come_back_with_their_real_dates(self):
+        monday = _monday_of("2025-R")
+        _lesson("2025-R", day=0)
+        _lesson("2025-R", day=2, title="Duomenų bazės")
+        # An IRREGULAR one-off — the whole point of the dated model
+        _lesson("2025-R", day=3, time="18:00", title="Kviestinė paskaita")
+
+        window = f"from={monday.isoformat()}&to={(monday + timedelta(days=6)).isoformat()}"
+        body = self.client.get(f"/api/schedule/events?group=IS-1&{window}").json()
+
+        self.assertEqual([(e["date"], e["title"], e["dayOfWeek"]) for e in body["events"]], [
+            (monday.isoformat(), "Programavimas", 0),
+            ((monday + timedelta(days=2)).isoformat(), "Duomenų bazės", 2),
+            ((monday + timedelta(days=3)).isoformat(), "Kviestinė paskaita", 3),
+        ])
+        # Outside the window: nothing — the range is the filter
+        empty = self.client.get(
+            f"/api/schedule/events?group=IS-1&from={(monday + timedelta(days=30)).isoformat()}"
+            f"&to={(monday + timedelta(days=36)).isoformat()}").json()
+        self.assertEqual(empty["events"], [])
+
+    def test_events_range_validation(self):
+        self.assertEqual(self.client.get("/api/schedule/events?from=2026-13-01").status_code, 400)
+        self.assertEqual(self.client.get("/api/schedule/events?from=garbage").status_code, 400)
+        self.assertEqual(
+            self.client.get("/api/schedule/events?from=2026-03-02&to=2026-03-01").status_code, 400)
+        self.assertEqual(
+            self.client.get("/api/schedule/events?from=2025-01-01&to=2026-01-01").status_code, 400)
+
+    def test_two_groups_sharing_one_event_answer_under_each(self):
+        event = _lesson("2025-R", group="IS-1")
+        stamp = utc_now()
+        other, _ = ScheduleGroup.objects.get_or_create(
+            slug="slug-VV-2", defaults={"group_name": "VV-2", "last_seen_at": stamp})
+        ScheduleEventGroup.objects.create(event=event, group=other, last_seen_at=stamp)
+
+        window = f"from={event.date.isoformat()}&to={event.date.isoformat()}"
+        for group, expected in (("IS-1", 1), ("VV-2", 1), ("", 2)):
+            body = self.client.get(f"/api/schedule/events?group={group}&{window}").json()
+            self.assertEqual(len(body["events"]), expected, group)
 
 
 def _overlay_row(section, data, lang="lt", scraped_at=None):

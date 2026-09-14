@@ -6,8 +6,10 @@
 #  refuses the overlap, a corpse past its budget does not),
 #  the reconcile that closes what a killed process left, the
 #  retention pass that keeps every source's newest row, the
-#  push-shape guards, the timetable reconciliation counting
-#  change before writing, and the admin routes' status
+#  push-shape guards, the dated timetable sync (confirm
+#  instead of reinsert, converge across group feeds, retire
+#  only what a healthy feed dropped, keep the past until
+#  retention), and the admin routes' status
 #  mapping with the stable error slug — the raw exception
 #  text stays out of HTTP bodies.
 ############################################################
@@ -15,7 +17,7 @@
 
 import json
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 
 from django.test import Client, TestCase
@@ -26,8 +28,14 @@ from knfapp.common.timestamps import utc_now_iso
 from knfapp.scraper import common
 from knfapp.scraper.api import views
 from knfapp.scraper.models import ScraperRun
-from knfapp.scraper.schedule_scraper import _insert_lessons, _purge_old_semesters, _reconcile_partition
-from knfapp.schedule.models import ScheduleLesson
+from knfapp.scraper.schedule_scraper import RETENTION_DAYS, _sync_schedule
+from knfapp.schedule.models import (
+    ScheduleEvent,
+    ScheduleEventGroup,
+    ScheduleEventTeacher,
+    ScheduleGroup,
+    ScheduleTeacher,
+)
 from knfapp.users import auth
 from .utils import bearer, create_user
 
@@ -98,40 +106,173 @@ class PushShapeTests(TestCase):
         self.assertFalse(common.push_allowed("knf.vu.lt", 3, run.id))
 
 
-class TimetableReconcileTests(TestCase):
+class TimetableSyncTests(TestCase):
+
+    GROUPS_OK = {"isks-1-kursas": {"display_name": "ISKS 1 kursas", "group_name": "ISKS-1"}}
 
     def _lesson(self, **overrides):
         lesson = {"title": "Programavimas", "teacher": "A. Petraitis", "room": "302",
-                  "time_start": "10:00", "time_end": "11:30", "day_of_week": 0,
-                  "group_name": "ISKS-1", "semester": "2026-R"}
+                  "lecture_type": "", "date": date.today() + timedelta(days=7),
+                  "time_start": "10:00", "time_end": "11:30",
+                  "group_name": "ISKS-1", "slug": "isks-1-kursas", "semester": "2026-R"}
         lesson.update(overrides)
         return lesson
 
-    def test_the_natural_index_dedups_reinserts(self):
-        self.assertEqual(_insert_lessons([self._lesson()]), 1)
-        self.assertEqual(_insert_lessons([self._lesson()]), 0)
-        # "" and None are DIFFERENT rows to a unique index — the
-        # scraper stores "" so a teacherless lesson dedups too
-        self.assertEqual(_insert_lessons([self._lesson(teacher="")]), 1)
-        self.assertEqual(_insert_lessons([self._lesson(teacher="")]), 0)
+    def _sync(self, lessons, groups_ok=None, stamp=None):
+        return _sync_schedule(lessons, self.GROUPS_OK if groups_ok is None else groups_ok,
+                              stamp or datetime.now(timezone.utc))
 
-    def test_change_is_counted_before_the_rewrite(self):
-        _insert_lessons([self._lesson()])
-        # Unchanged partition: (0, 0) and no rewrite → no push
-        self.assertEqual(_reconcile_partition("ISKS-1", "2026-R", [self._lesson()]), (0, 0))
-        # A room change is one gained and one lost — and the phantom
-        # old row is GONE, not haunting every following week
-        self.assertEqual(_reconcile_partition("ISKS-1", "2026-R", [self._lesson(room="404")]), (1, 1))
-        rooms = list(ScheduleLesson.objects.values_list("room", flat=True))
-        self.assertEqual(rooms, ["404"])
+    def test_the_natural_key_dedups_and_confirms_instead_of_reinserting(self):
+        self.assertEqual(self._sync([self._lesson()]), (1, 0))
+        # The same event again: confirmed, not re-added — an
+        # unchanged timetable pushes nothing
+        self.assertEqual(self._sync([self._lesson()]), (0, 0))
+        # A teacher swap is the SAME event (teacher is not
+        # identity): the row updates in place
+        self.assertEqual(self._sync([self._lesson(teacher="B. Kazlauskas")]), (0, 0))
+        self.assertEqual(list(ScheduleEvent.objects.values_list("teacher", flat=True)),
+                         ["B. Kazlauskas"])
+        self.assertEqual(ScheduleEventTeacher.objects.count(), 1)
 
-    def test_the_purge_retires_only_labels_this_scraper_wrote(self):
-        _insert_lessons([self._lesson(semester="2025-R"),
-                         self._lesson(semester="2026-R"),
-                         self._lesson(semester="2025-pavasaris")])
-        _purge_old_semesters("2026-R")
-        kept = sorted(ScheduleLesson.objects.values_list("semester", flat=True))
-        self.assertEqual(kept, ["2025-pavasaris", "2026-R"])
+    def test_two_group_feeds_converge_on_one_event(self):
+        groups = {**self.GROUPS_OK,
+                  "isks-1b": {"display_name": "ISKS 1 k. 2 grupė", "group_name": "ISKS-1"}}
+        added, _ = self._sync([self._lesson(), self._lesson(slug="isks-1b")], groups_ok=groups)
+        self.assertEqual(added, 1)
+        self.assertEqual(ScheduleEvent.objects.count(), 1)
+        self.assertEqual(ScheduleEventGroup.objects.count(), 2)
+
+    def test_a_vanished_future_event_is_retired_but_a_failed_feed_preserves_its_schedule(self):
+        room_change = self._lesson(room="404")
+        self._sync([self._lesson(), room_change])
+        # The next healthy run serves only the room-change row:
+        # the stale twin loses its link and goes
+        self.assertEqual(self._sync([room_change]), (0, 1))
+        self.assertEqual(list(ScheduleEvent.objects.values_list("room", flat=True)), ["404"])
+        # A run where this group's feed FAILED (not in groups_ok)
+        # must not touch its stored schedule
+        self.assertEqual(self._sync([], groups_ok={}), (0, 0))
+        self.assertEqual(ScheduleEvent.objects.count(), 1)
+
+    def test_the_past_is_history_until_retention(self):
+        past = self._lesson(date=date.today() - timedelta(days=30))
+        ancient = self._lesson(date=date.today() - timedelta(days=RETENTION_DAYS + 30),
+                               time_start="08:00")
+        self._sync([past, ancient])
+        # A healthy run that no longer serves either (both are
+        # outside the window) keeps the past — only retention
+        # removes, and only past the horizon
+        self.assertEqual(self._sync([self._lesson()]), (1, 0))
+        kept = sorted(ScheduleEvent.objects.values_list("time_start", flat=True))
+        self.assertEqual(kept, ["10:00", "10:00"])
+
+    def test_a_lecture_leaving_one_feed_keeps_the_event_through_the_other(self):
+        # The subtlest retire: a shared event loses ONE group's
+        # claim (that healthy feed dropped it) but survives on
+        # the other group's link — deleted only when the last
+        # link goes
+        groups = {**self.GROUPS_OK,
+                  "ft-1-kursas": {"display_name": "FT 1 kursas", "group_name": "FT-1"}}
+        self._sync([self._lesson(), self._lesson(slug="ft-1-kursas", group_name="FT-1")],
+                   groups_ok=groups)
+        self.assertEqual(ScheduleEventGroup.objects.count(), 2)
+
+        # Next healthy run: only FT-1 still serves the lecture
+        self.assertEqual(self._sync([self._lesson(slug="ft-1-kursas", group_name="FT-1")],
+                                    groups_ok=groups), (0, 0))
+        self.assertEqual(ScheduleEvent.objects.count(), 1)
+        links = list(ScheduleEventGroup.objects.values_list("group_id", flat=True))
+        self.assertEqual(links, ["ft-1-kursas"])
+
+    def test_a_failed_feed_keeps_the_teacher_links_too(self):
+        # Teacher-link retirement is scoped to CONFIRMED events:
+        # a week whose feed failed must keep its teachers, or a
+        # blip would strip every lecturer until the next run
+        self._sync([self._lesson()])
+        self.assertEqual(ScheduleEventTeacher.objects.count(), 1)
+        self.assertEqual(self._sync([], groups_ok={}), (0, 0))
+        self.assertEqual(ScheduleEventTeacher.objects.count(), 1)
+
+    def test_orphaned_entities_prune_only_past_the_horizon(self):
+        # A link-less teacher or group is kept until the
+        # retention horizon — pruning it early would strip the
+        # columns the tracer system fills (ad_account) the
+        # moment a teacher has a lecture-free fortnight
+        now = datetime.now(timezone.utc)
+        stale = now - timedelta(days=RETENTION_DAYS + 5)
+        ScheduleTeacher.objects.create(id="t-senas", name="Senas", last_seen_at=stale)
+        ScheduleTeacher.objects.create(id="t-naujas", name="Naujas", last_seen_at=now)
+        ScheduleGroup.objects.create(slug="senas", group_name="SEN-1", last_seen_at=stale)
+        ScheduleGroup.objects.create(slug="naujas", group_name="NAU-1", last_seen_at=now)
+
+        self._sync([self._lesson()])
+
+        teachers = sorted(ScheduleTeacher.objects.values_list("name", flat=True))
+        self.assertEqual(teachers, ["A. Petraitis", "Naujas"])
+        groups = sorted(ScheduleGroup.objects.values_list("slug", flat=True))
+        self.assertEqual(groups, ["isks-1-kursas", "naujas"])
+
+
+class TimetableRunTests(TestCase):
+
+    # MIN_SEMESTER_LESSONS per feed, so the stray-label guard
+    # never trips whatever real date the suite runs on
+    def _feed(self, room):
+        from knfapp.scraper import schedule_scraper as ss
+        when = date.today() + timedelta(days=7)
+        label = ss._get_semester_label(datetime(when.year, when.month, when.day))
+        return [
+            {"title": "Programavimas", "teacher": "A. Petraitis", "room": room,
+             "lecture_type": "", "date": when,
+             "time_start": f"{9 + i:02d}:00", "time_end": f"{10 + i:02d}:30",
+             "group_name": "ISKS-1", "slug": "isks-1-kursas", "semester": label}
+            for i in range(5)
+        ]
+
+    def test_the_full_run_writes_and_a_failed_feed_run_preserves(self):
+        # The whole pipeline through scrape_knf_schedule with the
+        # network mocked out: run one populates, run two has one
+        # feed serving moved rooms and the other RAISING — the
+        # failed feed's schedule must survive untouched while the
+        # healthy feed's stale rows retire
+        from knfapp.scraper import schedule_scraper as ss
+
+        stats = {"events": 5, "all_day": 0, "retakes": 0, "unparsable": 0,
+                 "untitled": 0, "colours": {}}
+        groups = [{"slug": "isks-1-kursas", "display_name": "ISKS 1 kursas"},
+                  {"slug": "ft-1-kursas", "display_name": "FT 1 kursas"}]
+        isks = self._feed("302")
+        ft = [{**lesson, "slug": "ft-1-kursas", "group_name": "FT-1", "room": "404"}
+              for lesson in self._feed("404")]
+
+        real_list, real_schedule = ss.scrape_group_list, ss.scrape_group_schedule
+        ss.scrape_group_list = lambda: groups
+        ss.scrape_group_schedule = lambda slug, *_args: (ft if slug == "ft-1-kursas" else isks, stats)
+        try:
+            result = ss.scrape_knf_schedule(notify=False)
+            self.assertEqual((result["groups_scraped"], result["lessons_found"], result["lessons_new"]),
+                             (2, 10, 10))
+            self.assertEqual(ScheduleEvent.objects.count(), 10)
+
+            # Run two: ISKS moved every lecture one room over,
+            # FT's feed dies mid-scrape
+            moved = [{**lesson, "room": "303"} for lesson in isks]
+
+            def second(slug, *_args):
+                if slug == "ft-1-kursas":
+                    raise RuntimeError("feed down")
+                return moved, stats
+
+            ss.scrape_group_schedule = second
+            result = ss.scrape_knf_schedule(notify=False)
+            self.assertEqual((result["groups_scraped"], result["lessons_new"]), (1, 5))
+
+            rooms = sorted(set(ScheduleEvent.objects.values_list("room", flat=True)))
+            # 303 replaced 302; the failed feed's 404 rows intact
+            self.assertEqual(rooms, ["303", "404"])
+            self.assertEqual(ScheduleEvent.objects.count(), 10)
+        finally:
+            ss.scrape_group_list, ss.scrape_group_schedule = real_list, real_schedule
 
 
 class ScraperRouteTests(TestCase):

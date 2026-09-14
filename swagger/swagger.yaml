@@ -1201,13 +1201,16 @@ paths:
   /schedule:
     get:
       tags: [schedule]
-      summary: Get schedule/timetable
+      summary: Get schedule/timetable (legacy weekly shape)
       description: |
-        One page of lessons, ordered by dayOfWeek, timeStart, group, id — at most
-        500 rows per call (an unfiltered call used to return the whole table).
+        One page of WEEKLY lesson patterns, folded on the fly from the dated
+        schedule_events tables (see /schedule/events for the real dated rows) —
+        ordered by dayOfWeek, timeStart, group; at most 500 rows per call. The
+        `id` is a stable hash of the pattern.
 
-        With no `semester` the newest semester carrying at least 5 lessons is used,
-        so years never interleave; pass `semester=all` for every semester at once.
+        With no `semester` the CURRENT term (today's label, carrying at least 5
+        lessons) is used, so the next term's early-imported exam weeks never
+        steal the default; pass `semester=all` for every semester at once.
 
         Answers carry `Cache-Control: public, max-age=21600` (the 6 h scrape
         interval) and a weak `ETag`; a matching `If-None-Match` gets a 304.
@@ -1259,6 +1262,85 @@ paths:
           description: Not modified - If-None-Match matched the ETag
         "400":
           description: Invalid day, limit or offset
+
+  /schedule/events:
+    get:
+      tags: [schedule]
+      summary: Get dated lecture events in a date range
+      description: |
+        The DATED timetable — one row per (event, group) with the real calendar
+        date, so irregular and one-off lectures appear on their exact dates.
+        Ordered by date, timeStart, group; at most 500 rows per call (page with
+        `offset`). `dayOfWeek` is derived server-side from `date` (0=Monday).
+
+        `from`/`to` are inclusive ISO dates; with neither given the range is
+        [today-7, today+28], and any range is capped at 220 days.
+
+        Same caching as /schedule: `Cache-Control: public, max-age=21600` plus a
+        weak `ETag`, and a 304 on a matching `If-None-Match`.
+      parameters:
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Inclusive range start (YYYY-MM-DD); default today-7
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Inclusive range end (YYYY-MM-DD); default today+28
+        - name: group
+          in: query
+          schema:
+            type: string
+          description: Exact group label ("ISKS-1")
+        - name: semester
+          in: query
+          schema:
+            type: string
+          description: Exact semester label
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 500
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 100000
+            default: 0
+      responses:
+        "200":
+          description: Dated events in the range
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: "#/components/schemas/Lesson"
+                        - type: object
+                          properties:
+                            date:
+                              type: string
+                              format: date
+                              example: "2026-09-15"
+                            lectureType:
+                              type: string
+                              example: ""
+        "304":
+          description: Not modified - If-None-Match matched the ETag
+        "400":
+          description: Invalid date, range over 220 days, limit or offset
 
   /schedule/filters:
     get:

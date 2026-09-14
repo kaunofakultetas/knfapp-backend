@@ -125,16 +125,17 @@ class EnumCheckTests(TestCase):
 class ScheduleNaturalKeyTests(TestCase):
 
     def test_the_key_columns_refuse_null_and_dedup_stays_total(self):
-        # A raw INSERT with NULL teacher — the shape that would
+        # A raw INSERT with NULL room — the shape that would
         # dodge the natural key — dies at the constraint
         with self.assertRaises(IntegrityError), transaction.atomic():
             with connection.cursor() as cursor:
                 cursor.execute(
-                    """INSERT INTO schedule_lessons
-                       (id, title, teacher, room, time_start, time_end, day_of_week,
-                        group_name, semester, created_at)
-                       VALUES (%s, %s, NULL, '', '10:00', '11:30', 0, 'G-1', '2026-R', %s)""",
-                    (str(uuid.uuid4()), "Programavimas", utc_now_iso()),
+                    """INSERT INTO schedule_events
+                       (id, title, lecture_type, teacher, room, date, time_start,
+                        time_end, semester, last_seen_at, created_at)
+                       VALUES (%s, %s, '', '', NULL, '2026-03-02', '10:00', '11:30',
+                               '2025-P', %s, %s)""",
+                    (str(uuid.uuid4()), "Programavimas", utc_now_iso(), utc_now_iso()),
                 )
 
         # With '' enforced, the scraper's conflict-ignoring
@@ -143,15 +144,16 @@ class ScheduleNaturalKeyTests(TestCase):
         with connection.cursor() as cursor:
             for _ in range(2):
                 cursor.execute(
-                    """INSERT INTO schedule_lessons
-                       (id, title, teacher, room, time_start, time_end, day_of_week,
-                        group_name, semester, created_at)
-                       VALUES (%s, %s, '', '', '10:00', '11:30', 0, 'G-1', '2026-R', %s)
-                       ON CONFLICT (semester, group_name, day_of_week, time_start,
-                                    time_end, title, teacher, room) DO NOTHING""",
-                    (str(uuid.uuid4()), "Programavimas", utc_now_iso()),
+                    """INSERT INTO schedule_events
+                       (id, title, lecture_type, teacher, room, date, time_start,
+                        time_end, semester, last_seen_at, created_at)
+                       VALUES (%s, %s, '', '', '', '2026-03-02', '10:00', '11:30',
+                               '2025-P', %s, %s)
+                       ON CONFLICT (date, time_start, time_end, title,
+                                    lecture_type, room) DO NOTHING""",
+                    (str(uuid.uuid4()), "Programavimas", utc_now_iso(), utc_now_iso()),
                 )
-            cursor.execute("SELECT COUNT(*) FROM schedule_lessons")
+            cursor.execute("SELECT COUNT(*) FROM schedule_events")
             self.assertEqual(cursor.fetchone()[0], 1)
 
 

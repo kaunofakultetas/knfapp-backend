@@ -23,7 +23,8 @@ EXPECTED_INDEXES = {
     "reports": {"idx_reports_status"},
     "memes": {"idx_memes_created"},
     "messages": {"idx_messages_expires", "idx_messages_conversation"},
-    "schedule_lessons": {"idx_schedule_lessons_filter"},
+    "schedule_events": {"idx_schedule_events_date", "idx_schedule_events_sem"},
+    "schedule_groups": {"idx_schedule_groups_name"},
     "uploads": {"idx_uploads_user", "idx_uploads_created"},
     "users": {"users_username_ci", "users_email_ci"},
 }
@@ -32,8 +33,8 @@ EXPECTED_INDEXES = {
 # autoindexes — pinned by their COLUMNS, not a name
 EXPECTED_UNIQUES = {
     "messages": ("conversation_id", "sender_id", "client_msg_id"),
-    "schedule_lessons": ("semester", "group_name", "day_of_week", "time_start",
-                         "time_end", "title", "teacher", "room"),
+    "schedule_events": ("date", "time_start", "time_end", "title",
+                        "lecture_type", "room"),
 }
 
 

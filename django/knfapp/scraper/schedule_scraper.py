@@ -2,20 +2,25 @@
 #  [*] Schedule scraper — tvarkarasciai.vu.lt timetable
 #
 #  Pulls every KNF group's FullCalendar event feed from
-#  tvarkarasciai.vu.lt and folds the dated events into
-#  schedule_lessons as WEEKLY patterns: a lesson's identity
-#  is title|teacher|room|time|weekday|group|semester, so the
-#  same lecture week after week becomes ONE row, and a
-#  one-off room change would become a second row the app
-#  then shows every week. That is why the import is a
-#  RECONCILIATION, not an append: for the semester the run
-#  is about, each (group_name, semester) partition is
-#  rewritten from the freshly scraped set, so a moved
-#  lecture, a cancelled one and last week's phantom room all
-#  disappear on the next run. Neighbouring semesters caught
-#  by the window are only ever added to (DO NOTHING inserts) —
-#  the window covers a fortnight of them, which is not
-#  enough to rebuild them from.
+#  tvarkarasciai.vu.lt and stores the events DATED, one
+#  schedule_events row per (date, times, title, type, room)
+#  — the tracer system's proven event identity. Teacher and
+#  group are NOT identity: a teacher swap updates the row,
+#  and every group feed serving the same lecture confirms
+#  ONE row through schedule_event_groups. Irregular and
+#  one-off lectures need no folding: a lecture that happens
+#  on three scattered dates is three rows on those dates.
+#
+#  Sync is the tracer confirmation-stamp pattern: each run
+#  inserts-or-confirms events and link rows with the run's
+#  stamp, then deletes FUTURE events whose stamp went stale
+#  (the site stopped serving them) — except events whose
+#  every group feed FAILED this run, which are preserved
+#  (nothing was fetched, so nothing was cancelled). A stale
+#  group link on a surviving event is retired alone: the
+#  lecture moved out of that one group's feed. Past events
+#  are history: kept as scraped until RETENTION_DAYS, then
+#  dropped with their links.
 #
 #  The window is rolling — [today - 2 weeks, today + 20
 #  weeks] — instead of "this semester from its first day":
@@ -37,9 +42,9 @@
 #  "2025-P". A label carrying fewer than
 #  MIN_SEMESTER_LESSONS events across the whole run is
 #  dropped rather than stored, so one stray event can never
-#  become a semester option in the mobile picker, and
-#  semesters older than the run's anchor are purged once the
-#  anchor itself has rows.
+#  become a semester option in the mobile picker; old
+#  semesters leave through retention, not a purge, so last
+#  year's matching term stays browsable.
 #
 #  Every run is logged in scraper_runs (source
 #  'tvarkarasciai.vu.lt') with the lesson counts in the
@@ -51,7 +56,7 @@
 ############################################################
 
 
-import hashlib
+
 import html
 import json
 import logging
@@ -66,7 +71,13 @@ from bs4 import BeautifulSoup
 from django.db import connection, transaction
 
 from knfapp.common.timestamps import utc_now
-from knfapp.schedule.models import ScheduleLesson
+from knfapp.schedule.models import (
+    ScheduleEvent,
+    ScheduleEventGroup,
+    ScheduleEventTeacher,
+    ScheduleGroup,
+    ScheduleTeacher,
+)
 from knfapp.scraper.common import (
     HTML_CONTENT_TYPES,
     JSON_CONTENT_TYPES,
@@ -98,6 +109,12 @@ EVENT_URL_TEMPLATE = f"{BASE_URL}/knf/ajax_fullcalendar_events/{{slug}}/group/25
 # exam session behind it
 WINDOW_BACK_WEEKS = 2
 WINDOW_FORWARD_WEEKS = 20
+
+# How long a PAST event stays as history before the run
+# drops it (with its links) — ~13 months keeps the previous
+# academic year's matching semester browsable, mirroring the
+# tracer system's retention idea at app scale
+RETENTION_DAYS = 400
 
 # A semester label the whole run saw fewer times than this
 # is a stray (a single misdated event) and is not stored —
@@ -309,33 +326,6 @@ def _parse_group_display_name(slug: str, display_name: str) -> str:
     logger.info("No programme matched the group '%s' (slug %s) — keeping the slug as its name",
                 display_name, slug)
     return slug[:30]
-
-
-
-
-
-
-
-
-############################################################
-# _lesson_hash
-############################################################
-#
-# 16 hex chars of SHA-256 over the eight identity fields
-# joined with "|". Only an in-memory dedup key inside one
-# group's scrape — it is never stored; the DB-side "already
-# exists" check in scrape_knf_schedule compares the same
-# eight columns directly.
-#
-# Used by:
-#   - scrape_group_schedule (below)
-############################################################
-
-def _lesson_hash(title: str, teacher: str, room: str, time_start: str,
-                 time_end: str, day_of_week: int, group_name: str, semester: str) -> str:
-    key = f"{title}|{teacher}|{room}|{time_start}|{time_end}|{day_of_week}|{group_name}|{semester}"
-    return hashlib.sha256(key.encode()).hexdigest()[:16]
-
 
 
 
@@ -690,14 +680,13 @@ def scrape_group_list() -> list[dict]:
 # before it is interpolated into the feed URL; a malformed
 # one raises and the caller skips the group.
 #
-# Every event collapses to its weekday + "HH:MM" times, so
-# the dated occurrences of one lecture dedupe to a single
-# dict via _lesson_hash, while a one-week room change
-# survives as a separate dict. day_of_week is
-# datetime.weekday(): 0 = Monday … 6 = Sunday, the same
-# convention /api/schedule and the mobile app use. Raises
-# on HTTP/JSON failure — the caller logs and skips the
-# group.
+# Every event keeps its DATE plus "HH:MM" times — one dict
+# per dated occurrence, deduped only against the feed
+# serving the same instance twice (the natural key, teacher
+# excluded). A one-off room change is simply a different
+# row on that one date, which is the whole point of the
+# dated model. Raises on HTTP/JSON failure — the caller
+# logs and skips the group.
 #
 # Used by:
 #   - scrape_knf_schedule (below) — once per group
@@ -725,7 +714,7 @@ def scrape_group_schedule(slug: str, group_display_name: str,
 
     group_name = _parse_group_display_name(slug, group_display_name)
 
-    lessons_seen = set()  # _lesson_hash keys — weekly recurrences collapse here
+    lessons_seen = set()  # natural keys — a feed serving one event twice collapses here
     lessons = []
     # What the run threw away and why — a filter that silently
     # stops matching is otherwise indistinguishable from a
@@ -775,7 +764,6 @@ def scrape_group_schedule(slug: str, group_display_name: str,
             stats["unparsable"] += 1
             continue
 
-        day_of_week = start_dt.weekday()  # 0=Mon, 6=Sun -- matches our API
         time_start = start_dt.strftime("%H:%M")
         time_end = end_dt.strftime("%H:%M")
         # Labelled per event, not per run — see _get_semester_label
@@ -792,7 +780,7 @@ def scrape_group_schedule(slug: str, group_display_name: str,
         # Top-level fields first; the popover markup is only
         # consulted when the title actually carries HTML. A null
         # one becomes "" and NEVER None: both columns are part of
-        # idx_schedule_lessons_natural, and SQLite counts NULLs
+        # idx_schedule_events_natural, and SQLite counts NULLs
         # in a unique index as distinct — a NULL would re-insert
         # a lecturerless lesson on every single run
         teacher = event.get("instructor") or ""
@@ -808,21 +796,24 @@ def scrape_group_schedule(slug: str, group_display_name: str,
         if teacher:
             teacher = teacher.strip().rstrip(",").strip()
 
-        # Same weekday/time/group/semester = the same weekly lesson
-        h = _lesson_hash(title, teacher, room, time_start, time_end,
-                         day_of_week, group_name, semester)
-        if h in lessons_seen:
+        # The DATED natural key — teacher is deliberately not in
+        # it, matching idx_schedule_events_natural: a teacher swap
+        # is the same event
+        key = (start_dt.date(), time_start, time_end, title, "", room)
+        if key in lessons_seen:
             continue
-        lessons_seen.add(h)
+        lessons_seen.add(key)
 
         lessons.append({
             "title": title,
             "teacher": teacher,
             "room": room,
+            "lecture_type": "",
+            "date": start_dt.date(),
             "time_start": time_start,
             "time_end": time_end,
-            "day_of_week": day_of_week,
             "group_name": group_name,
+            "slug": slug,
             "semester": semester,
         })
 
@@ -841,10 +832,11 @@ def scrape_group_schedule(slug: str, group_display_name: str,
 #
 # The full import: takes both halves of the source lock,
 # opens a scraper_runs row, fetches the group list, scrapes
-# every group over the network, then RECONCILES the result
-# into schedule_lessons, purges semesters older than the
-# run's anchor, closes the run and pushes a "schedule"
-# channel notification when something actually changed.
+# every group over the network, then hands the dated dicts
+# to _sync_schedule (insert-or-confirm plus the stale-
+# future retire and retention), closes the run and pushes a
+# "schedule" channel notification when something actually
+# changed.
 # Returns {"groups_scraped", "lessons_found", "lessons_new",
 # "dropped"} — plus an "error" key and zero counts on
 # failure (which is what lets the admin trigger answer a
@@ -860,20 +852,20 @@ def scrape_group_schedule(slug: str, group_display_name: str,
 # Date window: rolling, [today - 2 weeks, today +
 # forward_weeks]. Every event keeps the label
 # _get_semester_label gives its own date; the run's ANCHOR
-# is today's label, and only anchor partitions are
-# rewritten. A label seen fewer than MIN_SEMESTER_LESSONS
-# times across the run is dropped as a stray instead of
-# becoming a semester option.
+# (today's label) is always kept, and any other label seen
+# fewer than MIN_SEMESTER_LESSONS times across the run is
+# dropped as a stray instead of becoming a semester option.
 #
 # Writes happen once, after every fetch, inside ONE
-# transaction.atomic() block — per-partition rewrites and
-# the neighbour DO NOTHING inserts land together or not at
-# all. lessons_found sums every group's post-dedup
-# dicts; lessons_new counts rows that were NOT already
-# there, so an unchanged timetable pushes nothing.
+# transaction.atomic() block — the insert-or-confirm pass
+# and the stale-future retire land together or not at all
+# (_sync_schedule). lessons_found sums every group's
+# post-dedup dicts; lessons_new counts events that were NOT
+# already there, so an unchanged timetable pushes nothing.
 #
 # A group that fails to scrape is logged and skipped, and
-# its partition is left alone rather than emptied. Only a
+# because only groups in groups_ok may retire anything, its
+# stored schedule is left alone rather than emptied. Only a
 # failed group LIST fails the run.
 #
 # Used by:
@@ -944,7 +936,8 @@ def _run(run_id, forward_weeks, notify, deadline):
         # STEP 4: scrape every group — network only, nothing is
         # written while a fetch is outstanding
         # =====================================================
-        scraped: dict = {}
+        scraped: list = []
+        groups_ok: dict = {}  # slug → {display_name, group_name} of successful fetches
         total_lessons = 0
         groups_scraped = 0
         # What every group's feed threw away, summed — the only
@@ -977,11 +970,15 @@ def _run(run_id, forward_weeks, notify, deadline):
             for colour, count in stats["colours"].items():
                 colours[colour] = colours.get(colour, 0) + count
 
-            # STEP 4.2: file each lesson under its (group, semester)
-            # partition — the unit the write phase reconciles
-            for lesson in lessons:
-                partition = (lesson["group_name"], lesson["semester"])
-                scraped.setdefault(partition, []).append(lesson)
+            # STEP 4.2: remember the healthy fetch — only feeds in
+            # groups_ok may retire events and links in the write
+            # phase; a failed or unfetched group's stored schedule
+            # is preserved untouched
+            groups_ok[slug] = {
+                "display_name": display_name,
+                "group_name": _parse_group_display_name(slug, display_name),
+            }
+            scraped.extend(lessons)
 
 
         # STEP 4.3: every group answered and not one lesson came
@@ -1008,8 +1005,8 @@ def _run(run_id, forward_weeks, notify, deadline):
         # misdated events must never become a picker option
         # =================================================
         per_semester = {}
-        for (_group_name, semester), lessons in scraped.items():
-            per_semester[semester] = per_semester.get(semester, 0) + len(lessons)
+        for lesson in scraped:
+            per_semester[lesson["semester"]] = per_semester.get(lesson["semester"], 0) + 1
 
         kept_semesters = {
             semester for semester, count in per_semester.items()
@@ -1019,34 +1016,17 @@ def _run(run_id, forward_weeks, notify, deadline):
             if semester not in kept_semesters:
                 logger.info("Dropping stray semester label %s (%d event(s) this run)", semester, count)
 
+        scraped = [lesson for lesson in scraped if lesson["semester"] in kept_semesters]
 
-        # STEP 6: the write phase — anchor partitions are
-        # rewritten from the scraped set, the neighbouring
-        # semesters the window clipped are only added to;
-        # one transaction covers the whole reconciliation
-        # ===============================================
-        total_new = 0
-        total_removed = 0
+
+        # STEP 6: the write phase — insert-or-confirm every dated
+        # event with the run's stamp, then retire what the healthy
+        # feeds stopped serving; one transaction covers everything
+        # ========================================================
+        run_stamp = utc_now()
 
         with transaction.atomic():
-            for (group_name, semester), lessons in scraped.items():
-                if semester not in kept_semesters:
-                    continue
-
-                if semester == anchor_semester:
-                    added, removed = _reconcile_partition(group_name, semester, lessons)
-                    total_new += added
-                    total_removed += removed
-                else:
-                    total_new += _insert_lessons(lessons)
-
-
-            # STEP 7: retire semesters older than the anchor, but
-            # only once the anchor itself actually has rows — an
-            # empty scrape must never empty the app
-            # ===================================================
-            if anchor_semester in kept_semesters:
-                _purge_old_semesters(anchor_semester)
+            total_new, total_removed = _sync_schedule(scraped, groups_ok, run_stamp)
 
 
         # STEP 8: close the run row — the lesson counts go into
@@ -1110,54 +1090,56 @@ def _run(run_id, forward_weeks, notify, deadline):
 
 
 
-
-
 ############################################################
-# _reconcile_partition
+# _upsert_event
 ############################################################
 #
-# Rewrites one (group_name, semester) partition to exactly
-# the lessons just scraped and answers (added, removed).
-# DELETE + INSERT rather than an upsert because the natural
-# key IS the whole row: there is nothing to update, only
-# rows to gain and rows to lose. The counts are taken by
-# comparing the two sets BEFORE the write, so an unchanged
-# timetable reports zero and sends no push — a plain "rows
-# inserted" count would report the whole partition as new on
-# every run.
-#
-# Parallel subgroups legitimately share a slot with a
-# different teacher or room, so the comparison key is the
-# full six-column identity, never the time slot alone.
+# Insert-or-confirm ONE dated event: a conflict-ignoring
+# INSERT on idx_schedule_events_natural (the spelling runs
+# on SQLite and Postgres alike), then an unconditional
+# confirmation UPDATE — teacher and semester are refreshed
+# and last_seen_at takes the run's stamp whether the row is
+# new or a year old. Answers (event_id, created); the
+# SELECT instead of RETURNING keeps the SQL portable.
 #
 # Used by:
-#   - scrape_knf_schedule (above) — the anchor semester's
-#     partitions
+#   - _sync_schedule (below) — once per merged event
 ############################################################
 
-def _reconcile_partition(group_name: str, semester: str, lessons: list[dict]):
-    # STEP 1: what the table holds for this partition today
-    # =====================================================
-    existing = set(
-        ScheduleLesson.objects.filter(group_name=group_name, semester=semester)
-        .values_list("title", "teacher", "room", "time_start", "time_end", "day_of_week")
+def _upsert_event(cursor, event: dict, run_stamp):
+    key = (event["date"], event["time_start"], event["time_end"],
+           event["title"], event["lecture_type"], event["room"])
+    # Raw SQL must store stamps in the exact form the ORM
+    # writes and compares — on SQLite a bare datetime binding
+    # keeps its "+00:00" suffix and breaks every <=> filter
+    run_stamp = connection.ops.adapt_datetimefield_value(run_stamp)
+
+    cursor.execute(
+        """INSERT INTO schedule_events
+           (id, title, lecture_type, teacher, room, date, time_start,
+            time_end, semester, last_seen_at, created_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+           ON CONFLICT (date, time_start, time_end, title, lecture_type, room)
+           DO NOTHING""",
+        (str(uuid.uuid4()), event["title"], event["lecture_type"], event["teacher"],
+         event["room"], event["date"], event["time_start"], event["time_end"],
+         event["semester"], run_stamp, run_stamp),
     )
+    created = cursor.rowcount > 0
 
-    scraped = {
-        (lesson["title"], lesson["teacher"], lesson["room"],
-         lesson["time_start"], lesson["time_end"], lesson["day_of_week"])
-        for lesson in lessons
-    }
-
-
-    # STEP 2: replace the partition — the delete is what makes a
-    # one-week room change stop haunting every following week
-    # ==========================================================
-    if existing != scraped:
-        ScheduleLesson.objects.filter(group_name=group_name, semester=semester).delete()
-        _insert_lessons(lessons)
-
-    return len(scraped - existing), len(existing - scraped)
+    cursor.execute(
+        """UPDATE schedule_events SET teacher = %s, semester = %s, last_seen_at = %s
+           WHERE date = %s AND time_start = %s AND time_end = %s
+             AND title = %s AND lecture_type = %s AND room = %s""",
+        (event["teacher"], event["semester"], run_stamp, *key),
+    )
+    cursor.execute(
+        """SELECT id FROM schedule_events
+           WHERE date = %s AND time_start = %s AND time_end = %s
+             AND title = %s AND lecture_type = %s AND room = %s""",
+        key,
+    )
+    return cursor.fetchone()[0], created
 
 
 
@@ -1167,49 +1149,133 @@ def _reconcile_partition(group_name: str, semester: str, lessons: list[dict]):
 
 
 ############################################################
-# _insert_lessons
+# _sync_schedule
 ############################################################
 #
-# Inserts a batch of scraped lesson dicts and returns how
-# many rows were actually added — the per-row rowcount sums
-# only the rows the conflict clause let through. ON
-# CONFLICT DO NOTHING leans on idx_schedule_lessons_natural
-# instead of a SELECT per candidate — a check-then-insert
-# would scan the table per row and still lose to a parallel
-# run; the spelling runs on SQLite and Postgres alike.
-# created_at is stamped here — the Django-built table
-# carries no DDL default.
+# The whole write phase, called inside one
+# transaction.atomic(). Merges the per-group dicts on the
+# natural key (the same lecture reached through two feeds
+# becomes ONE event with two group links), inserts-or-
+# confirms events, teachers and links with the run's stamp,
+# then retires what the healthy feeds stopped serving:
+#
+#   - a stale link whose GROUP answered this run is deleted
+#     alone — the lecture moved out of that feed; a failed
+#     or unfetched group's links (and through them its
+#     events) are never touched
+#   - a FUTURE event left with no group links is deleted —
+#     every feed that could claim it dropped it
+#   - the past is history: never retired by staleness, only
+#     by RETENTION_DAYS, together with link-less teachers
+#     and groups nothing references any more
+#
+# Teacher links are regenerated from the event's teacher
+# string on every confirmation, so a swap replaces the link
+# instead of accumulating both names. Answers (added,
+# removed): rows inserted and future events retired — an
+# unchanged timetable answers (0, 0) and pushes nothing.
 #
 # Used by:
-#   - _reconcile_partition (above) — after the delete
-#   - scrape_knf_schedule (above) — the semesters the window
-#     only clipped, which are added to and never rewritten
+#   - scrape_knf_schedule (above) — STEP 6
 ############################################################
 
-def _insert_lessons(lessons: list[dict]) -> int:
+def _sync_schedule(scraped: list, groups_ok: dict, run_stamp):
+    today = run_stamp.date()
+
+    # STEP 1: upsert the groups whose feeds answered
+    # ==============================================
+    for slug, info in groups_ok.items():
+        ScheduleGroup.objects.update_or_create(
+            slug=slug,
+            defaults={"display_name": info["display_name"],
+                      "group_name": info["group_name"],
+                      "last_seen_at": run_stamp},
+        )
+
+
+    # STEP 2: merge the per-group dicts on the natural key
+    # ====================================================
+    merged: dict = {}
+    for lesson in scraped:
+        key = (lesson["date"], lesson["time_start"], lesson["time_end"],
+               lesson["title"], lesson["lecture_type"], lesson["room"])
+        entry = merged.get(key)
+        if entry is None:
+            entry = merged[key] = {**lesson, "slugs": set()}
+        entry["slugs"].add(lesson["slug"])
+        # The first non-empty teacher wins — feeds rarely disagree,
+        # and '' must never overwrite a name
+        if not entry["teacher"] and lesson["teacher"]:
+            entry["teacher"] = lesson["teacher"]
+
+
+    # STEP 3: insert-or-confirm events, teachers and links
+    # ====================================================
     added = 0
-
+    teacher_ids: dict = {}
+    confirmed_ids: list = []
     with connection.cursor() as cursor:
-        for lesson in lessons:
-            cursor.execute(
-                """INSERT INTO schedule_lessons
-                   (id, title, teacher, room, time_start, time_end,
-                    day_of_week, group_name, semester, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (semester, group_name, day_of_week, time_start,
-                                time_end, title, teacher, room) DO NOTHING""",
-                (str(uuid.uuid4()), lesson["title"], lesson["teacher"],
-                 lesson["room"], lesson["time_start"], lesson["time_end"],
-                 lesson["day_of_week"], lesson["group_name"], lesson["semester"],
-                 utc_now()),
-            )
-            added += cursor.rowcount
+        for event in merged.values():
+            event_id, created = _upsert_event(cursor, event, run_stamp)
+            confirmed_ids.append(event_id)
+            if created:
+                added += 1
 
-    return added
+            for slug in event["slugs"]:
+                ScheduleEventGroup.objects.update_or_create(
+                    event_id=event_id, group_id=slug,
+                    defaults={"last_seen_at": run_stamp},
+                )
+
+            name = event["teacher"]
+            if name:
+                teacher_id = teacher_ids.get(name)
+                if teacher_id is None:
+                    teacher, _ = ScheduleTeacher.objects.get_or_create(
+                        name=name,
+                        defaults={"id": str(uuid.uuid4()), "last_seen_at": run_stamp},
+                    )
+                    ScheduleTeacher.objects.filter(pk=teacher.pk).update(last_seen_at=run_stamp)
+                    teacher_id = teacher_ids[name] = teacher.pk
+                ScheduleEventTeacher.objects.update_or_create(
+                    event_id=event_id, teacher_id=teacher_id,
+                    defaults={"last_seen_at": run_stamp},
+                )
 
 
+    # STEP 4: retire what the healthy feeds stopped serving —
+    # future only; the past is outside every feed's window and
+    # its links are history, not staleness. Confirmed ids are
+    # chunked: SQLite caps bound parameters per statement
+    # ========================================================
+    for i in range(0, len(confirmed_ids), 500):
+        ScheduleEventTeacher.objects.filter(
+            event_id__in=confirmed_ids[i:i + 500], last_seen_at__lt=run_stamp,
+        ).delete()
+
+    ScheduleEventGroup.objects.filter(
+        event__date__gte=today, last_seen_at__lt=run_stamp,
+        group_id__in=groups_ok.keys(),
+    ).delete()
+
+    _, by_model = ScheduleEvent.objects.filter(
+        date__gte=today, last_seen_at__lt=run_stamp,
+        scheduleeventgroup__isnull=True,
+    ).delete()
+    removed = by_model.get("schedule.ScheduleEvent", 0)
 
 
+    # STEP 5: retention — the past goes at RETENTION_DAYS, and
+    # entities nothing links to any more go with it
+    # ========================================================
+    horizon = run_stamp - timedelta(days=RETENTION_DAYS)
+    ScheduleEvent.objects.filter(date__lt=today - timedelta(days=RETENTION_DAYS)).delete()
+    ScheduleTeacher.objects.filter(scheduleeventteacher__isnull=True,
+                                   last_seen_at__lt=horizon).delete()
+    ScheduleGroup.objects.filter(scheduleeventgroup__isnull=True,
+                                 last_seen_at__lt=horizon).delete()
+
+    return added, removed
 
 
 
@@ -1222,12 +1288,14 @@ def _insert_lessons(lessons: list[dict]) -> int:
 # not one this scraper writes. Plain text sorting is WRONG
 # here: "2025-P" (spring 2026) sorts before "2025-R"
 # (autumn 2025) although it comes after it in the academic
-# year, so autumn is 0 and spring 1 within the year. A
-# label in any other shape ("2025-pavasaris", anything
-# hand-typed) returns None and is left alone by the purge.
+# year, so autumn is 0 and spring 1 within the label year.
+# A label in any other shape ("2025-pavasaris", anything
+# hand-typed) returns None and is left to text order.
 #
 # Used by:
-#   - _purge_old_semesters (below)
+#   - schedule/api/views.py — _semester_options, so the
+#     newest-semester default flips to spring in January
+#     instead of clinging to the autumn label all year
 ############################################################
 
 def _semester_key(label: str):
@@ -1236,40 +1304,3 @@ def _semester_key(label: str):
         return None
 
     return int(match.group(1)) * 2 + (0 if match.group(2) == "R" else 1)
-
-
-
-
-
-
-
-
-############################################################
-# _purge_old_semesters
-############################################################
-#
-# Deletes schedule_lessons rows whose semester is older than
-# the run's anchor, so the picker does not grow a longer
-# list of dead semesters every year. Only labels this
-# scraper wrote are eligible (_semester_key) — anything else
-# is left for an admin. Runs only after the anchor semester
-# itself has rows, so a scrape that fetched nothing can
-# never empty the timetable.
-#
-# Used by:
-#   - scrape_knf_schedule (above) — inside the write
-#     transaction, after the reconciliation
-############################################################
-
-def _purge_old_semesters(anchor_semester: str):
-    anchor_key = _semester_key(anchor_semester)
-    if anchor_key is None:
-        return
-
-    semesters = ScheduleLesson.objects.values_list("semester", flat=True).distinct()
-    stale = [semester for semester in semesters
-             if _semester_key(semester) is not None and _semester_key(semester) < anchor_key]
-
-    for semester in stale:
-        deleted, _ = ScheduleLesson.objects.filter(semester=semester).delete()
-        logger.info("Retired %d lesson(s) from the finished semester %s", deleted, semester)

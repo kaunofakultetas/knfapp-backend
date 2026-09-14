@@ -302,7 +302,7 @@ urlpatterns += [
 # meme library is signed-in except its public file serve.
 ############################################################
 
-from knfapp.schedule.api.views import get_schedule, get_schedule_filters
+from knfapp.schedule.api.views import get_schedule, get_schedule_events, get_schedule_filters
 from knfapp.info.api.views import get_faculty_info
 from knfapp.memes.api.views import delete_meme, list_memes, push_meme, serve_meme
 
@@ -312,7 +312,8 @@ def _memes_dispatch(request):
 
 
 urlpatterns += [
-    path("api/schedule", get_schedule),                    # GET — one capped page of lessons
+    path("api/schedule", get_schedule),                    # GET — the folded weekly page (legacy)
+    path("api/schedule/events", get_schedule_events),      # GET — dated events in a range
     path("api/schedule/filters", get_schedule_filters),    # GET — groups + semesters + days
     path("api/info", get_faculty_info),                    # GET — the bilingual handbook
     path("api/memes", _memes_dispatch),                    # GET the library / POST a push

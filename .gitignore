@@ -1,9 +1,8 @@
-/_DATA/
+/_*
 .env
 /docker-compose.yml
 /.claude
-/_DEFECTS_*
-/_OLD
+
 
 
 
