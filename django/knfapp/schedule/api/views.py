@@ -321,12 +321,16 @@ def get_schedule_events(request):
 
     # STEP 2: one page of dated (event × group) rows
     # ==============================================
+    # DISTINCT: two slugs folding to one group_name ("1 grupė"/
+    # "2 grupė" subgroups) can both link the same event — one
+    # (event × group_name) row must reach the wire once, or the
+    # client renders duplicate keys
     rows = _rows_for(group=group, semester=semester, teacher=teacher,
                      date_from=bounds["from"], date_to=bounds["to"]).values(
         "event__id", "event__title", "event__teacher", "event__room",
         "event__lecture_type", "event__date", "event__time_start",
         "event__time_end", "event__semester", "group__group_name",
-    )[offset:offset + limit]
+    ).distinct()[offset:offset + limit]
 
     events = [
         {

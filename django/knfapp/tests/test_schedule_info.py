@@ -173,6 +173,21 @@ class ScheduleTests(TestCase):
         # Case-folded order — a lowercase name does not sink
         self.assertEqual(body["teachers"], ["agne Zemaite", "Eimantas Rebždys, Lekt."])
 
+    def test_two_slugs_folding_to_one_group_name_answer_once(self):
+        # The "1 grupė / 2 grupė" case: both subgroup slugs fold
+        # to the same group_name and both link the lecture — the
+        # wire must carry ONE row per (event, group_name), or the
+        # mobile list renders duplicate React keys
+        event = _lesson("2025-R", group="LFR-1")
+        stamp = utc_now()
+        twin, _ = ScheduleGroup.objects.get_or_create(
+            slug="slug-LFR-1-b", defaults={"group_name": "LFR-1", "last_seen_at": stamp})
+        ScheduleEventGroup.objects.create(event=event, group=twin, last_seen_at=stamp)
+
+        window = f"from={event.date.isoformat()}&to={event.date.isoformat()}"
+        body = self.client.get(f"/api/schedule/events?group=LFR-1&{window}").json()
+        self.assertEqual(len(body["events"]), 1)
+
     def test_two_groups_sharing_one_event_answer_under_each(self):
         event = _lesson("2025-R", group="IS-1")
         stamp = utc_now()
