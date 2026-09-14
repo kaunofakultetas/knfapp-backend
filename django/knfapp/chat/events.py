@@ -72,6 +72,12 @@ from urllib.parse import parse_qs
 
 from django.db import close_old_connections
 
+# Refusals must carry a REASON the client can triage: only an
+# auth refusal may show "session expired" — a capacity or
+# transient one renders as retryable. A bare `return False`
+# sends the stock message, indistinguishable from a bad token.
+from socketio.exceptions import ConnectionRefusedError
+
 from knfapp.chat.models import ConversationParticipant, Message
 
 # The one token → user lookup in the backend: REST reaches it
@@ -96,11 +102,16 @@ _connected_users: dict = {}
 # values must stay bare ids.
 _connected_names: dict = {}
 
-# Connection caps. Per user: a client that reconnects in a
-# loop cannot hold more than this many sockets at once, each
-# of which costs an engineio packet thread. Per process: the
-# backstop for many users doing it at once — an excess
-# handshake is rejected, live sockets are left alone.
+# Connection caps. Per user: NEWEST WINS — a fresh handshake
+# past the cap evicts the user's oldest socket instead of
+# being refused. The slots a phone burns through are mostly
+# zombies (polling sockets that died without a clean close
+# and sit in the table until the ping timeout reaps them);
+# refusing the newcomer told a freshly logged-in user their
+# session was dead while five corpses held the door. Per
+# process: the backstop for many users at once — an excess
+# handshake is refused with reason 'busy', live sockets are
+# left alone.
 _MAX_SOCKETS_PER_USER = 5
 _MAX_TOTAL_SOCKETS = 500
 
@@ -419,19 +430,36 @@ def register_socket_events(sio):
         if not user:
             logger.info("Socket connection rejected — invalid token (sid=%s ip=%s)",
                         sid, environ.get("REMOTE_ADDR") if environ else None)
-            return False
+            # 'unauthorized' is the ONE reason the client may
+            # render as "session expired"
+            raise ConnectionRefusedError("unauthorized")
 
         user_id = user["id"]
 
         if len(_connected_users) >= _MAX_TOTAL_SOCKETS:
             logger.warning("Socket connection rejected — process cap %d reached (user=%s)",
                            _MAX_TOTAL_SOCKETS, user_id)
-            return False
+            raise ConnectionRefusedError("busy")
 
-        if sum(1 for uid in list(_connected_users.values()) if uid == user_id) >= _MAX_SOCKETS_PER_USER:
-            logger.info("Socket connection rejected — user cap %d reached (user=%s)",
-                        _MAX_SOCKETS_PER_USER, user_id)
-            return False
+        # Newest wins: past the per-user cap, evict this user's
+        # OLDEST socket(s) rather than refuse the fresh one. The
+        # dict is insertion-ordered, so the first matching sid is
+        # the oldest; a sid that died between snapshot and call is
+        # popped regardless — exactly what disconnect_user_sockets
+        # does. A live older device just reconnects and, if all
+        # slots are truly live, evicts the next-oldest in turn.
+        while sum(1 for uid in list(_connected_users.values()) if uid == user_id) >= _MAX_SOCKETS_PER_USER:
+            oldest = next((s for s, uid in list(_connected_users.items()) if uid == user_id), None)
+            if oldest is None:
+                break
+            try:
+                sio.disconnect(oldest)
+            except Exception:
+                logger.warning("Could not disconnect evicted socket sid=%s user=%s", oldest, user_id)
+            _connected_users.pop(oldest, None)
+            _connected_names.pop(oldest, None)
+            logger.info("Evicted oldest socket sid=%s for user=%s — newest wins past cap %d",
+                        oldest, user_id, _MAX_SOCKETS_PER_USER)
 
         try:
             room_ids = list(ConversationParticipant.objects.filter(user_id=user_id)
@@ -447,11 +475,13 @@ def register_socket_events(sio):
             sio.emit("connected", {"userId": user_id}, to=sid)
         except Exception:
             # No half-connected sid may survive in the presence
-            # table — returning False tears the session down
+            # table — the refusal tears the session down. Reason
+            # 'error' so the client retries instead of telling the
+            # user their session died over a transient DB hiccup
             _connected_users.pop(sid, None)
             _connected_names.pop(sid, None)
             logger.exception("Socket handshake failed: user=%s sid=%s", user_id, sid)
-            return False
+            raise ConnectionRefusedError("error")
         finally:
             close_old_connections()
 

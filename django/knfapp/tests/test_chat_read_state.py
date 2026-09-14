@@ -119,6 +119,78 @@ class SocketHandshakeTests(TestCase):
         finally:
             events.reset_socket_state()
 
+    def test_a_bad_token_is_refused_with_reason_unauthorized(self):
+        # The reason string is the client's ONLY way to tell a
+        # dead session from a capacity refusal — the mobile app
+        # shows "session expired" for 'unauthorized' alone
+        from socketio.exceptions import ConnectionRefusedError
+
+        calls = {"handlers": {}}
+
+        class _Sio:
+            def on(self, event, handler=None):
+                calls["handlers"][event] = handler
+
+            def enter_room(self, sid, room_name):
+                pass
+
+            def emit(self, event, payload=None, to=None, **kwargs):
+                pass
+
+        events.reset_socket_state()
+        try:
+            events.register_socket_events(_Sio())
+            with self.assertRaises(ConnectionRefusedError) as caught:
+                calls["handlers"]["connect"]("sid-x", {}, {"token": "netikras"})
+            self.assertEqual(caught.exception.error_args.get("message"), "unauthorized")
+        finally:
+            events.reset_socket_state()
+
+    def test_past_the_user_cap_the_oldest_socket_is_evicted_and_the_newcomer_admitted(self):
+        # Newest wins: five slots full (mostly zombies in real
+        # life) must NOT read as a dead session to a user who just
+        # logged in — the oldest sid goes, the fresh handshake
+        # lands. The evicted sid is also force-disconnected so a
+        # LIVE old device notices and reconnects.
+        user = create_user(username="tomas")
+        token = auth.mint_session(user.id)
+
+        calls = {"handlers": {}, "disconnected": []}
+
+        class _Sio:
+            def on(self, event, handler=None):
+                calls["handlers"][event] = handler
+
+            def enter_room(self, sid, room_name):
+                pass
+
+            def emit(self, event, payload=None, to=None, **kwargs):
+                pass
+
+            def disconnect(self, sid):
+                calls["disconnected"].append(sid)
+
+        events.reset_socket_state()
+        try:
+            events.register_socket_events(_Sio())
+            for i in range(events._MAX_SOCKETS_PER_USER):
+                events._connected_users[f"sid-{i}"] = user.id
+                events._connected_names[f"sid-{i}"] = "Tomas"
+
+            accepted = calls["handlers"]["connect"]("sid-new", {}, {"token": token})
+
+            self.assertNotEqual(accepted, False)
+            self.assertEqual(calls["disconnected"], ["sid-0"])
+            self.assertNotIn("sid-0", events._connected_users)
+            self.assertEqual(events._connected_users.get("sid-new"), user.id)
+            # The cap still holds: five sockets, newcomer included
+            self.assertEqual(
+                sum(1 for uid in events._connected_users.values() if uid == user.id),
+                events._MAX_SOCKETS_PER_USER,
+            )
+        finally:
+            events.reset_socket_state()
+
 
 class SocketRateTests(TestCase):
 
