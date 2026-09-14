@@ -1296,6 +1296,11 @@ paths:
           schema:
             type: string
           description: Exact group label ("ISKS-1")
+        - name: teacher
+          in: query
+          schema:
+            type: string
+          description: Exact teacher string, as the /schedule/filters roster serves it
         - name: semester
           in: query
           schema:
@@ -1378,6 +1383,11 @@ paths:
                     items:
                       type: string
                     example: ["2025-P", "2025-R"]
+                  teachers:
+                    type: array
+                    items:
+                      type: string
+                    example: ["Eimantas Rebždys, Lekt.", "Rita Baranauskienė, Doc., Dr."]
                   days:
                     type: array
                     description: Day numbers that actually carry lessons (0=Monday..6=Sunday)

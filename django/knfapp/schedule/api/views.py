@@ -36,7 +36,7 @@ from django.http import HttpResponse
 
 
 from knfapp.common.http import etag_for, if_none_match_contains, json_error, json_response
-from knfapp.schedule.models import ScheduleEvent, ScheduleEventGroup
+from knfapp.schedule.models import ScheduleEvent, ScheduleEventGroup, ScheduleTeacher
 from knfapp.scraper.schedule_scraper import _get_semester_label, _semester_key
 
 
@@ -132,12 +132,16 @@ def _conditional_json(request, payload, seed):
     return response
 
 
-def _rows_for(group=None, semester=None, date_from=None, date_to=None):
+def _rows_for(group=None, semester=None, teacher=None, date_from=None, date_to=None):
     query = ScheduleEventGroup.objects.select_related("event", "group")
     if group:
         query = query.filter(group__group_name=group)
     if semester:
         query = query.filter(event__semester=semester)
+    if teacher:
+        # Exact match on the display string — the roster in
+        # /schedule/filters serves these exact values
+        query = query.filter(event__teacher=teacher)
     if date_from:
         query = query.filter(event__date__gte=date_from)
     if date_to:
@@ -264,13 +268,17 @@ def get_schedule(request):
 # get_schedule_events
 ############################################################
 #
-# GET /api/schedule/events?group=&from=&to=&semester=&limit=
-# &offset= — dated events, the real timetable: one row per
-# (event × group) with the calendar date on it, ordered
-# date, time, group. from/to are inclusive ISO dates; the
-# default range is [today - 7, today + 28] and a requested
-# one is capped at MAX_RANGE_DAYS. dayOfWeek rides along
-# (0=Monday) so clients never re-derive it differently.
+# GET /api/schedule/events?group=&teacher=&from=&to=
+# &semester=&limit=&offset= — dated events, the real
+# timetable: one row per (event × group) with the calendar
+# date on it, ordered date, time, group. group and teacher
+# are exact matches (the teacher string as the filters
+# roster serves it — the mobile teacher perspective's feed,
+# where the FOLDED shape showed an alternating biweekly
+# lecture twice per week). from/to are inclusive ISO dates;
+# the default range is [today - 7, today + 28] and a
+# requested one is capped at MAX_RANGE_DAYS. dayOfWeek rides
+# along (0=Monday) so clients never re-derive it.
 #
 # Used by:
 #   - services/api/schedule.ts fetchScheduleEvents — the
@@ -281,6 +289,7 @@ def get_schedule_events(request):
     # STEP 1: validate filters — dates strictly YYYY-MM-DD
     # ====================================================
     group = request.GET.get("group")
+    teacher = request.GET.get("teacher")
     semester = request.GET.get("semester")
 
     bounds = {}
@@ -312,7 +321,7 @@ def get_schedule_events(request):
 
     # STEP 2: one page of dated (event × group) rows
     # ==============================================
-    rows = _rows_for(group=group, semester=semester,
+    rows = _rows_for(group=group, semester=semester, teacher=teacher,
                      date_from=bounds["from"], date_to=bounds["to"]).values(
         "event__id", "event__title", "event__teacher", "event__room",
         "event__lecture_type", "event__date", "event__time_start",
@@ -340,7 +349,7 @@ def get_schedule_events(request):
     # STEP 3: the conditional answer
     # ==============================
     seed = (f"events|{_table_version()}|"
-            f"{(group, semester, bounds['from'], bounds['to'], limit, offset)!r}")
+            f"{(group, teacher, semester, bounds['from'], bounds['to'], limit, offset)!r}")
     return _conditional_json(request, {"events": events}, seed)
 
 
@@ -356,9 +365,11 @@ def get_schedule_events(request):
 #
 # GET /api/schedule/filters — the filter sheet in one call:
 # groups, semesters (past the threshold, newest first), the
-# DISTINCT days, and semesterGroups correlating which groups
-# really exist in which semester. ?semester= scopes groups
-# and days to one label; semesters and semesterGroups always
+# DISTINCT days, teachers (the roster the teacher-perspective
+# picker searches — exact strings ?teacher= matches), and
+# semesterGroups correlating which groups really exist in
+# which semester. ?semester= scopes groups and days to one
+# label; semesters, teachers and semesterGroups always
 # describe the whole table.
 #
 # Used by:
@@ -401,6 +412,10 @@ def get_schedule_filters(request):
         "groups": groups,
         "semesters": semesters,
         "days": days,
+        # Every known teacher, retention-pruned with the events —
+        # the strings are exactly what ?teacher= matches
+        "teachers": sorted(ScheduleTeacher.objects.values_list("name", flat=True),
+                           key=str.casefold),
         "semesterGroups": [{"semester": s, "groups": sorted(set(by_semester.get(s, [])))}
                            for s in semesters],
     }

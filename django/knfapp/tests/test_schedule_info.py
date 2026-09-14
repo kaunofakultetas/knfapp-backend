@@ -141,6 +141,38 @@ class ScheduleTests(TestCase):
         self.assertEqual(
             self.client.get("/api/schedule/events?from=2025-01-01&to=2026-01-01").status_code, 400)
 
+    def test_a_teacher_filter_serves_only_their_dated_rows(self):
+        # The Rebždys case: a lecture alternating Monday one week
+        # and Tuesday the next is ONE event per week under the
+        # dated wire — the folded shape used to show both slots
+        # every week (6 lectures instead of 5)
+        monday = _monday_of("2025-R")
+        _lesson("2025-R", day=0, time="13:45", title="Virtualizacijos pagrindai")
+        other = _lesson("2025-R", day=0, time="09:00", title="Kita paskaita")
+        ScheduleEvent.objects.filter(pk=other.pk).update(teacher="B. Kitas")
+        # The alternating twin lands NEXT week, on Tuesday
+        next_tue = ScheduleEvent.objects.get(pk=_lesson("2025-R", day=1, time="13:45",
+                                                        title="Virtualizacijos pagrindai").pk)
+        ScheduleEvent.objects.filter(pk=next_tue.pk).update(date=next_tue.date + timedelta(days=7))
+
+        def week(start):
+            window = f"from={start.isoformat()}&to={(start + timedelta(days=6)).isoformat()}"
+            url = f"/api/schedule/events?teacher=J.%20Jonaitis&{window}"
+            return [(e["date"], e["timeStart"]) for e in self.client.get(url).json()["events"]]
+
+        self.assertEqual(week(monday), [(monday.isoformat(), "13:45")])
+        self.assertEqual(week(monday + timedelta(days=7)),
+                         [((monday + timedelta(days=8)).isoformat(), "13:45")])
+
+    def test_the_filters_sheet_carries_the_teacher_roster(self):
+        from knfapp.schedule.models import ScheduleTeacher
+        stamp = utc_now()
+        ScheduleTeacher.objects.create(id="t1", name="Eimantas Rebždys, Lekt.", last_seen_at=stamp)
+        ScheduleTeacher.objects.create(id="t2", name="agne Zemaite", last_seen_at=stamp)
+        body = self.client.get("/api/schedule/filters").json()
+        # Case-folded order — a lowercase name does not sink
+        self.assertEqual(body["teachers"], ["agne Zemaite", "Eimantas Rebždys, Lekt."])
+
     def test_two_groups_sharing_one_event_answer_under_each(self):
         event = _lesson("2025-R", group="IS-1")
         stamp = utc_now()
