@@ -47,6 +47,7 @@ Table users {
   study_program      text  [null]
   active             boolean  [default: true, note: 'false locks the account out on live sessions too']
   chat_push_preview  boolean  [default: true, note: 'false = push shows "Nauja žinutė" instead of message text']
+  last_active_at     timestamptz  [null, note: 'Stamped best-effort on chat socket connect and read events — the "matytas (-a)" presence line, relationship-gated on the wire']
   created_at         timestamptz
   updated_at         timestamptz
 }
@@ -126,7 +127,7 @@ Table news_posts {
   author_name     text  [null, note: 'Display-name SNAPSHOT; erasure tombstones it to "Ištrintas naudotojas"']
   source          text  [note: 'CHECK: knf.vu.lt / vu.lt / faculty / user / app — the feed score gives sources +15/+10']
   source_url      text  [unique, null, note: 'Scraper dedup key, canonical normalise_url shape']
-  post_type       text  [note: 'CHECK: article / event / social']
+  post_type       text  [note: 'CHECK: article / social / announcement / poll / link']
   is_public       boolean  [default: true, note: 'false = members-only; hidden and missing answer the same 404']
   likes_count     int   [default: 0, note: 'Recomputed from news_likes on every toggle']
   comments_count  int   [default: 0, note: 'Recomputed from news_comments']
@@ -243,7 +244,7 @@ Ref: reports.reporter_id > users.id
 Table activity {
   id               text  [pk, note: 'uuid4']
   user_id          text  [note: 'Whose feed the row lands in']
-  kind             text  [note: 'CHECK: like / comment / friend_accept / wall_post']
+  kind             text  [note: 'CHECK: like / comment / connect_request / connect_accept']
   actor_id         text  [note: 'Who did it']
   subject_id       text  [null, note: 'The post/comment concerned — loose ref, NOT an FK']
   subject_preview  text  [null, note: 'Frozen excerpt for the list row']
@@ -290,7 +291,7 @@ Table messages {
   sender_id        text
   text             text  [note: 'Blanked on unsend']
   image_url        text  [null, note: 'Own /api/uploads/ or /api/memes/file/ path ONLY — the beacon guard']
-  reply_to_id      text  [null, note: 'LOOSE self-reference (no FK) — the TTL sweep deletes quoted rows under live replies; a dangling ref renders as the ghost quote']
+  reply_to_id      text  [null, note: 'LOOSE self-reference (db_constraint=False, no database FK; ORM deletes SET NULL it) — the TTL sweep can still delete quoted rows under live replies, and a dangling ref renders as the ghost quote']
   deleted_at       timestamptz  [null, note: 'SOFT delete ("unsend") — the row keeps its slot, content is cleared']
   client_msg_id    text  [null, note: 'The idempotency nonce of the sender — a retry answers the committed row']
   kind             text  [default: 'text', note: 'CHECK: text / image / file / video / audio / system']
@@ -335,22 +336,78 @@ Ref: message_reactions.user_id > users.id
 
 // ------------------------------------------------------------
 // Timetable, handbook, memes (schedule / info / memes apps)
+// The timetable stores DATED event instances, not weekly
+// patterns: one physical lecture reached through several
+// group feeds lands on ONE row, link tables carry which
+// groups and teachers participate. Every last_seen_at is a
+// scraper confirmation stamp.
 // ------------------------------------------------------------
 
-Table schedule_lessons {
-  id           text  [pk, note: 'uuid4 — but the IDENTITY is the natural key below']
-  title        text
-  teacher      text  [not null, default: '', note: '"" never NULL — a NULL would be distinct in the unique key, so the schema forbids it']
-  room         text  [not null, default: '']
-  time_start   text  [note: '"HH:MM" wall clock']
-  time_end     text
-  day_of_week  int   [note: 'CHECK 0..6, 0 = Monday']
-  group_name   text  [not null, default: '', note: 'Programme abbreviation + course, e.g. "ISKS-1"; parallel groups share it']
-  semester     text  [not null, default: '', note: '"YYYY-R" autumn / "YYYY-P" spring, keyed on the first calendar year of the academic year']
-  created_at   timestamptz
+Table schedule_events {
+  id            text  [pk, note: 'uuid4 — the IDENTITY is the natural key below']
+  title         text
+  lecture_type  text  [not null, default: '', note: '"" never NULL — a NULL inside the unique key would be distinct from every twin (SQLite), so dedup only works over ""']
+  teacher       text  [not null, default: '', note: 'The feed display string VERBATIM — the read side; schedule_event_teachers is the joinable form']
+  room          text  [not null, default: '']
+  date          date  [note: 'A plain DATE — VU publishes Vilnius wall clock, timezones never touch the timetable']
+  time_start    text  [note: '"HH:MM" wall clock']
+  time_end      text
+  semester      text  [not null, default: '', note: '"YYYY-R" autumn / "YYYY-P" spring, derived from date — stored so the picker options stay one GROUP BY']
+  last_seen_at  timestamptz  [note: 'Cleanup deletes FUTURE events whose stamp went stale (the site stopped serving them); past events stay as history until retention']
+  created_at    timestamptz
 
-  Note: 'UNIQUE over (semester, group_name, day_of_week, time_start, time_end, title, teacher, room) — the whole row IS the identity; the scraper rewrites the current semester partitions against it'
+  indexes {
+    date
+    semester
+  }
+
+  Note: 'UNIQUE over (date, time_start, time_end, title, lecture_type, room) — the natural key the conflict-ignoring insert dedups on ACROSS group feeds; teacher and group are deliberately NOT part of it (a teacher swap updates the row)'
 }
+
+Table schedule_groups {
+  slug          text  [pk, note: 'The site slug of the VU group — several slugs may fold to one group_name']
+  display_name  text  [not null, default: '']
+  group_name    text  [note: 'The folded picker name, programme + course, e.g. "ISKS-1" (the "1 grupė / 2 grupė" split dropped) — what the mobile filter and the assistant roster speak']
+  last_seen_at  timestamptz
+
+  indexes {
+    group_name
+  }
+}
+
+Table schedule_teachers {
+  id            text  [pk, note: 'uuid4']
+  name          text  [unique, note: 'The feed display string WHOLE, academic titles included — never split on commas, "doc. dr." would shred']
+  external_id   text  [not null, default: '', note: 'VU employee id — the tracer system fills it, this app writes neither']
+  ad_account    text  [not null, default: '', note: 'Tracer AD autolinker column, unused here']
+  last_seen_at  timestamptz
+}
+
+Table schedule_event_groups {
+  id            int   [pk, increment]
+  event_id      text
+  group_slug    text
+  last_seen_at  timestamptz  [note: 'Per-LINK stamp: a run retires ONE group claim on a shared event (the lecture left that feed) without touching the event or the other links']
+
+  indexes {
+    (event_id, group_slug) [unique]
+  }
+}
+Ref: schedule_event_groups.event_id > schedule_events.id
+Ref: schedule_event_groups.group_slug > schedule_groups.slug
+
+Table schedule_event_teachers {
+  id            int   [pk, increment]
+  event_id      text
+  teacher_id    text
+  last_seen_at  timestamptz  [note: 'Regenerated from the event teacher string on every confirmation — can never drift from the read side']
+
+  indexes {
+    (event_id, teacher_id) [unique]
+  }
+}
+Ref: schedule_event_teachers.event_id > schedule_events.id
+Ref: schedule_event_teachers.teacher_id > schedule_teachers.id
 
 Table faculty_info {
   id          text  [pk, note: 'uuid4 — survives re-scrapes (the row is updated in place)']
@@ -662,7 +719,11 @@ TableGroup "Chat" {
 }
 
 TableGroup "Timetable & Handbook" {
-  schedule_lessons
+  schedule_events
+  schedule_groups
+  schedule_teachers
+  schedule_event_groups
+  schedule_event_teachers
   faculty_info
 }
 
