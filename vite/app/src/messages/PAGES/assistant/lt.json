@@ -1,0 +1,39 @@
+{
+  "TITLE": "AI asistentas",
+  "loadError": "Nepavyko įkelti asistento duomenų.",
+  "stats": {
+    "turns": "Ėjimai (7 d.)",
+    "errors": "Klaidos (7 d.)",
+    "up": "👍 iš viso",
+    "down": "👎 iš viso",
+    "threads": "Pokalbiai"
+  },
+  "knowledge": {
+    "title": "Žinių bazė",
+    "reindex": "Atnaujinti indeksą",
+    "reindexAll": "Perindeksuoti viską",
+    "reindexAllConfirm": "Visi įrašai bus įterpti iš naujo per AI šliuzą. Tęsti?",
+    "reindexDone": "Indeksas atnaujintas: {embedded} nauji, {unchanged} nepakitę, {retired} pašalinti"
+  },
+  "test": {
+    "title": "Paieškos testas",
+    "placeholder": "Studentų klausimas…",
+    "run": "Ieškoti",
+    "empty": "Nieko nerasta — klausimas neturi atramos žinių bazėje."
+  },
+  "prompts": {
+    "title": "Sistemos prompto versijos",
+    "activeLine": "Aktyvi versija: v{version} — tai VISAS asistento sistemos promptas.",
+    "coreLine": "AKTYVIOS VERSIJOS NĖRA — asistentas neatsakinėja (503), kol viena neaktyvuota.",
+    "placeholder": "Visas sistemos promptas. Vietaženkliai: {WEEKDAY}, {TODAY}, {LEADING_LANGUAGE}, {USER_CONTEXT} — jie pakeičiami kiekvieno pokalbio metu.",
+    "notesPlaceholder": "Pastaba apie šią versiją (nebūtina)",
+    "saveActivate": "Išsaugoti ir aktyvuoti",
+    "saveOnly": "Tik išsaugoti",
+    "saved": "Nauja versija išsaugota",
+    "active": "aktyvi",
+    "activate": "Aktyvuoti",
+    "coreOnly": "Deaktyvuoti promptą",
+    "coreOnlyConfirm": "DĖMESIO: be aktyvios versijos asistentas NEATSAKINĖS (klaida 503). Tęsti?",
+    "legend": "Vietaženkliai: {WEEKDAY} — savaitės diena, {TODAY} — data (Europe/Vilnius), {LEADING_LANGUAGE} — kalbos pavadinimas, {USER_CONTEXT} — prisijungusio studento grupė arba svečio instrukcijos."
+  }
+}

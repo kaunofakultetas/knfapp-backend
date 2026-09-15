@@ -16,11 +16,14 @@ WORKDIR /app
 
 
 # Django + configuration + the postgres driver (the engine
-# is a DATABASE_URL choice — the image carries both)
+# is a DATABASE_URL choice — the image carries both) + the
+# assistant's vector column type (the extension itself is
+# baked into the postgres image; this is the ORM side)
 RUN pip install --no-cache-dir                  \
     django==5.2.17                              \
     django-environ==0.13.0                      \
-    "psycopg[binary]==3.3.5"
+    "psycopg[binary]==3.3.5"                    \
+    pgvector==0.4.1
 
 # Auth + serving + the image re-encode gate
 RUN pip install --no-cache-dir                  \

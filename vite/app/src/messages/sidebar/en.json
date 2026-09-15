@@ -23,7 +23,9 @@
   "OPERATIONS": {
     "TITLE": "OPERATIONS",
     "scrapers": "Scrapers",
-    "wayfind": "Indoor navigation"
+    "wayfind": "Indoor navigation",
+    "assistant": "AI assistant",
+    "assistantThreads": "AI conversations"
   },
   "SYSTEM": {
     "TITLE": "SYSTEM",

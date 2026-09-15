@@ -1,0 +1,19 @@
+{
+  "name": "knfapp-assistant",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "nodemon --legacy-watch --delay 0.5 server.js",
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^1.0.0",
+    "ai": "7.0.93",
+    "express": "^5.1.0"
+  }
+}

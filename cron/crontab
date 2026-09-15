@@ -2,3 +2,5 @@
 15 */6 * * *  docker exec knfapp-django python3 manage.py scrape_schedule
 40 3 * * *    docker exec knfapp-django python3 manage.py scrape_info
 20 4 * * *    docker exec knfapp-django python3 manage.py maintenance
+50 4 * * *    docker exec knfapp-django python3 manage.py index_support_corpus
+10 5 * * *    docker exec knfapp-django python3 manage.py prune_assistant_data

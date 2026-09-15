@@ -191,6 +191,32 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = 52 * 1024 * 1024
 
 
 ############################################################
+# AI assistant
+############################################################
+#
+# The faculty AI gateway (ai.knf.vu.lt, OpenAI wire format)
+# — Django only ever calls its EMBEDDINGS endpoint; chat
+# completions belong to the assistant container. The model
+# and dimensions pin what every support_chunks row stores,
+# and ASSISTANT_INTERNAL_SECRET gates the /internal/
+# assistant routes the container calls (empty = the routes
+# refuse everything, failing closed).
+############################################################
+
+AI_GATEWAY_URL = env("AI_GATEWAY_URL", default="https://ai.knf.vu.lt/v1")
+AI_GATEWAY_KEY = env("AI_GATEWAY_KEY", default="")
+AI_EMBED_MODEL = env("AI_EMBED_MODEL", default="text-embedding-3-small")
+AI_EMBED_DIMENSIONS = env.int("AI_EMBED_DIMENSIONS", default=1536)
+ASSISTANT_INTERNAL_SECRET = env("ASSISTANT_INTERNAL_SECRET", default="")
+
+
+
+
+
+
+
+
+############################################################
 # Apps
 ############################################################
 #
@@ -213,6 +239,7 @@ INSTALLED_APPS = [
     "knfapp.chat.apps.ChatConfig",
     "knfapp.wayfind.apps.WayfindConfig",
     "knfapp.ops.apps.OpsConfig",
+    "knfapp.assistant.apps.AssistantConfig",
 ]
 
 

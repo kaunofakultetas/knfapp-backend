@@ -56,6 +56,8 @@ import LinkOffOutlinedIcon from '@mui/icons-material/LinkOffOutlined';
 // OPERATIONS
 import CloudSyncOutlinedIcon from '@mui/icons-material/CloudSyncOutlined';
 import MapOutlinedIcon from '@mui/icons-material/MapOutlined';
+import SmartToyOutlinedIcon from '@mui/icons-material/SmartToyOutlined';
+import ForumOutlinedIcon from '@mui/icons-material/ForumOutlined';
 
 // SYSTEM
 import ApiIcon from '@mui/icons-material/Api';
@@ -101,6 +103,8 @@ const SECTIONS = [
     items: [
       { href: "/scrapers", icon: CloudSyncOutlinedIcon, label: "OPERATIONS.scrapers", roles: ["admin"] },
       { href: "/wayfind", icon: MapOutlinedIcon, label: "OPERATIONS.wayfind" },
+      { href: "/assistant", icon: SmartToyOutlinedIcon, label: "OPERATIONS.assistant", roles: ["admin"] },
+      { href: "/assistant-threads", icon: ForumOutlinedIcon, label: "OPERATIONS.assistantThreads", roles: ["admin"] },
     ],
   },
   {

@@ -158,12 +158,22 @@ def get_feed(request):
     user = get_current_user(request)
 
 
+    # The ?q= text filter: each token is stemmed by trimming
+    # the inflected tail (Lithuanian endings — "stipendijos" /
+    # "stipendija" / "stipendijai" share a stem) and matched
+    # with icontains over title and content; tokens combine
+    # with AND. Empty q filters nothing.
+    q_filter = (request.GET.get("q") or "").strip()[:100]
+
     # STEP 2: the visibility filter, as composable Q objects
     # ======================================================
     visibility = models.Q()
 
     if source_filter:
         visibility &= models.Q(source=source_filter)
+    for token in q_filter.split():
+        stem = token if len(token) <= 4 else token[:max(4, len(token) - 2)]
+        visibility &= (models.Q(title__icontains=stem) | models.Q(content__icontains=stem))
     if before:
         visibility &= models.Q(published_at__lte=before)
 
@@ -189,7 +199,7 @@ def get_feed(request):
         core.feed_version(),
         user["id"] if user else "guest",
         hashlib.sha256(",".join(sorted(friend_ids)).encode("utf-8")).hexdigest()[:16] if user else "-",
-        str(page), str(per_page), source_filter or "-", core.feed_stamp(before),
+        str(page), str(per_page), source_filter or "-", q_filter or "-", core.feed_stamp(before),
     ))
     tag = core.etag_for(seed)
 

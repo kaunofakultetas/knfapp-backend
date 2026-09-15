@@ -42,6 +42,7 @@ from django.db.models import F, Q, Value
 from django.db.models.functions import Greatest
 
 
+from knfapp.assistant.models import AssistantThread, AssistantTurn
 from knfapp.common.timestamps import utc_now
 from knfapp.news.models import NewsLike, NewsPost, PollOption, PollVote
 from knfapp.notifications.models import NotificationChannel, PushToken
@@ -170,6 +171,14 @@ def erase_user_account(user_id):
     # Their own feed is theirs alone; the actor-side rows
     # advertise gestures the deletes above just removed
     Activity.objects.filter(Q(user_id=user_id) | Q(actor_id=user_id)).delete()
+    # AI assistant transcripts are theirs alone too — the users
+    # row survives anonymised, so the CASCADE never fires by
+    # itself: the threads (and their messages, by CASCADE) go
+    # here. The per-turn telemetry keeps its counters but loses
+    # the person: SET_NULL only triggers on a user-row delete,
+    # so the unlink is explicit.
+    AssistantThread.objects.filter(user_id=user_id).delete()
+    AssistantTurn.objects.filter(user_id=user_id).update(user=None)
 
 
     # STEP 4: tombstone the authored snapshots, anonymise the

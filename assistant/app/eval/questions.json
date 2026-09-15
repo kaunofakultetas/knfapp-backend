@@ -1,0 +1,22 @@
+[
+  { "q": "Kaip prisijungti prie VU Wi-Fi?", "lang": "lt", "expectTool": "searchHandbook", "mustMatch": ["eduroam"] },
+  { "q": "Kaip gauti stipendiją?", "lang": "lt", "expectTool": "searchHandbook", "mustMatch": ["stipendij"] },
+  { "q": "Kur atsiimti studento pažymėjimą?", "lang": "lt", "expectTool": "searchHandbook", "mustMatch": ["102|Studij"] },
+  { "q": "Koks bibliotekos darbo laikas?", "lang": "lt", "expectTool": "searchHandbook", "mustMatch": ["9|09"] },
+  { "q": "Koks Studijų skyriaus el. paštas?", "lang": "lt", "expectTool": "searchHandbook", "mustMatch": ["studijos@knf.vu.lt"] },
+  { "q": "Kaip gauti bendrabutį?", "lang": "lt", "expectTool": "searchHandbook", "mustMatch": ["VU IS|bendrabu"] },
+  { "q": "Kur yra studentų atstovybė?", "lang": "lt", "expectTool": "searchHandbook", "mustMatch": ["110"] },
+  { "q": "Ką daryti jei negaliu atvykti į paskaitą?", "lang": "lt", "expectTool": "searchHandbook", "mustMatch": ["dėstytoj"] },
+  { "q": "Kokias magistro programas turi fakultetas?", "lang": "lt", "expectTool": "searchHandbook", "mustMatch": ["magistr"] },
+  { "q": "Kada šiandien paskaitos ISKS-1 grupei?", "lang": "lt", "expectTool": "lookupSchedule", "mustMatch": ["ISKS-1|paskait|nėra"] },
+  { "q": "Kokios paskaitos šią savaitę isks pirmam kursui?", "lang": "lt", "expectTool": "lookupSchedule", "mustMatch": ["ISKS-1|savait"] },
+  { "q": "Kokios naujienos fakultete?", "lang": "lt", "expectTool": "searchNews", "mustMatch": [""] },
+  { "q": "Parašyk man esė apie Kantą", "lang": "lt", "expectTool": null, "mustMatch": ["negal|fakulte|atsipraš"] },
+  { "q": "Koks mano pažymių vidurkis?", "lang": "lt", "expectTool": null, "mustMatch": ["negal|nemat|VU IS"] },
+  { "q": "How do I connect to the university Wi-Fi?", "lang": "en", "expectTool": "searchHandbook", "mustMatch": ["eduroam"] },
+  { "q": "What are the library opening hours?", "lang": "en", "expectTool": "searchHandbook", "mustMatch": ["9|09"] },
+  { "q": "How do I get a scholarship?", "lang": "en", "expectTool": "searchHandbook", "mustMatch": ["scholarship|stipend"] },
+  { "q": "What master's programs does the faculty offer?", "lang": "en", "expectTool": "searchHandbook", "mustMatch": ["master|Magistr"] },
+  { "q": "What is this assistant for?", "lang": "en", "expectTool": null, "mustMatch": ["timetable|schedule|news"] },
+  { "q": "Who won the football world cup?", "lang": "en", "expectTool": null, "mustMatch": ["faculty|sorry|can't|cannot"] }
+]

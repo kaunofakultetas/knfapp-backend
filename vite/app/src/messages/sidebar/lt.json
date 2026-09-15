@@ -23,7 +23,9 @@
   "OPERATIONS": {
     "TITLE": "OPERACIJOS",
     "scrapers": "Scraperiai",
-    "wayfind": "Navigacija pastate"
+    "wayfind": "Navigacija pastate",
+    "assistant": "AI asistentas",
+    "assistantThreads": "AI pokalbiai"
   },
   "SYSTEM": {
     "TITLE": "SISTEMA",

@@ -589,3 +589,62 @@ from knfapp.ops.api.views import health
 urlpatterns += [
     path("api/health", health),                            # GET — 200 ok / 503 with the first reason
 ]
+
+
+
+
+
+
+
+
+############################################################
+# Assistant — the AI container's internal door
+############################################################
+#
+# ISOLATED-NETWORK ONLY: Caddy proxies /api/* and never
+# /internal/*, and every view additionally demands the
+# compose-injected X-Internal-Secret header. The assistant
+# container is the sole caller — retrieval for its
+# searchHandbook tool, the stored conversations, and the
+# per-turn telemetry. Not part of the public wire, so not
+# in swagger.
+#
+# Views live in knfapp/assistant/api/.
+############################################################
+
+from knfapp.assistant.api.admin_views import (
+    activate_prompt, assistant_overview, create_prompt, deactivate_prompt,
+    knowledge_search, list_prompts, reindex_knowledge, review_thread,
+    review_threads,
+)
+from knfapp.assistant.api.internal_views import (
+    active_prompt, assistant_search, message_feedback, thread_delete,
+    thread_messages, threads_claim, threads_create, threads_list,
+    threads_lookup, turn_log,
+)
+
+
+def _admin_prompts_dispatch(request):
+    # One path, two verbs — POST saves a new version, GET lists
+    return create_prompt(request) if request.method == "POST" else list_prompts(request)
+
+urlpatterns += [
+    path("internal/assistant/search", assistant_search),                            # POST — pgvector top-k for searchHandbook
+    path("internal/assistant/prompt", active_prompt),                               # GET — the active prompt appendix
+    path("internal/assistant/threads", threads_create),                             # POST — mint a thread (uuid is the guest credential)
+    path("internal/assistant/threads/list", threads_list),                          # GET — the signed-in list, newest first
+    path("internal/assistant/threads/lookup", threads_lookup),                      # POST — guest bulk fetch by device-held ids
+    path("internal/assistant/threads/claim", threads_claim),                        # POST — login adopts the device's guest threads
+    path("internal/assistant/threads/<uuid:thread_id>/messages", thread_messages),  # GET transcript / POST turn upsert
+    path("internal/assistant/threads/<uuid:thread_id>/feedback", message_feedback),  # POST — thumbs verdict on one message
+    path("internal/assistant/threads/<uuid:thread_id>/delete", thread_delete),      # POST — soft delete
+    path("internal/assistant/turn-log", turn_log),                                  # POST — one telemetry row per turn
+    path("api/admin/assistant/prompts", _admin_prompts_dispatch),                   # GET history / POST a new version (admin)
+    path("api/admin/assistant/prompts/deactivate", deactivate_prompt),              # POST — core prompt alone (admin)
+    path("api/admin/assistant/prompts/<int:version>/activate", activate_prompt),    # POST — switch the live version (admin)
+    path("api/admin/assistant/overview", assistant_overview),                       # GET — KB, turns, ratings, active prompt (admin)
+    path("api/admin/assistant/knowledge/reindex", reindex_knowledge),               # POST — cron's sync on demand (admin, audited)
+    path("api/admin/assistant/knowledge/search", knowledge_search),                 # POST — retrieval test box (admin)
+    path("api/admin/assistant/threads", review_threads),                            # GET — review list, ?rating=down (admin)
+    path("api/admin/assistant/threads/<uuid:thread_id>", review_thread),            # GET — one transcript (admin, audited)
+]

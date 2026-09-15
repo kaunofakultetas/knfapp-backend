@@ -1,0 +1,39 @@
+{
+  "TITLE": "AI assistant",
+  "loadError": "Could not load assistant data.",
+  "stats": {
+    "turns": "Turns (7 d.)",
+    "errors": "Errors (7 d.)",
+    "up": "👍 total",
+    "down": "👎 total",
+    "threads": "Conversations"
+  },
+  "knowledge": {
+    "title": "Knowledge base",
+    "reindex": "Refresh index",
+    "reindexAll": "Re-embed everything",
+    "reindexAllConfirm": "Every entry will be re-embedded through the AI gateway. Continue?",
+    "reindexDone": "Index refreshed: {embedded} new, {unchanged} unchanged, {retired} retired"
+  },
+  "test": {
+    "title": "Retrieval test",
+    "placeholder": "A student question…",
+    "run": "Search",
+    "empty": "Nothing found — this question has no grounding in the knowledge base."
+  },
+  "prompts": {
+    "title": "System prompt versions",
+    "activeLine": "Active version: v{version} — this is the assistant's ENTIRE system prompt.",
+    "coreLine": "NO ACTIVE VERSION — the assistant refuses every chat (503) until one is activated.",
+    "placeholder": "The whole system prompt. Placeholders: {WEEKDAY}, {TODAY}, {LEADING_LANGUAGE}, {USER_CONTEXT} — substituted on every turn.",
+    "notesPlaceholder": "A note about this version (optional)",
+    "saveActivate": "Save and activate",
+    "saveOnly": "Save only",
+    "saved": "New version saved",
+    "active": "active",
+    "activate": "Activate",
+    "coreOnly": "Deactivate the prompt",
+    "coreOnlyConfirm": "WARNING: without an active version the assistant REFUSES every chat (error 503). Continue?",
+    "legend": "Placeholders: {WEEKDAY} — the weekday, {TODAY} — the date (Europe/Vilnius), {LEADING_LANGUAGE} — the language name, {USER_CONTEXT} — the signed-in student's group or the guest instructions."
+  }
+}

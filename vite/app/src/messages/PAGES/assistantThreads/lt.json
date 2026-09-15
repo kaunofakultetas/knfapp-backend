@@ -1,0 +1,20 @@
+{
+  "TITLE": "AI pokalbiai",
+  "loadError": "Nepavyko įkelti pokalbio.",
+  "onlyDown": "Tik su 👎 nusiskundimais",
+  "untitled": "Pokalbis be pavadinimo",
+  "guest": "svečias",
+  "deletedBadge": "ištrintas",
+  "columns": {
+    "title": "Pavadinimas",
+    "preview": "Paskutinis atsakymas",
+    "user": "Naudotojas",
+    "messages": "Žinutės",
+    "deleted": "Būsena",
+    "lastMessageAt": "Paskutinė žinutė"
+  },
+  "transcript": {
+    "title": "Pokalbis",
+    "close": "Užverti"
+  }
+}

@@ -1,0 +1,16 @@
+# -----------------------------------------------------------
+#  [*] knfapp-assistant — dev image
+#
+#  Bare node; compose bind-mounts ./assistant/app over /app
+#  and the entry installs dependencies then watches — the
+#  same dev loop as the vite and jauka chat containers.
+# -----------------------------------------------------------
+
+FROM node:24.16.0
+
+WORKDIR /app
+
+ENV PORT=3000
+EXPOSE 3000
+
+CMD ["sh", "-c", "npm install && npm run dev"]

@@ -2,8 +2,9 @@
 //  knfapp — Django schema (SQLite or Postgres)
 //
 //  Every primary key is a uuid4 TEXT string minted in Python
-//  (except the composite tables and the content-addressed /
-//  scoped ids called out below). Timestamps are real datetime
+//  (except the composite tables, the content-addressed /
+//  scoped ids, and the two bigserial assistant tables called
+//  out below). Timestamps are real datetime
 //  columns holding one aware UTC instant (timestamptz on
 //  Postgres; SQLite stores the engine's own text form and the
 //  ORM converts) — cursors and unread counts compare them as
@@ -380,6 +381,100 @@ Ref: memes.added_by > users.id
 
 
 // ------------------------------------------------------------
+// AI assistant (assistant app) — the support agent's tables.
+// Written only through /internal/assistant/* (the Node
+// container's door, isolated-network + shared secret); the
+// mobile app never reaches them directly. The knowledge base
+// is a pgvector semantic COPY of content whose truth lives
+// elsewhere (faculty_info, news_posts, curated_faq.py).
+// ------------------------------------------------------------
+
+Table support_chunks {
+  id            text  [pk, note: 'CONTENT-derived: "<source>:<source_id>:<hash12>" (chunk-hash prefix) — a reordered document keeps its unchanged ids, an edited chunk gets a NEW id; nothing re-embeds over a reorder']
+  source        text  [note: 'CHECK: handbook / news / curated — which table/file the text came from']
+  source_id     text  [note: 'The row/document in that source, e.g. "lt-faq" or a news_posts id']
+  title         text  [note: 'What the assistant cites; FAQ chunks carry their QUESTION here']
+  section       text  [null]
+  language      text  [default: 'lt', note: 'CHECK: lt / en — search adds a soft distance penalty, never a filter']
+  text          text  [note: 'The embedded passage, ≤1500 chars + overlap']
+  content_hash  text  [note: 'sha256 over title|section|text — the incremental indexer re-embeds only on change']
+  embed_model   text  [note: 'Vectors from different models never compare — search filters on the CURRENT model, a model swap re-embeds']
+  embedding     vector [note: 'vector(1536), text-embedding-3-small; HNSW cosine index added by a vendor-guarded migration (Postgres only — the sqlite test engine skips it)']
+  indexed_at    timestamptz
+  last_seen_at  timestamptz  [note: 'Stamped every run the chunk still exists; rows absent from a run are retired — unless their unit FAILED to chunk or the whole corpus came back empty (a broken run must not empty the knowledge base)']
+
+  indexes {
+    (source, source_id)
+    last_seen_at
+  }
+}
+
+Table assistant_threads {
+  id               text  [pk, note: 'uuid4 minted SERVER-side — for a guest thread the unguessable id IS the credential (device keeps it in its AsyncStorage registry)']
+  user_id          text  [null, note: 'NULL = guest thread, served to any presenter of the id; login CLAIMS ownerless ids. Erasure hard-deletes the threads of the erased person (the users row survives, so no CASCADE would fire)']
+  title            text  [null, note: 'Auto-set from the first user message, 60 chars']
+  preview          text  [null, note: 'First words of the newest ANSWER — the second line of the thread list row']
+  language         text  [default: 'lt', note: 'CHECK: lt / en']
+  created_at       timestamptz
+  last_message_at  timestamptz  [note: 'The sort key of the thread list']
+  deleted_at       timestamptz  [null, note: 'SOFT delete from the GUI (confirm-gated); cron hard-prunes row and messages after retention']
+
+  indexes {
+    (user_id, last_message_at)
+    deleted_at
+  }
+}
+Ref: assistant_threads.user_id > users.id
+
+Table assistant_messages {
+  thread_id   text  [pk, note: 'Composite PK (thread_id, id) — the AI SDK message id is unique per thread, not globally']
+  id          text  [pk, note: 'Client message ids ride as-is; assistant replies are server-minted "srv-<uuid>"']
+  format      text  [default: 'aisdk-v7', note: 'The payload dialect — moves when the mobile ai major does']
+  content     json  [note: 'One UIMessage VERBATIM (role, text/reasoning/tool parts) — reopening a thread replays exactly what was seen']
+  rating      int   [null, note: 'CHECK: -1 / 1 / NULL — the thumbs verdict of the reader. A rated row is EVIDENCE: the replay upsert skips it, never overwrites']
+  created_at  timestamptz  [note: 'Microsecond-stepped per batch position (a shared stamp made ORDER BY a coin flip); immutable on re-upsert']
+
+  indexes {
+    (thread_id, created_at)
+  }
+}
+Ref: assistant_messages.thread_id > assistant_threads.id
+
+Table assistant_turns {
+  id              int   [pk, increment, note: 'bigserial — telemetry, not a wire id']
+  created_at      timestamptz
+  thread_id       text  [null, note: 'SET NULL on thread delete — usage stats OUTLIVE a deleted transcript']
+  user_id         text  [null, note: 'Erasure unlinks explicitly (the users row is anonymised, never deleted)']
+  client_version  text  [null]
+  language        text  [default: 'lt', note: 'CHECK: lt / en']
+  model           text  [note: 'The gateway model id the turn ran on']
+  prompt_version  int   [null, note: 'Which assistant_prompts version rendered the system prompt of this turn']
+  input_tokens    int   [default: 0, note: 'Errored/aborted turns log the step usage they actually burned, not zero']
+  output_tokens   int   [default: 0]
+  tool_calls      json  [null, note: '[{name, ms, ok}] recorded by the tool layer itself — real per-call outcome and duration']
+  duration_ms     int   [default: 0]
+  outcome         text  [default: 'ok', note: 'CHECK: ok / error / aborted — a client hang-up aborts the model run and lands here as aborted']
+
+  indexes {
+    created_at
+  }
+}
+Ref: assistant_turns.thread_id > assistant_threads.id
+Ref: assistant_turns.user_id > users.id
+
+Table assistant_prompts {
+  id          int   [pk, increment, note: 'bigserial']
+  version     int   [unique, note: 'Minted max+1 in a transaction, NEVER reused — the stamped prompt_version of a turn always names exactly the text it ran with; a racing double-save answers 409']
+  text        text  [note: 'The admin-editable system prompt TEMPLATE (placeholders {TODAY}/{WEEKDAY}/{LEADING_LANGUAGE}/{USER_CONTEXT} render per turn); capped at 8000 chars']
+  notes       text  [null]
+  active      boolean  [default: false, note: 'PARTIAL UNIQUE WHERE active — at most ONE live version; none active = the chat answers 503, never a promptless run']
+  created_by  text  [null]
+  created_at  timestamptz  [note: 'Rows are IMMUTABLE — a fix is a new version, the list is the changelog']
+}
+Ref: assistant_prompts.created_by > users.id
+
+
+// ------------------------------------------------------------
 // Admin console (admin app)
 // ------------------------------------------------------------
 
@@ -569,6 +664,14 @@ TableGroup "Chat" {
 TableGroup "Timetable & Handbook" {
   schedule_lessons
   faculty_info
+}
+
+TableGroup "AI Assistant" {
+  support_chunks
+  assistant_threads
+  assistant_messages
+  assistant_turns
+  assistant_prompts
 }
 
 TableGroup "Admin & Scrapers" {

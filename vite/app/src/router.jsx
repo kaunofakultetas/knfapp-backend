@@ -47,6 +47,8 @@ import FacultyInfo from '@/systemPages/CONTENT/FacultyInfo/FacultyInfo';
 // Operations
 import Scrapers from '@/systemPages/OPERATIONS/Scrapers/Scrapers';
 import Wayfind from '@/systemPages/OPERATIONS/Wayfind/Wayfind';
+import Assistant from '@/systemPages/OPERATIONS/Assistant/Assistant';
+import AssistantThreads from '@/systemPages/OPERATIONS/AssistantThreads/AssistantThreads';
 
 // System
 import Account from '@/systemPages/SYSTEM/Account/Account';
@@ -85,6 +87,8 @@ export const router = createBrowserRouter([
       // Operations
       { path: 'scrapers', element: <PageWrapper component={Scrapers} /> },
       { path: 'wayfind', element: <PageWrapper component={Wayfind} /> },
+      { path: 'assistant', element: <PageWrapper component={Assistant} /> },
+      { path: 'assistant-threads', element: <PageWrapper component={AssistantThreads} /> },
 
       // System
       { path: 'account', element: <PageWrapper component={Account} /> },

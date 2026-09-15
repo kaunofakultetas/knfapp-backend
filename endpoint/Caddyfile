@@ -15,6 +15,21 @@
         }
 
 
+        # AI assistant container — must sit above /api/*.
+        # flush_interval -1 disables response buffering: the
+        # chat answer is an SSE token stream, and a buffered
+        # proxy would hold it until the turn ends
+        handle /api/assistant/* {
+            request_body {
+                max_size 2MB
+            }
+            reverse_proxy knfapp-assistant:3000 {
+                flush_interval -1
+                header_up -X-Forwarded-Prefix
+            }
+        }
+
+
         # API backend
         handle /api/* {
             # Oversized bodies die here instead of filling the

@@ -1,0 +1,20 @@
+{
+  "TITLE": "AI conversations",
+  "loadError": "Could not load the conversation.",
+  "onlyDown": "Only with 👎 complaints",
+  "untitled": "Untitled conversation",
+  "guest": "guest",
+  "deletedBadge": "deleted",
+  "columns": {
+    "title": "Title",
+    "preview": "Latest answer",
+    "user": "User",
+    "messages": "Messages",
+    "deleted": "Status",
+    "lastMessageAt": "Last message"
+  },
+  "transcript": {
+    "title": "Conversation",
+    "close": "Close"
+  }
+}

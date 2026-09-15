@@ -860,6 +860,7 @@ def export_me(request):
         except Exception:
             return []
 
+    from knfapp.assistant.models import AssistantMessage, AssistantThread
     from knfapp.chat.models import ConversationParticipant, Message, MessageReaction
     from knfapp.memes.models import Meme
     from knfapp.news.models import NewsComment, NewsLike, NewsPost, PollVote
@@ -949,4 +950,21 @@ def export_me(request):
         ],
         "memes": orm_rows(Meme.objects.filter(added_by_id=user_id).order_by("created_at")
                           .values("id", "title", "tags", "created_at")),
+        # The AI assistant's stored conversations — GDPR export
+        # covers the transcripts too (guest threads carry no
+        # user and are not attributable, so they cannot ride).
+        # content is the verbatim stored UIMessage: the person's
+        # words, the answers, and the tool traffic between them.
+        "assistantThreads": [
+            {**row, "id": str(row["id"])}
+            for row in AssistantThread.objects.filter(user_id=user_id).order_by("created_at")
+            .values("id", "title", "preview", "language",
+                    "created_at", "last_message_at", "deleted_at")
+        ],
+        "assistantMessages": [
+            {**row, "thread_id": str(row["thread_id"])}
+            for row in AssistantMessage.objects.filter(thread__user_id=user_id)
+            .order_by("created_at")
+            .values("thread_id", "id", "content", "rating", "created_at")
+        ],
     })
