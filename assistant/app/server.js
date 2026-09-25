@@ -11,7 +11,8 @@
 //  half-configurations (no gateway key = 503s on chat, no
 //  internal secret = Django refuses every relay), so a
 //  misdeployed container is diagnosed from its first log
-//  lines, not from a phone.
+//  lines, not from a phone — and /health names both halves,
+//  so a probe sees a missing secret too.
 //
 //  Started by: npm run dev (node --watch server.js) in the
 //  dev bind-mount; npm start in the baked image. The app
@@ -43,7 +44,11 @@ app.use("/api/assistant/threads", threadRoutes);
 app.use("/api/assistant/tools", toolsRoutes);
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", model: isModelConfigured() ? "configured" : "missing-key" });
+  res.json({
+    status: "ok",
+    model: isModelConfigured() ? "configured" : "missing-key",
+    internal: INTERNAL_SECRET ? "configured" : "missing-secret",
+  });
 });
 
 

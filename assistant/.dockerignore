@@ -1,0 +1,11 @@
+# The build context is ./assistant. The dev container writes
+# app/node_modules through its bind mount; copying that tree
+# into the production image would let a hand-patched or
+# compromised dependency ride past the lockfile (npm keeps a
+# package it finds at the locked version without re-checking
+# its hash — KNF-152). Tests and the eval harness never run
+# in production.
+app/node_modules
+app/tests
+app/eval
+**/.DS_Store

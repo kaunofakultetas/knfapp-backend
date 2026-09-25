@@ -22,6 +22,8 @@
 
 import hashlib
 import json
+import math
+import re
 
 
 CONNECTOR_KINDS = ("stairs", "elevator", "ramp")
@@ -31,6 +33,31 @@ ENTITY_KINDS = ("level", "node", "edge", "room")
 
 # The plural the document keys an entity kind under
 COLLECTION = {"level": "levels", "node": "nodes", "edge": "edges", "room": "rooms"}
+
+# The id grammar every entity id — and every field that
+# names one (a node's level, an edge's ends, a room's node) —
+# must follow; api/views.py re-exports it for the routes
+ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+
+# Optional fields the app reads as text, per kind: absent,
+# null or a string — anything else is refused at write time,
+# because the phone would crash or misdraw on it (a room's
+# name folded for search, a pano reference resolved as a url)
+OPTIONAL_TEXT = {
+    "level": ("plan",),
+    "node": ("roomId", "pano", "qr", "landmark"),
+    "edge": (),
+    "room": ("nameKey", "nameEn", "category", "hours", "access"),
+}
+
+# Optional fields the router or the stage does ARITHMETIC on,
+# per kind: absent, null or a finite number
+OPTIONAL_NUMBER = {
+    "level": ("northDeg",),
+    "node": ("panoYaw",),
+    "edge": ("closedUntil", "delaySeconds"),
+    "room": (),
+}
 
 
 
@@ -103,7 +130,10 @@ def compile_document(building, rows):
 ############################################################
 
 def document_text(document) -> str:
-    return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    # allow_nan=False: a NaN / Infinity that slipped past the
+    # write checks raises here instead of publishing text no
+    # JSON parser on a phone will read
+    return json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def document_etag(text: str) -> str:
@@ -123,12 +153,21 @@ def document_etag(text: str) -> str:
 # The engine's validateGraph ERROR codes, in Python, over a
 # compiled document. Same codes, same refs, so the app can
 # show a server refusal with the very messages its own
-# validator uses: duplicate_id, unknown_level, dangling_edge,
-# unknown_kind (edges only — a node kind never reaches the
-# router's arithmetic), bad_length, cross_level_hallway,
-# connector_without_length, room_without_node,
-# missing_entrance. Answers the list of issues; empty means
-# publishable.
+# validator uses: duplicate_id, unknown_level, bad_coordinate
+# (a node whose x / y is not a finite number — the router's
+# edge lengths would be NaN and every route 'no_path'),
+# dangling_edge, unknown_kind (edges only — a node kind never
+# reaches the router's arithmetic), bad_length,
+# cross_level_hallway, connector_without_length,
+# room_without_node, missing_entrance. Answers the list of
+# issues; empty means publishable.
+#
+# It never raises on a malformed row: every value used as a
+# set or dict key is checked to be a string first, so a row
+# written before entity_shape_error learned types (a level
+# that is a JSON object, an edge end that is a list) degrades
+# to its issue instead of taking GET /draft and the publish
+# down with a TypeError.
 #
 # Used by:
 #   - api/views.py publish_building — refuses with the list
@@ -154,8 +193,10 @@ def validate_document(document):
         if node["id"] in nodes:
             _issue(issues, "duplicate_id", node["id"], f"node '{node['id']}' is defined twice")
         nodes[node["id"]] = node
-        if node.get("level") not in levels:
+        if not _known(node.get("level"), levels):
             _issue(issues, "unknown_level", node["id"], f"node '{node['id']}' sits on unknown level '{node.get('level')}'")
+        if not (_finite(node.get("x")) and _finite(node.get("y"))):
+            _issue(issues, "bad_coordinate", node["id"], f"node '{node['id']}' has coordinates ({node.get('x')}, {node.get('y')})")
 
 
     # STEP 2: edges — both ends exist, a known kind, a sane
@@ -164,8 +205,8 @@ def validate_document(document):
     # ======================================================
     for edge in document.get("edges", []):
         ref = f"{edge.get('a')}-{edge.get('b')}"
-        a = nodes.get(edge.get("a"))
-        b = nodes.get(edge.get("b"))
+        a = nodes.get(edge.get("a")) if _known(edge.get("a"), nodes) else None
+        b = nodes.get(edge.get("b")) if _known(edge.get("b"), nodes) else None
         if a is None or b is None:
             _issue(issues, "dangling_edge", ref, f"edge {ref} references a missing node")
             continue
@@ -191,14 +232,14 @@ def validate_document(document):
         if room["id"] in rooms:
             _issue(issues, "duplicate_id", room["id"], f"room '{room['id']}' is defined twice")
         rooms.add(room["id"])
-        if room.get("nodeId") not in nodes:
+        if not _known(room.get("nodeId"), nodes):
             _issue(issues, "room_without_node", room["id"], f"room '{room['id']}' points at missing node '{room.get('nodeId')}'")
-        if room.get("level") not in levels:
+        if not _known(room.get("level"), levels):
             _issue(issues, "unknown_level", room["id"], f"room '{room['id']}' sits on unknown level '{room.get('level')}'")
 
     entrance = document.get("entranceNodeId")
-    if entrance and entrance not in nodes:
-        _issue(issues, "missing_entrance", entrance, f"entranceNodeId '{entrance}' is not a node")
+    if entrance and not _known(entrance, nodes):
+        _issue(issues, "missing_entrance", str(entrance), f"entranceNodeId '{entrance}' is not a node")
 
     return issues
 
@@ -215,10 +256,19 @@ def validate_document(document):
 #
 # The one shape check an op's payload gets before it is
 # stored: a JSON object with the fields the engine cannot do
-# without for that kind. Everything finer (a level that does
-# not exist yet, a dangling edge) is the validator's business
-# at publish time — an admin mid-edit is allowed a graph that
-# does not yet hang together. Answers None or the reason.
+# without for that kind, each of the TYPE the engine reads
+# it as — ids are id strings, coordinates / ordinals / scales
+# finite numbers (never a bool, never NaN or Infinity, which
+# the body parser accepts and PostgreSQL's jsonb refuses), a
+# polygon three or more [x, y] points, the optional text
+# fields text and the optional numbers numbers. A room's
+# nodeId may be "" — the editor unlinks a room that way when
+# its node is force-deleted, and the validator then names it
+# room_without_node. Everything finer (a level that does not
+# exist yet, a dangling edge, a length) is the validator's
+# business at publish time — an admin mid-edit is allowed a
+# graph that does not yet hang together. Answers None or the
+# reason.
 #
 # Used by:
 #   - api/views.py post_ops
@@ -239,16 +289,62 @@ def entity_shape_error(kind, data):
     if missing:
         return f"missing {', '.join(missing)}"
 
-    if kind == "node" and data["kind"] not in NODE_KINDS:
-        return f"unknown node kind '{data['kind']}'"
-    if kind == "edge" and data["kind"] not in EDGE_KINDS:
-        return f"unknown edge kind '{data['kind']}'"
     if kind == "level":
+        if not (isinstance(data["label"], str) and data["label"].strip()):
+            return "label must be a non-empty string"
         box = data["viewBox"]
-        if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) for v in box)):
-            return "viewBox must be [minX, minY, width, height]"
-        if not (isinstance(data["metersPerPixel"], (int, float)) and data["metersPerPixel"] > 0):
+        if not (isinstance(box, list) and len(box) == 4 and all(_finite(v) for v in box) and box[2] > 0 and box[3] > 0):
+            return "viewBox must be [minX, minY, width, height] with a positive size"
+        if not (_finite(data["metersPerPixel"]) and data["metersPerPixel"] > 0):
             return "metersPerPixel must be a positive number"
+        if not _finite(data["ordinal"]):
+            return "ordinal must be a number"
+    if kind == "node":
+        if not _is_id(data["level"]):
+            return "level must be a level id"
+        if not (_finite(data["x"]) and _finite(data["y"])):
+            return "x and y must be finite numbers"
+        if data["kind"] not in NODE_KINDS:
+            return f"unknown node kind '{data['kind']}'"
+        geometry = data.get("panoGeometry")
+        if geometry is not None and not _pano_geometry(geometry):
+            return "panoGeometry must carry numeric hfovDeg and vfovDeg"
+        if data.get("panoHeading") is not None and not isinstance(data["panoHeading"], dict):
+            return "panoHeading must be an object or null"
+        links = data.get("panoLinks")
+        if links is not None and not (isinstance(links, list) and all(isinstance(link, dict) and isinstance(link.get("targetNodeId"), str) for link in links)):
+            return "panoLinks must list objects naming a targetNodeId"
+    if kind == "edge":
+        if not (_is_id(data["a"]) and _is_id(data["b"])):
+            return "a and b must be node ids"
+        if data["kind"] not in EDGE_KINDS:
+            return f"unknown edge kind '{data['kind']}'"
+        if data.get("oneWay") is not None and not isinstance(data["oneWay"], bool):
+            return "oneWay must be true, false or null"
+    if kind == "room":
+        if not (isinstance(data["name"], str) and data["name"].strip()):
+            return "name must be a non-empty string"
+        if not _is_id(data["level"]):
+            return "level must be a level id"
+        if not (data["nodeId"] == "" or _is_id(data["nodeId"])):
+            return "nodeId must be a node id"
+        polygon = data.get("polygon")
+        if polygon is not None and not (isinstance(polygon, list) and len(polygon) >= 3 and all(
+                isinstance(point, list) and len(point) == 2 and _finite(point[0]) and _finite(point[1]) for point in polygon)):
+            return "polygon must list at least three [x, y] points"
+        for field in ("aliases", "photos"):
+            value = data.get(field)
+            if value is not None and not (isinstance(value, list) and all(isinstance(item, str) for item in value)):
+                return f"{field} must be a list of strings or null"
+
+
+    # The optional fields every kind shares the rule for
+    for field in OPTIONAL_TEXT[kind]:
+        if data.get(field) is not None and not isinstance(data[field], str):
+            return f"{field} must be a string or null"
+    for field in OPTIONAL_NUMBER[kind]:
+        if data.get(field) is not None and not _finite(data[field]):
+            return f"{field} must be a number or null"
 
     return None
 
@@ -260,14 +356,23 @@ def entity_shape_error(kind, data):
 
 
 ############################################################
-# _issue / _number
+# _issue / _number / _finite / _is_id / _known /
+# _pano_geometry
 ############################################################
 #
-# One issue row in the engine's own shape, and a sort key
-# that tolerates a missing or non-numeric ordinal.
+# One issue row in the engine's own shape; a sort key that
+# tolerates a missing or non-numeric ordinal; whether a value
+# is a finite JSON number (a bool is not one, and neither is
+# NaN or Infinity); whether a value is an entity id; whether
+# a value is a STRING key of the given set / dict — the
+# membership test that cannot raise on an unhashable value;
+# and whether a panorama geometry is an object whose sizes
+# are numbers (its centre / offset numbers or null).
 #
 # Used by:
-#   - validate_document / compile_document (above)
+#   - validate_document / compile_document /
+#     entity_shape_error (above)
+#   - api/views.py — _finite for the building's northDeg
 ############################################################
 
 def _issue(issues, code, ref, message):
@@ -276,3 +381,23 @@ def _issue(issues, code, ref, message):
 
 def _number(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def _finite(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_id(value):
+    return isinstance(value, str) and ENTITY_ID_RE.match(value) is not None
+
+
+def _known(value, keys):
+    return isinstance(value, str) and value in keys
+
+
+def _pano_geometry(geometry):
+    if not isinstance(geometry, dict):
+        return False
+    if not (_finite(geometry.get("hfovDeg")) and _finite(geometry.get("vfovDeg"))):
+        return False
+    return all(geometry.get(field) is None or _finite(geometry.get(field)) for field in ("centreYawDeg", "vOffsetDeg"))

@@ -4,14 +4,20 @@
 #  The ranked unified feed with its weak-ETag 304 path,
 #  post create/read/delete, the like toggle and share
 #  counter, the comment thread, and the poll lifecycle —
-#  behind the frozen wire contract, plus the three
+#  behind the frozen wire contract, plus the four
 #  invariants every write here honours: counters are
 #  RECOMPUTED from child rows inside the UPDATE itself
 #  (never ±1, never a count carried through Python), a
 #  hidden post
-#  answers the same 404 as a missing one, and every write
+#  answers the same 404 as a missing one, every write
 #  that changes a feed page bumps the post's updated_at —
-#  the feed fingerprint's moving term (core.feed_version).
+#  the feed fingerprint's moving term (core.feed_version) —
+#  and every writer that touches a post's children LOCKS
+#  THE POST ROW FIRST (core.lock_post): one lock order, post
+#  then children, so two engagements on one post serialise
+#  (the second recount runs on a snapshot that already
+#  holds the first one's row) and no pair of writers can
+#  deadlock by taking the two in opposite orders.
 #
 #  Split into:
 #
@@ -54,7 +60,7 @@ from knfapp.news.models import (
     PollVote,
 )
 from knfapp.social.activity import drop_activity, record_activity
-from knfapp.social.models import Friendship
+from knfapp.social.models import Activity, Friendship
 from knfapp.uploads.storage import delete_upload, owns_upload
 from knfapp.users.auth import get_current_user, require_auth
 from knfapp.users.models import User
@@ -182,17 +188,27 @@ def _cacheable(response, tag, shared):
 # their friends' wall posts, non-staff never see a private
 # faculty draft, and a wall post by an account on either
 # side of a block with the viewer is never listed (official
-# rows are — see core.can_view_post). The ranking runs on a
-# NARROW id-only query; only the page of ids is joined out
-# to full rows. Every answer carries a weak ETag over the
-# feed fingerprint plus every input the visibility filter
-# took — the caller, their role, their friend set, their
-# block set — and the query; a 304 is decided before any
-# ranking work.
+# rows are — see core.can_view_post), nor one whose author
+# is deactivated (the liveness rule, for everyone — an
+# admin reaches such a post only by its id). ?truncate=1
+# cuts every body to SUMMARY_LENGTH with the `truncated`
+# flag — a card renders the summary and the article screen
+# fetches the post whole, so the phone opts in and ~85% of
+# the page stops travelling; the admin panel's list reads
+# bodies and does not. The ranking runs on a NARROW id-only
+# query; only the page of ids is joined out to full rows.
+# Every answer carries a weak ETag over the feed
+# fingerprint plus every input the visibility filter took —
+# the caller, their role, their friend set, their block
+# set, the inactive-author stamp — and the query (the
+# truncate flag included: it changes the bytes); a 304 is
+# decided before any ranking work.
 #
 # Used by:
 #   - services/api/news.ts fetchNewsFeed — the news tab's
-#     source chips map straight onto ?source
+#     source chips map straight onto ?source; it asks with
+#     ?truncate=1
+#   - vite admin panel — NewsTable (full bodies)
 ############################################################
 
 def get_feed(request):
@@ -212,6 +228,10 @@ def get_feed(request):
         if pinned is None:
             return json_error("before must be an ISO-8601 timestamp", 400)
         before = pinned
+
+    # List-page bodies: anything but an explicit yes keeps them
+    # whole, so a client that never heard of the flag is unchanged
+    truncate = (clean_param(request.GET.get("truncate")) or "").strip().lower() in ("1", "true")
 
     offset = (page - 1) * per_page
     user = get_current_user(request)
@@ -236,6 +256,12 @@ def get_feed(request):
         visibility &= (models.Q(title__icontains=stem) | models.Q(content__icontains=stem))
     if before:
         visibility &= models.Q(published_at__lte=before)
+
+    # The liveness rule (core.can_view_post): a deactivated
+    # author's wall posts leave every page — the same clause
+    # social_feed carries; an author-less row stays
+    visibility &= (~models.Q(source="user") | models.Q(author__active=True)
+                   | models.Q(author__isnull=True))
 
     friend_ids = []
     blocked = set()
@@ -267,11 +293,13 @@ def get_feed(request):
     # ============================================================
     seed = "|".join((
         core.feed_version(),
+        core.inactive_authors_stamp(),
         user["id"] if user else "guest",
         user["role"] if user else "-",
         _set_token(friend_ids) if user else "-",
         _set_token(blocked) if user else "-",
         str(page), str(per_page), source_filter or "-", q_filter or "-", core.feed_stamp(before),
+        "t" if truncate else "-",
     ))
     tag = core.etag_for(seed)
 
@@ -301,11 +329,14 @@ def get_feed(request):
             .annotate(live_author_name=models.F("author__display_name"))
             .values(*core.POST_FIELDS, "live_author_name")
         }
-        posts = [core.post_to_dict(by_id[pid]) for pid in post_ids if pid in by_id]
+        posts = [core.post_to_dict(by_id[pid], truncate=truncate) for pid in post_ids if pid in by_id]
 
 
-    # STEP 6: the caller's like flags, one IN query per page
-    # ======================================================
+    # STEP 6: the caller's like flags, one IN query per page, and
+    # the tallies as THIS reader can see them (a block hides the
+    # other side's likes and comments — core
+    # .subtract_blocked_engagement)
+    # ============================================================
     liked_set = set()
     if user and post_ids:
         liked_set = set(
@@ -314,6 +345,7 @@ def get_feed(request):
         )
     for p in posts:
         p["liked"] = p["id"] in liked_set
+    core.subtract_blocked_engagement(posts, blocked)
 
 
     # STEP 7: poll cards ship their poll inline — three batched
@@ -416,6 +448,7 @@ def _spawn_news_push(title, summary, data, exclude_user_id):
 # Used by:
 #   - services/api/news.ts createPost — the create-post
 #     screen; a poll follows via create_poll
+#   - vite admin panel — NewPost (a staff announcement)
 ############################################################
 
 @require_methods("POST")
@@ -438,7 +471,7 @@ def create_post(request):
     raw_title = data.get("title")
     if raw_title is not None and not isinstance(raw_title, str):
         return json_error("title must be a string", 400)
-    title = (raw_title or "").strip() or content[:80]
+    title = (raw_title or "").strip() or core.derive_title(content)
 
     if len(title) > core.MAX_TITLE_LENGTH:
         return json_error(f"Title must be at most {core.MAX_TITLE_LENGTH} characters", 400)
@@ -519,18 +552,28 @@ def create_post(request):
 ############################################################
 #
 # GET serves one visible post (404 for missing AND hidden —
-# existence never leaks) with the viewer's liked flag and
-# the additive poll object. DELETE is author-or-admin;
+# existence never leaks) with the viewer's liked flag, the
+# tallies as the viewer can see them (a block hides the other
+# side's likes and comments) and the additive poll object. DELETE is author-or-admin;
 # scraped articles get their source_url tombstoned first so
-# the scrapers cannot resurrect them, dependants go before
-# the row (belt and braces beside the FK cascade), and the
-# cover upload is handed to the uploads sink after the
-# commit AS THE AUTHOR'S — also when an admin deletes the
-# post: the sink refuses a file the author never owned.
+# the scrapers cannot resurrect them, the post row is locked
+# before its dependants go (the writers' one lock order —
+# core.lock_post), dependants go before the row (belt and
+# braces beside the FK cascade) together with the like and
+# comment ACTIVITY rows that point at it (activity keys the
+# post by a bare subject_id, so nothing cascades — without
+# the reap every liker's and commenter's notification would
+# dead-end on a 404), and the cover upload is handed to the
+# uploads sink after the commit AS THE AUTHOR'S — also when
+# an admin deletes the post: the sink refuses a file the
+# author never owned.
 #
 # Used by:
-#   - services/api/news.ts fetchNewsPost (the detail screen);
-#     DELETE is swagger-documented for moderation
+#   - services/api/news.ts fetchNewsPost — the article
+#     screen, and the feed's and profile's re-read of the post
+#     they opened (components/news/openedPostResync.ts)
+#   - vite admin panel — PostDetails (DELETE, the moderation
+#     lever) and ReportDetails (GET, a reported post's title)
 ############################################################
 
 def get_post(request, post_id):
@@ -541,6 +584,10 @@ def get_post(request, post_id):
 
     body = core.post_to_dict(row)
     body["liked"] = bool(user) and NewsLike.objects.filter(user_id=user["id"], post_id=post_id).exists()
+    # The tallies as this reader can see them — the thread below
+    # drops a blocked pair's comments, so must the count
+    if user:
+        core.subtract_blocked_engagement([body], core.block_set(user["id"]))
 
     if row["post_type"] == "poll":
         poll = core.polls_for_posts([post_id], user["id"] if user else None).get(post_id)
@@ -576,15 +623,18 @@ def delete_post(request, post_id):
         )
 
 
-    # STEP 3: dependants first, then the row — one transaction
-    # (ATOMIC_REQUESTS) for the lot
+    # STEP 3: the post row locked, dependants first, then the
+    # row — one transaction (ATOMIC_REQUESTS) for the lot; the
+    # notifications about it go with it
     # ========================================================
+    core.lock_post(post_id)
     NewsLike.objects.filter(post_id=post_id).delete()
     NewsComment.objects.filter(post_id=post_id).delete()
     for poll_id in Poll.objects.filter(post_id=post_id).values_list("id", flat=True):
         PollVote.objects.filter(poll_id=poll_id).delete()
         PollOption.objects.filter(poll_id=poll_id).delete()
         Poll.objects.filter(id=poll_id).delete()
+    Activity.objects.filter(subject_id=post_id, kind__in=("like", "comment")).delete()
     NewsPost.objects.filter(id=post_id).delete()
 
 
@@ -617,14 +667,22 @@ def delete_post(request, post_id):
 # toggle_like / share_post
 ############################################################
 #
-# The like flips the caller's news_likes row on a post they
-# may ENGAGE with (_can_engage: the read gate plus the
-# block's pair test on official rows; get_or_create absorbs
-# the concurrent-toggle PK race) and RECOMPUTES likes_count
-# from the rows inside the UPDATE (_child_count — one
-# statement, never a count carried through Python); the
-# author's activity row rides the same
-# transaction — a like lands one, an unlike takes it back.
+# The like SETS or flips the caller's news_likes row on a
+# post they may ENGAGE with (_can_engage: the read gate plus
+# the block's pair test on official rows). A body of
+# {"liked": true|false} is the state to reach — idempotent,
+# so a client queue that coalesces a burst of taps down to
+# "the one in flight + the final intent" lands exactly the
+# final intent (two flips of a toggle would undo each other
+# — KNF-110); no body keeps the legacy flip for older
+# clients. Under the post's row lock (core.lock_post) the read
+# of the current row and the write cannot race, and a set
+# that is already true writes nothing at all — no recount,
+# no stamp, no second notification. A real change RECOMPUTES
+# likes_count from the rows inside the UPDATE (_child_count
+# — one statement, never a count carried through Python);
+# the author's activity row rides the same transaction — a
+# like lands one, an unlike takes it back.
 # The share bumps shares_count with no auth (guests share
 # too), so its budget keys on the client IP — the only
 # identity a guest has — under the plain visibility gate: a
@@ -636,45 +694,67 @@ def delete_post(request, post_id):
 # a crash.
 #
 # Used by:
-#   - services/api/news.ts toggleLikeApi / sharePostApi
+#   - packages/socialengine/src/adapters/knf/index.ts setLiked
+#     — POST …/like with {"liked"}, behind useLikeToggle on
+#     the news tab's cards and the article screen
+#   - services/api/news.ts sharePostApi — the share tally
+#     recorded by the news tab and the article screen
 ############################################################
 
 @require_methods("POST")
 @require_auth
 @ratelimit.per_user("news_like", max_attempts=300)
 def toggle_like(request, post_id):
+    # STEP 1: the optional target state — absent means "flip"
+    # (the legacy toggle), anything but a real boolean is a 400
+    # ==========================================================
+    data = get_json_object(request) or {}
+    desired = data.get("liked")
+    if desired is not None and not isinstance(desired, bool):
+        return json_error("liked must be a boolean", 400)
+    user_id = request.user["id"]
+
+
+    # STEP 2: the post locked, then gated
+    # ===================================
+    core.lock_post(post_id)
     post = _gate_row(post_id)
     if not post or not _can_engage(post, request.user):
         return json_error("Post not found", 404)
 
-    _, created = NewsLike.objects.get_or_create(
-        user_id=request.user["id"], post_id=post_id,
-        defaults={"created_at": utc_now()},
-    )
-    if created:
-        liked = True
-    else:
-        NewsLike.objects.filter(user_id=request.user["id"], post_id=post_id).delete()
-        liked = False
 
-    # Recomputed from the rows in ONE statement, not ±1 and not a
-    # count read first — the correlated subquery is evaluated by
-    # the database inside the UPDATE (a .count() bound as an integer
-    # would be a second statement, and two racing likes would both
-    # read 1 and both write 1); a drifted counter heals the same way
-    NewsPost.objects.filter(id=post_id).update(
-        likes_count=_child_count(NewsLike),
-        updated_at=utc_now(),
-    )
-
-    author = NewsPost.objects.filter(id=post_id).values("author_id", "title").first()
-    if author:
+    # STEP 3: reach the target — a no-op set changes nothing
+    # ======================================================
+    held = NewsLike.objects.filter(user_id=user_id, post_id=post_id).exists()
+    liked = (not held) if desired is None else desired
+    if liked != held:
         if liked:
-            record_activity(author["author_id"], "like", request.user["id"],
-                            post_id, (author["title"] or "")[:80] or None)
+            NewsLike.objects.get_or_create(user_id=user_id, post_id=post_id,
+                                           defaults={"created_at": utc_now()})
         else:
-            drop_activity(author["author_id"], "like", request.user["id"], post_id)
+            NewsLike.objects.filter(user_id=user_id, post_id=post_id).delete()
 
+        # Recomputed from the rows in ONE statement, not ±1 and not a
+        # count read first — the correlated subquery is evaluated by
+        # the database inside the UPDATE (a .count() bound as an integer
+        # would be a second statement, and two racing likes would both
+        # read 1 and both write 1); a drifted counter heals the same way
+        NewsPost.objects.filter(id=post_id).update(
+            likes_count=_child_count(NewsLike),
+            updated_at=utc_now(),
+        )
+
+        author = NewsPost.objects.filter(id=post_id).values("author_id", "title").first()
+        if author:
+            if liked:
+                record_activity(author["author_id"], "like", user_id,
+                                post_id, (author["title"] or "")[:80] or None)
+            else:
+                drop_activity(author["author_id"], "like", user_id, post_id)
+
+
+    # STEP 4: the settled state and the stored count
+    # ==============================================
     fresh = NewsPost.objects.filter(id=post_id).values("likes_count").first()
     if not fresh:
         return json_error("Post not found", 404)
@@ -726,12 +806,21 @@ def share_post(request, post_id):
 # wrote with ONE clock read; delete_comment is
 # comment-author /
 # post-author / admin, and the comment must belong to the
-# post in the path. Both writes stamp updated_at — the feed
-# fingerprint's moving term.
+# post in the path. Both writes lock the post row first
+# (core.lock_post) and stamp updated_at — the feed
+# fingerprint's moving term. A delete also settles the post
+# author's "X commented on your post" row, whose excerpt is
+# the commenter's NEWEST comment text: it follows the newest
+# comment that survives (excerpt and stamp, the read flag
+# untouched — an old comment is not news), and goes when
+# none does — a moderated insult must not live on verbatim
+# in its victim's notification list.
 #
 # Used by:
-#   - services/api/news.ts fetchComments / addCommentApi;
-#     the delete is swagger-documented moderation
+#   - services/api/news.ts fetchComments / addCommentApi /
+#     deleteCommentApi — the article screen and the full
+#     thread (delete on the viewer's own comment, or on any
+#     comment under their own post; admins everywhere)
 ############################################################
 
 def get_comments(request, post_id):
@@ -783,6 +872,7 @@ def add_comment(request, post_id):
     if len(comment_text) > core.MAX_COMMENT_LENGTH:
         return json_error(f"Comment must be at most {core.MAX_COMMENT_LENGTH} characters", 400)
 
+    core.lock_post(post_id)
     post = _gate_row(post_id)
     if not post or not _can_engage(post, request.user):
         return json_error("Post not found", 404)
@@ -816,9 +906,10 @@ def add_comment(request, post_id):
 @require_auth
 @ratelimit.per_user("news_comment_delete", max_attempts=60)
 def delete_comment(request, post_id, comment_id):
-    # STEP 1: the post gates the thread, then the comment must be
-    # one of ITS comments
-    # ===========================================================
+    # STEP 1: the post locked and gating the thread, then the
+    # comment must be one of ITS comments
+    # ========================================================
+    core.lock_post(post_id)
     post = _gate_row(post_id)
     if not post or not core.can_view_post(post, request.user):
         return json_error("Post not found", 404)
@@ -843,10 +934,29 @@ def delete_comment(request, post_id, comment_id):
     # =============================================================
     NewsComment.objects.filter(id=comment_id).delete()
     NewsPost.objects.filter(id=post_id).update(comments_count=_child_count(NewsComment), updated_at=utc_now())
-    fresh = NewsPost.objects.filter(id=post_id).values("comments_count").first()
+    fresh = NewsPost.objects.filter(id=post_id).values("id", "likes_count", "comments_count").first()
+    # The count the caller's thread shows — without a blocked
+    # pair's comments, as get_comments' total is
+    remaining = [{"id": post_id, "likes": fresh["likes_count"], "comments": fresh["comments_count"]}] if fresh else []
+    core.subtract_blocked_engagement(remaining, core.block_set(user["id"]))
+
+
+    # STEP 4: the author's notification follows the commenter's
+    # newest SURVIVING comment, or goes — never the deleted text
+    # ==========================================================
+    survivor = (
+        NewsComment.objects.filter(post_id=post_id, user_id=comment["user_id"])
+        .order_by("-created_at", "-id").values("text", "created_at").first()
+    )
+    if survivor is None:
+        drop_activity(post["author_id"], "comment", comment["user_id"], post_id)
+    elif post["author_id"]:
+        Activity.objects.filter(
+            user_id=post["author_id"], kind="comment", actor_id=comment["user_id"], subject_id=post_id,
+        ).update(subject_preview=survivor["text"][:80], created_at=survivor["created_at"])
 
     logger.info("Comment %s on post %s deleted by %s", comment_id, post_id, user["id"])
-    return json_response({"status": "deleted", "comments": fresh["comments_count"] if fresh else 0})
+    return json_response({"status": "deleted", "comments": remaining[0]["comments"] if remaining else 0})
 
 
 
@@ -864,19 +974,28 @@ def delete_comment(request, post_id, comment_id):
 # exactly that into null). create is author-or-admin, one
 # poll per post (the unique constraint answers the racing
 # twin the same 409), scraped articles refused, end_date
-# normalised to explicit UTC at the door. delete restores
+# normalised to explicit UTC at the door and refused when it
+# is not in the future (400 end_date_in_the_past — a 201 for
+# a poll every vote would bounce off as "Poll has ended" is
+# a dead poll nobody is told about). delete restores
 # the post_type its source implies. vote casts or moves via
 # an ON CONFLICT upsert; re-voting the held option is the
 # 409 the client treats as a no-op; the option counters are
 # RECOMPUTED from the rows (the poll total is derived from
-# them at shape time, never stored). Attach, detach and
+# them at shape time, never stored). All three writes lock
+# the post row before the poll rows (core.lock_post — the one
+# lock order). Attach, detach and
 # vote all stamp the post's updated_at: none of them moves
 # a news_posts counter, and the feed's poll cards would
 # otherwise sit behind a stale 304.
 #
 # Used by:
-#   - services/api/news.ts fetchPoll / createPollApi /
-#     votePollApi (PollWidget); delete is swagger-documented
+#   - packages/socialengine/src/adapters/knf/index.ts
+#     fetchPoll (GET) and vote (POST …/poll/vote) — usePoll
+#     behind components/news/PollWidget.tsx
+#   - services/api/news.ts createPollApi (POST) — the
+#     create-post screen's attach step
+#   - DELETE has no app client (swagger-documented)
 ############################################################
 
 def get_poll(request, post_id):
@@ -929,19 +1048,23 @@ def create_poll(request, post_id):
 
 
     # STEP 3: the optional end date — parsed AND moved onto UTC
-    # here, so the vote gate never has to guess
+    # here, so the vote gate never has to guess, and in the
+    # future (the vote gate compares with the same clock)
     # =========================================================
     end_date = data.get("end_date")
     if end_date is not None:
         pinned = core.as_utc(core.parse_iso(end_date))
         if pinned is None:
             return json_error("end_date must be an ISO-8601 timestamp", 400)
+        if pinned <= utc_now():
+            return json_error("end_date must be in the future", 400, code="end_date_in_the_past")
         end_date = pinned
 
 
     # STEP 4: visible + owned (or admin) + not scraped + not
-    # already polled
+    # already polled — the post row locked first
     # ======================================================
+    core.lock_post(post_id)
     post = _gate_row(post_id)
     if not post or not core.can_view_post(post, request.user):
         return json_error("Post not found", 404)
@@ -987,8 +1110,10 @@ def create_poll(request, post_id):
 @require_auth
 @ratelimit.per_user("news_poll", max_attempts=20)
 def delete_poll(request, post_id):
-    # STEP 1: the post gates the poll, then author-or-admin
-    # =====================================================
+    # STEP 1: the post locked and gating the poll, then
+    # author-or-admin
+    # =================================================
+    core.lock_post(post_id)
     post = _gate_row(post_id)
     if not post or not core.can_view_post(post, request.user):
         return json_error("Post not found", 404)
@@ -1037,8 +1162,9 @@ def vote_poll(request, post_id):
     user_id = request.user["id"]
 
 
-    # STEP 2: the post gates its poll
-    # ===============================
+    # STEP 2: the post locked and gating its poll
+    # ===========================================
+    core.lock_post(post_id)
     post = _gate_row(post_id)
     if not post or not core.can_view_post(post, request.user):
         return json_error("No poll found for this post", 404)

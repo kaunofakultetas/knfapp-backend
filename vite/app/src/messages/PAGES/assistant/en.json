@@ -13,7 +13,8 @@
     "reindex": "Refresh index",
     "reindexAll": "Re-embed everything",
     "reindexAllConfirm": "Every entry will be re-embedded through the AI gateway. Continue?",
-    "reindexDone": "Index refreshed: {embedded} new, {unchanged} unchanged, {retired} retired"
+    "reindexDone": "Index refreshed: {embedded} new, {unchanged} unchanged, {retired} retired",
+    "retireBlockedConfirm": "The refresh would have retired {count} entries (over a quarter of the knowledge base), so nothing was retired — usually a sign of a broken scrape. Did the source really shrink, and should these entries be retired?"
   },
   "test": {
     "title": "Retrieval test",

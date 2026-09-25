@@ -39,11 +39,13 @@ const BASE = `http://127.0.0.1:${server.address().port}`;
 after(() => new Promise((resolve) => server.close(resolve)));
 
 
-test("the server listens on the configured port and /health reports the model configuration", async () => {
+test("the server listens on the configured port and /health reports the model AND secret configuration", async () => {
   assert.ok(server.address().port > 0, "an ephemeral port was taken");
   const response = await fetch(`${BASE}/health`);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { status: "ok", model: "configured" });
+  // `internal` is new: a deploy missing ASSISTANT_INTERNAL_SECRET
+  // answered a plain "ok" while Django refused every relay
+  assert.deepEqual(await response.json(), { status: "ok", model: "configured", internal: "configured" });
 });
 
 

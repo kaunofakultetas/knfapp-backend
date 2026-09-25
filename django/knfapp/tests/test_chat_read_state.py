@@ -5,7 +5,10 @@
 #  ever advances, the receipt cap, the shared socket+REST
 #  budget, and the send path settling both stores through
 #  the same helper — replying is reading), the
-#  relationship-gated presence oracle, the
+#  relationship-gated presence oracle (a relationship the
+#  other side TOOK PART in — a message they wrote in a
+#  shared room, or a friendship — never a room a stranger
+#  forced them into, and never across a block), the
 #  people picker's exclusions and ranking, the socket rate
 #  window, and the chat side of erasure and export.
 ############################################################
@@ -263,6 +266,60 @@ class SocketRateTests(TestCase):
 
 
 class PresenceTests(ReadStateTestCase):
+
+    def setUp(self):
+        super().setUp()
+        # The relationship the gate asks for is one ona TOOK PART
+        # in: she has written in the room she shares with tomas
+        create_message(self.room, self.ona, text="Labas", minutes_ago=5)
+
+    def _presence(self, ids, token=None):
+        response = bearer(self.client.post, "/api/chat/online-status", token or self.tomas_token,
+                          data=json.dumps({"userIds": ids}), content_type="application/json")
+        return json.loads(response.content)
+
+    def test_a_forced_room_reveals_nothing(self):
+        # KNF-056: a stranger creates a DM with viktorija in one
+        # request — bare co-membership must not open her presence
+        viktorija = create_user(username="viktorija")
+        mallory_token = auth.mint_session(create_user(username="mallory").id)
+        from knfapp.common.timestamps import utc_now
+        from knfapp.users.models import User
+        User.objects.filter(id=viktorija.id).update(last_active_at=utc_now())
+        events._connected_users["sid-viktorija"] = viktorija.id
+        self.addCleanup(events.reset_socket_state)
+
+        created = bearer(self.client.post, "/api/chat/conversations", mallory_token,
+                         data=json.dumps({"participantIds": [viktorija.id], "type": "direct"}),
+                         content_type="application/json")
+        self.assertEqual(created.status_code, 201)
+        body = self._presence([viktorija.id], token=mallory_token)
+        self.assertFalse(body["online"][viktorija.id])
+        self.assertIsNone(body["lastSeen"][viktorija.id])
+
+        # Once SHE writes in the room, the relationship is hers too
+        room_id = json.loads(created.content)["conversationId"]
+        from knfapp.chat.models import Conversation
+        create_message(Conversation.objects.get(id=room_id), viktorija, text="Kas čia?")
+        self.assertTrue(self._presence([viktorija.id], token=mallory_token)["online"][viktorija.id])
+
+    def test_a_friend_is_visible_without_a_shared_room(self):
+        from .utils import befriend
+        draugas = create_user(username="draugas")
+        befriend(self.tomas, draugas)
+        events._connected_users["sid-draugas"] = draugas.id
+        self.addCleanup(events.reset_socket_state)
+        self.assertTrue(self._presence([draugas.id])["online"][draugas.id])
+
+    def test_a_block_hides_presence_both_ways(self):
+        from knfapp.social.models import UserBlock
+        from knfapp.common.timestamps import utc_now
+        events._connected_users["sid-ona"] = self.ona.id
+        self.addCleanup(events.reset_socket_state)
+        self.assertTrue(self._presence([self.ona.id])["online"][self.ona.id])
+        UserBlock.objects.create(blocker_id=self.ona.id, blocked_id=self.tomas.id, created_at=utc_now())
+        self.assertFalse(self._presence([self.ona.id])["online"][self.ona.id])
+        self.assertFalse(self._presence([self.tomas.id], token=self.ona_token)["online"][self.tomas.id])
 
     def test_presence_is_relationship_gated(self):
         stranger = create_user(username="svetimas")

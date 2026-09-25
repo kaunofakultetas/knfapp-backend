@@ -13,7 +13,8 @@
     "reindex": "Atnaujinti indeksą",
     "reindexAll": "Perindeksuoti viską",
     "reindexAllConfirm": "Visi įrašai bus įterpti iš naujo per AI šliuzą. Tęsti?",
-    "reindexDone": "Indeksas atnaujintas: {embedded} nauji, {unchanged} nepakitę, {retired} pašalinti"
+    "reindexDone": "Indeksas atnaujintas: {embedded} nauji, {unchanged} nepakitę, {retired} pašalinti",
+    "retireBlockedConfirm": "Atnaujinimas būtų pašalinęs {count} įrašų (daugiau nei ketvirtadalį žinių bazės), todėl nepašalinta nieko — dažniausiai taip nutinka, kai sugenda nuskaitymas. Ar šaltinis tikrai sumažėjo ir šiuos įrašus reikia pašalinti?"
   },
   "test": {
     "title": "Paieškos testas",

@@ -144,3 +144,29 @@ class MemeLibraryTests(TestCase):
         body = self._push(_jpg_bytes()).json()["meme"]
         self.assertEqual(self.client.get("/api/memes").status_code, 401)
         self.assertEqual(self.client.get(body["url"]).status_code, 200)
+
+
+
+
+
+
+
+
+class ServeTransactionTests(TestCase):
+
+    def test_the_public_file_serve_opens_no_transaction(self):
+        # KNF-135: the bytes of a meme need no table — the GET must
+        # not pay for the request-wide transaction (not even a
+        # savepoint) that ATOMIC_REQUESTS wraps every view in
+        self.assertTrue(getattr(meme_views.serve_meme, "_non_atomic_requests", None))
+        tmp = tempfile.mkdtemp(prefix="knfapp-memes-serve-")
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        meme_views._memes_dir_cache = tmp
+        self.addCleanup(lambda: setattr(meme_views, "_memes_dir_cache", None))
+        name = "a" * 32 + ".gif"
+        with open(f"{tmp}/{name}", "wb") as handle:
+            handle.write(_gif_bytes().getvalue())
+        with self.assertNumQueries(0):
+            response = Client().get(f"/api/memes/file/{name}")
+        self.assertEqual(response.status_code, 200)
+        response.close()

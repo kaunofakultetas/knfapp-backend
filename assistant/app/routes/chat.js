@@ -13,7 +13,14 @@
 //  The response head waits for the model's first word: a
 //  gateway that refuses the turn (quota, dead key, 5xx) is
 //  answered as the JSON envelope with the status it means,
-//  not as apology text inside a 200.
+//  not as apology text inside a 200 — and one that goes
+//  SILENT before its first word is a 504. A gateway that
+//  stalls mid-answer (the chunk / step / total ceilings) is
+//  told apart from the student pressing Stop: the answer is
+//  closed with a visible "cut off" line and an error frame
+//  (the phone's banner, with Retry), the stored reply carries
+//  the same line, and the telemetry says error, not aborted
+//  (KNF-067).
 //
 //  Split into:
 //
@@ -21,8 +28,11 @@
 //    verifyThread       — the asker may write this thread
 //    prepareMessages    — UIMessages → pruned model messages
 //    awaitFirstEvent    — hold the head until the model answers
+//    markStalls         — a stalled stream ends visibly
+//    withStallNote      — the stored reply's "cut off" line
 //    pipeWebResponse    — Web Response → Express response
-//    persistTurn        — the two new messages, upserted
+//    stripToolParts     — replayed history loses tool results
+//    persistTurn        — the turn's messages, upserted
 //    logTurn            — one telemetry row
 //    POST /             — the endpoint composing the above
 // -----------------------------------------------------------
@@ -49,7 +59,7 @@ import {
 } from "../middleware/errors.js";
 import { buildSystemPrompt } from "../llm/prompt.js";
 import { getModel, isModelConfigured } from "../llm/provider.js";
-import { createTools } from "../llm/tools.js";
+import { TOOL_SCHEMAS, createTools } from "../llm/tools.js";
 import { internalFetch } from "../services/django.js";
 import { resolveIdentity } from "../services/identity.js";
 import { activePrompt } from "../services/prompts.js";
@@ -75,7 +85,11 @@ const router = Router();
 // `file` part would make the model layer fetch attacker URLs
 // from inside the isolated network — while an assistant turn
 // may carry the part types our own stream produces (its tool
-// parts are the replayed history the model needs). The
+// parts are the replayed history the model needs — and only
+// the three tools this container runs: a `tool-<anything>`
+// part is forged). `parts` must be an array when present — a
+// truthy non-array used to throw a raw TypeError out of the
+// loop, a 500 for a malformed request (KNF-154). The
 // persisted thread is named ONLY by `threadId` — the field
 // our own transport wrapper injects. The upstream chat body
 // also carries an `id`, but that is assistant-ui's INTERNAL
@@ -90,6 +104,10 @@ const router = Router();
 // The part types our own UI stream produces on an assistant
 // message — anything else in a replayed history is forged
 const ASSISTANT_PART_TYPES = new Set(["text", "reasoning", "step-start"]);
+
+// The tool parts our stream can produce: one per tool this
+// container actually runs
+const TOOL_PART_TYPES = new Set(Object.keys(TOOL_SCHEMAS).map((name) => `tool-${name}`));
 
 export function validateBody(body) {
   const messages = body?.messages;
@@ -109,11 +127,14 @@ export function validateBody(body) {
     if (role !== "user" && role !== "assistant") {
       throw new HttpError(400, "INVALID_ROLE", "Message roles are limited to user and assistant");
     }
-    for (const part of message?.parts || []) {
+    if (message.parts != null && !Array.isArray(message.parts)) {
+      throw new HttpError(400, "INVALID_PART", "Message parts must be an array");
+    }
+    for (const part of message.parts || []) {
       const type = typeof part?.type === "string" ? part.type : "";
       const allowed = role === "user"
         ? type === "text"
-        : ASSISTANT_PART_TYPES.has(type) || type.startsWith("tool-");
+        : ASSISTANT_PART_TYPES.has(type) || TOOL_PART_TYPES.has(type);
       if (!allowed) {
         throw new HttpError(400, "INVALID_PART", `Part type "${type}" is not accepted for ${role} messages`);
       }
@@ -214,13 +235,16 @@ async function prepareMessages(messages) {
 // replayed ahead of the rest. The raw error comes from the
 // caller's streamText onError hook, which fires before the
 // error chunk reaches this reader; the chunk itself carries
-// only the sanitized text.
+// only the sanitized text. An `abort` before any content is
+// the gateway going silent past the SDK's ceilings (a phone
+// that hung up aborts too, but then nobody reads the answer)
+// — 504 GATEWAY_TIMEOUT, never a 200 with nothing in it.
 //
 // Used by:
 //   - POST / (below)
 // -----------------------------------------------------------
 
-async function awaitFirstEvent(uiStream, firstError) {
+async function awaitFirstEvent(uiStream, firstError, clientGone) {
   const reader = uiStream.getReader();
   const held = [];
   let ended = false;
@@ -235,6 +259,11 @@ async function awaitFirstEvent(uiStream, firstError) {
       // sees the reply, and skips it for having no content
       await reader.cancel().catch(() => {});
       throw gatewayErrorToHttpError(firstError());
+    }
+    if (value.type === "abort") {
+      await reader.cancel().catch(() => {});
+      throw new HttpError(504, "GATEWAY_TIMEOUT", "The assistant's gateway did not answer in time",
+                          { reason: clientGone() ? "client closed" : (value.reason ?? null) });
     }
     held.push(value);
     if (value.type !== "start") break;
@@ -254,6 +283,86 @@ async function awaitFirstEvent(uiStream, firstError) {
       return reader.cancel(reason);
     },
   });
+}
+
+
+
+
+
+// -----------------------------------------------------------
+// markStalls
+// -----------------------------------------------------------
+//
+//   stream.pipeThrough(markStalls(() => clientGone))
+//
+// The SDK ends a stalled gateway (a silent gap past the chunk
+// ceiling, a step or turn running past its own) with a bare
+// `abort` frame — the same frame a phone's own Stop produces
+// — and the phone renders whatever arrived as a FINISHED
+// answer, a date broken off mid-sentence read as fact. While
+// the phone is still listening, that frame is replaced: every
+// text part still open is closed, a last text part says the
+// answer was cut off, and an `error` frame carries the cause
+// — the phone's error banner, with Retry. A phone that hung
+// up gets the frame as is (nobody is reading).
+//
+// Used by:
+//   - POST / (below) — between the first event and the pipe
+// -----------------------------------------------------------
+
+// What a cut-off answer ends with — in the bubble and in the
+// stored transcript alike; both languages, like every text
+// this container writes into an answer
+export const STALL_NOTE = "\n\n⚠️ Atsakymas nutrūko — AI tarnyba nustojo atsakinėti. / "
+  + "The answer was cut off — the AI service stopped responding.";
+
+export function markStalls(clientGone) {
+  const open = new Set();
+  return new TransformStream({
+    transform(chunk, controller) {
+      if (chunk?.type === "text-start") open.add(chunk.id);
+      if (chunk?.type === "text-end") open.delete(chunk.id);
+      if (chunk?.type !== "abort" || clientGone()) {
+        controller.enqueue(chunk);
+        return;
+      }
+      for (const id of open) controller.enqueue({ type: "text-end", id });
+      open.clear();
+      controller.enqueue({ type: "text-start", id: "stall-note" });
+      controller.enqueue({ type: "text-delta", id: "stall-note", delta: STALL_NOTE });
+      controller.enqueue({ type: "text-end", id: "stall-note" });
+      controller.enqueue({
+        type: "error",
+        errorText: "Atsakymas nutrūko: AI tarnyba neatsakė laiku. Pabandykite dar kartą. / "
+          + "The answer was cut off: the AI service stopped answering. Please try again.\n\n"
+          + `(${chunk.reason || "timeout"})`,
+      });
+    },
+  });
+}
+
+
+
+
+
+// -----------------------------------------------------------
+// withStallNote
+// -----------------------------------------------------------
+//
+// The stored copy of a cut-off reply, ending in the same
+// STALL_NOTE part the phone was shown — so a thread opened
+// later never replays the broken answer as a finished one. A
+// reply that never said anything stays empty (and unstored):
+// that turn was a 504, and the phone's banner told it.
+//
+// Used by:
+//   - POST / (below) — onEnd, for a stalled turn
+// -----------------------------------------------------------
+
+function withStallNote(reply) {
+  if (!reply || !Array.isArray(reply.parts)) return reply;
+  if (!reply.parts.some((part) => part?.type !== "step-start")) return reply;
+  return { ...reply, parts: [...reply.parts, { type: "text", text: STALL_NOTE, state: "done" }] };
 }
 
 
@@ -298,21 +407,59 @@ async function pipeWebResponse(webResponse, res) {
 
 
 // -----------------------------------------------------------
+// stripToolParts
+// -----------------------------------------------------------
+//
+// A replayed assistant message minus its tool parts. The
+// phone's copy of an old answer is the phone's word, not
+// ours: its tool results may be anything the client wrote,
+// and stored as-is they became fake "sources" in the faculty
+// transcript (KNF-068). This turn's OWN reply keeps its tool
+// parts — the SDK built it from the calls it really made.
+//
+// Used by:
+//   - persistTurn (below)
+// -----------------------------------------------------------
+
+function stripToolParts(message) {
+  if (message?.role !== "assistant" || !Array.isArray(message.parts)) return message;
+  const parts = message.parts.filter((part) => !String(part?.type || "").startsWith("tool-"));
+  return parts.length === message.parts.length ? message : { ...message, parts };
+}
+
+
+
+
+
+// -----------------------------------------------------------
 // persistTurn
 // -----------------------------------------------------------
 //
 // The turn's content into Django: the TAIL of the request's
-// messages plus the streamed assistant message, upserted by
-// id. Sending the tail — not just the last pair — is the
-// self-healing property: a turn whose fire-and-forget write
-// failed is replayed by the NEXT turn's batch, because the
-// client's request always carries the history and the
-// upsert is idempotent. Django caps a batch at 20; the tail
-// plus the reply stays inside it. A reply with no content —
-// nothing past the step markers, the shape of a turn the
-// gateway refused — is not stored: the SDK's onEnd fires for
-// a cancelled stream too, and it used to write a permanent
-// blank bubble into the thread.
+// messages plus the streamed assistant message. Sending the
+// tail — not just the last pair — is the self-healing
+// property: a turn whose fire-and-forget write failed is
+// replayed by the NEXT turn's batch, because the client's
+// request always carries the history. Django only CREATES
+// rows the thread lacks and updates exactly one existing row,
+// `reply_id` — this turn's reply, which a tool round's
+// continuation grows in place; a replay never rewrites the
+// stored history, and the tail's assistant messages arrive
+// stripped of tool parts (stripToolParts). Django caps a
+// batch at 20; the tail plus the reply stays inside it. A
+// reply with no content — nothing past the step markers, the
+// shape of a turn the gateway refused — is not stored: the
+// SDK's onEnd fires for a cancelled stream too, and it used
+// to write a permanent blank bubble into the thread.
+// `beganOwnerless` marks a guest turn whose thread was
+// verified ownerless when it started: a login that claims
+// the thread mid-answer must not cost the answer (Django
+// accepts that one write into the claimed thread).
+// `replacedId` is the answer a regenerate (or the error
+// strip's Retry) replaced — sent only with a reply that has
+// content, so Django drops the old answer from the linear
+// transcript instead of replaying both one after the other;
+// a failed regenerate keeps the old one.
 //
 // Used by:
 //   - POST / (below) — toUIMessageStream onEnd
@@ -322,19 +469,27 @@ async function pipeWebResponse(webResponse, res) {
 // batch — enough to backfill a previously failed turn or two
 const PERSIST_TAIL = 10;
 
-function persistTurn(threadId, userId, requestMessages, responseMessage) {
+function persistTurn(threadId, userId, requestMessages, responseMessage, { beganOwnerless = false, replacedId = null } = {}) {
   const tail = requestMessages
     .filter((message) => message?.id && (message.role === "user" || message.role === "assistant"))
-    .slice(-PERSIST_TAIL);
+    .slice(-PERSIST_TAIL)
+    .filter((message) => message.id !== responseMessage?.id)
+    .map(stripToolParts);
   const hasContent = Array.isArray(responseMessage?.parts)
     && responseMessage.parts.some((part) => part?.type !== "step-start");
-  const batch = [...tail.filter((message) => message.id !== responseMessage?.id),
-                 ...(responseMessage?.id && responseMessage.role && hasContent ? [responseMessage] : [])];
+  const reply = responseMessage?.id && responseMessage.role && hasContent ? responseMessage : null;
+  const batch = [...tail, ...(reply ? [reply] : [])];
   if (!threadId || batch.length === 0) return;
 
   internalFetch(`/internal/assistant/threads/${threadId}/messages`, {
     method: "POST",
-    body: { user_id: userId, messages: batch },
+    body: {
+      user_id: userId,
+      messages: batch,
+      ...(reply ? { reply_id: reply.id } : {}),
+      ...(reply && replacedId && replacedId !== reply.id ? { replaced_id: replacedId } : {}),
+      ...(beganOwnerless ? { began_ownerless: true } : {}),
+    },
   }).catch((err) => console.error("Turn persistence failed:", err?.message));
 }
 
@@ -408,6 +563,10 @@ router.post("/", async (req, res, next) => {
     checkTurnLimit(userId ? `user:${userId}` : `ip:${req.ip}`);
 
     const { messages, threadId } = validateBody(req.body);
+    // A regenerate names the answer it replaces
+    const replacedId = req.body?.trigger === "regenerate-message" && typeof req.body?.messageId === "string"
+      ? req.body.messageId
+      : null;
     if (threadId) {
       await verifyThread(threadId, userId);
     }
@@ -452,10 +611,16 @@ router.post("/", async (req, res, next) => {
     // without this the stream ran its full 90 s for nobody,
     // billed in full, and the 'aborted' outcome never fired.
     // res 'close' also follows a NORMAL end, so only an
-    // unfinished response counts as a walk-away.
+    // unfinished response counts as a walk-away — and the flag
+    // tells that walk-away apart from the SDK's own ceilings
+    // aborting a stalled gateway (`stalled`, set in onAbort)
     const abort = new AbortController();
+    let clientGone = false;
+    let stalled = false;
     res.on("close", () => {
-      if (!res.writableEnded) abort.abort();
+      if (res.writableEnded) return;
+      clientGone = true;
+      abort.abort();
     });
 
     const result = streamText({
@@ -484,7 +649,10 @@ router.post("/", async (req, res, next) => {
         logOnce("ok", usage);
       },
       onAbort: () => {
-        logOnce("aborted");
+        // Only the student's own Stop is an 'aborted' turn — a
+        // gateway gone silent is an error the operator must see
+        stalled = !clientGone;
+        logOnce(clientGone ? "aborted" : "error");
       },
     });
 
@@ -501,14 +669,17 @@ router.post("/", async (req, res, next) => {
       onEnd: ({ messages: finished, responseMessage }) => {
         const reply = responseMessage
           ?? [...(finished ?? [])].reverse().find((message) => message?.role === "assistant");
-        persistTurn(threadId, userId, messages, reply);
+        persistTurn(threadId, userId, messages, stalled ? withStallNote(reply) : reply,
+                    { beganOwnerless: Boolean(threadId) && !userId, replacedId });
       },
     });
     // The same Web Response toUIMessageStreamResponse builds —
     // headers, SSE framing — over the stream once its first
-    // event has proven the model is answering
-    const stream = await awaitFirstEvent(uiStream, () => firstStreamError);
-    await pipeWebResponse(createUIMessageStreamResponse({ stream }), res);
+    // event has proven the model is answering; a stall after
+    // that ends the answer visibly (markStalls)
+    const stream = await awaitFirstEvent(uiStream, () => firstStreamError, () => clientGone);
+    const marked = stream.pipeThrough(markStalls(() => clientGone));
+    await pipeWebResponse(createUIMessageStreamResponse({ stream: marked }), res);
   } catch (err) {
     // Retry-After tells the engine's quota / unavailable
     // failure how long the person actually waits — the turn

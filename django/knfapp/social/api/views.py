@@ -53,7 +53,10 @@ from knfapp.news.core import (
     as_utc,
     block_set,
     blocked_pair,
+    derive_title,
+    lock_post,
     parse_iso,
+    subtract_blocked_engagement,
     wall_visibility_q,
 )
 from knfapp.news.models import NewsLike, NewsPost
@@ -248,6 +251,7 @@ def social_feed(request):
         & models.Q(published_at__gt=window_floor)
     )
 
+    blocked = set()
     if user:
         friend_ids = list(Friendship.objects.filter(user_id=user["id"]).values_list("friend_id", flat=True))
         visible_ids = [user["id"]] + friend_ids
@@ -281,10 +285,14 @@ def social_feed(request):
     total = base.count()
 
 
-    # STEP 4: the wire shape (list bodies trimmed) + liked flags
+    # STEP 4: the wire shape (list bodies trimmed) + liked flags,
+    # tallies as this reader can see them (news core
+    # .subtract_blocked_engagement — the thread drops a blocked
+    # pair's comments, so the count does too)
     # ==========================================================
     posts = [_post_row_to_dict(row, truncate=True) for row in rows]
     _attach_liked(posts, user)
+    subtract_blocked_engagement(posts, blocked)
 
     return json_response({
         "posts": posts,
@@ -463,8 +471,11 @@ def update_profile(request):
 # cleanup below.
 #
 # Used by:
-#   - services/api/social.ts sendFriendRequest — the
-#     profile's "add friend" action
+#   - packages/socialengine/src/adapters/knf/index.ts
+#     setRelationship — useRelationship behind the profile's
+#     "add friend" button (services/api/social.ts
+#     sendFriendRequest wraps the route too; no screen calls
+#     it today)
 ############################################################
 
 @require_methods("POST")
@@ -608,8 +619,12 @@ def send_friend_request(request):
 # nothing matched.
 #
 # Used by:
-#   - services/api/social.ts — the friends screens and the
-#     profile action button
+#   - services/api/social.ts fetchFriendRequests /
+#     acceptFriendRequest / rejectFriendRequest / fetchFriends
+#     — the friends and friend-requests screens
+#   - packages/socialengine/src/adapters/knf/index.ts
+#     setRelationship — accept, decline, cancel and unfriend
+#     behind the profile's relationship button
 ############################################################
 
 @require_methods("GET")
@@ -800,8 +815,14 @@ def unfriend(request, user_id):
 # profile's 404); ownership answers 404 (never 403); an
 # edit never touches
 # published_at, so it cannot re-rank the feed; the delete
-# trusts the FK cascade and hands the cover to the uploads
-# sink after the commit, as the author's. A cover is
+# locks the post row first (news core.lock_post — the news
+# writers' one lock order, the cascade's child deletes
+# follow it), reaps the like and comment ACTIVITY rows that
+# point at the post (a bare subject_id, so the cascade never
+# reaches them and every notification would dead-end on a
+# 404), trusts the FK cascade for the rest and hands the
+# cover to the uploads sink after the commit, as the
+# author's. A cover is
 # accepted on create, and a NEW one on edit, only when it
 # is the caller's own registered upload (400
 # upload_not_owned) — filenames are public, and the sink
@@ -834,7 +855,7 @@ def create_post(request):
     raw_title = data.get("title")
     if raw_title is not None and not isinstance(raw_title, str):
         return json_error("title must be a string", 400)
-    title = (raw_title or "").strip() or content[:80]
+    title = (raw_title or "").strip() or derive_title(content)
 
     if len(title) > MAX_TITLE_LENGTH:
         return json_error(f"Title must be at most {MAX_TITLE_LENGTH} characters", 400)
@@ -927,6 +948,8 @@ def get_user_posts(request):
 
     posts = [_post_row_to_dict(row, truncate=True) for row in rows]
     _attach_liked(posts, viewer)
+    if viewer:
+        subtract_blocked_engagement(posts, block_set(viewer["id"]))
     total = base.count()
 
     return json_response({"posts": posts, "page": page, "perPage": per_page,
@@ -962,9 +985,9 @@ def update_post(request, post_id):
     if "title" in data:
         if not isinstance(data["title"], str):
             return json_error("title must be a string", 400)
-        # A blank title becomes the head of the body being stored,
-        # never ""
-        title = data["title"].strip() or (content or post["content"] or "")[:80]
+        # A blank title becomes the head of the body being stored
+        # (a word-boundary cut — news core derive_title), never ""
+        title = data["title"].strip() or derive_title(content or post["content"] or "")
         if len(title) > MAX_TITLE_LENGTH:
             return json_error(f"Title must be at most {MAX_TITLE_LENGTH} characters", 400)
         updates["title"] = title
@@ -992,12 +1015,15 @@ def update_post(request, post_id):
 @require_auth
 @ratelimit.per_user("post_delete", max_attempts=40)
 def delete_post(request, post_id):
+    lock_post(post_id)
     post = NewsPost.objects.filter(id=post_id, author_id=request.user["id"],
                                    source__in=("user", "faculty")).values("id", "image_url").first()
     if not post:
         return json_error("Post not found or not yours", 404)
 
-    # The FK cascade takes likes, comments and polls with it
+    # The notifications about the post first (no FK reaches
+    # them), then the FK cascade takes likes, comments and polls
+    Activity.objects.filter(subject_id=post_id, kind__in=("like", "comment")).delete()
     NewsPost.objects.filter(id=post_id).delete()
 
     # As the author — the filter above made the caller exactly
@@ -1027,14 +1053,23 @@ def delete_post(request, post_id):
 # statement of the relation). Blocking severs the
 # friendship (both rows) and any pending request in the
 # same transaction — "blocked but still friends" is not a
-# state anyone means.
+# state anyone means — and wipes the pair's ACTIVITY rows in
+# both directions: the pending ask (its request row is gone,
+# so its accept button could only 404), the old "accepted
+# your request", and the likes and comment excerpts either
+# left on the other's posts — the block hides every trace of
+# each from the other everywhere else, and the notification
+# list is one more view onto the same gestures. No new row
+# can appear afterwards: likes, comments and requests
+# between a blocked pair all 404.
 # Repeat blocks and unknown unblocks are 200s (idempotent
 # taps); unblocking restores nothing. The list keeps
 # deactivated accounts — the block outlives the account.
 #
 # Used by:
 #   - services/api/social.ts blockUser / unblockUser /
-#     fetchBlockedUsers — the profile's block actions
+#     fetchBlockedUsers — the profile's block actions and
+#     the friends screen's blocked-users view
 ############################################################
 
 @require_methods("POST")
@@ -1067,6 +1102,10 @@ def block_user(request):
     # deletes are the same rows on both engines
     FriendRequest.objects.filter(status="pending", from_user_id=my_id, to_user_id=target_id).delete()
     FriendRequest.objects.filter(status="pending", from_user_id=target_id, to_user_id=my_id).delete()
+    # The pair's notifications, one direction per delete for the
+    # same planner reason (activity carries a partial unique index)
+    Activity.objects.filter(user_id=my_id, actor_id=target_id).delete()
+    Activity.objects.filter(user_id=target_id, actor_id=my_id).delete()
 
     return json_response({"status": "blocked"})
 
@@ -1125,7 +1164,9 @@ def list_blocks(request):
 #
 # Used by:
 #   - services/api/social.ts reportTarget — the profile's
-#     report action
+#     report (a user), a comment's report on the article
+#     screens (the post lane — comments have no lane of their
+#     own) and the chat room's message report
 ############################################################
 
 @require_methods("POST")
@@ -1185,7 +1226,12 @@ def create_report(request):
 # first page — the cursor is ours), the read-all flip and
 # the cheap badge COUNT. Deactivated actors still show —
 # their gesture happened; deleted ones are gone with the
-# cascade.
+# cascade. An actor on either side of a block with the
+# viewer never shows — in the list or in the badge count:
+# block_user reaps the pair's rows as it lands, and this
+# read-side filter covers what a block made before that
+# reap existed (the thread such a row opens hides the
+# comment anyway).
 #
 # Used by:
 #   - @knf/socialengine's adapter — the activity screen and
@@ -1204,6 +1250,9 @@ def list_activity(request):
         before = as_utc(parse_iso(raw_before))
 
     base = Activity.objects.filter(user_id=request.user["id"])
+    blocked = block_set(request.user["id"])
+    if blocked:
+        base = base.exclude(actor_id__in=blocked)
     if before and before_id:
         base = base.filter(
             models.Q(created_at__lt=before) | models.Q(created_at=before, id__lt=before_id),
@@ -1254,5 +1303,8 @@ def mark_activity_read(request):
 @require_methods("GET")
 @require_auth
 def activity_unread_count(request):
-    count = Activity.objects.filter(user_id=request.user["id"], read=0).count()
-    return json_response({"count": count})
+    unread = Activity.objects.filter(user_id=request.user["id"], read=0)
+    blocked = block_set(request.user["id"])
+    if blocked:
+        unread = unread.exclude(actor_id__in=blocked)
+    return json_response({"count": unread.count()})

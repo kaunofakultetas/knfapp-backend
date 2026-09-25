@@ -20,6 +20,7 @@
 #    require_internal   — the shared-secret gate
 #    _thread_for        — uuid + identity → thread or None
 #    _thread_payload    — one wire shape for thread rows
+#    transcript_order   — the one total order of a transcript
 #    assistant_search   — the searchHandbook retrieval
 #    active_prompt      — the versioned prompt appendix
 #    threads_create     — new thread row
@@ -41,6 +42,7 @@ from functools import wraps
 
 from django.conf import settings
 from django.db import IntegrityError
+from django.db.models import Q
 from django.utils import timezone
 
 from knfapp.assistant.gateway import GatewayError
@@ -132,6 +134,45 @@ def _thread_for(thread_id, user_id):
     if thread.user_id is not None and str(thread.user_id) != str(user_id or ""):
         return None
     return thread
+
+
+
+
+
+
+
+
+############################################################
+# transcript_order
+############################################################
+#
+#   transcript_order(thread.messages.all()) → rows in order
+#
+# The ONE order a transcript is read in, by both readers:
+# created_at, then — for rows stored in the same microsecond
+# (every message of a batch shared one stamp before the
+# per-message stepping of 2026-09-16, and eight legacy pairs
+# still do) — the question before its answer, then the id so
+# the order is total. Sorting the tie by id alone put an
+# answer above its question whenever the client's random
+# nanoid sorted after 'srv-' (KNF-149).
+#
+# Used by:
+#   - thread_messages (below) — the transcript GET
+#   - api/admin_views.py — review_thread
+############################################################
+
+_ROLE_RANK = {"user": 0, "assistant": 1}
+
+
+def transcript_order(rows):
+    def key(row):
+        content = row["content"] if isinstance(row, dict) else row.content
+        created = row["created_at"] if isinstance(row, dict) else row.created_at
+        row_id = row["id"] if isinstance(row, dict) else row.id
+        role = content.get("role") if isinstance(content, dict) else None
+        return (created, _ROLE_RANK.get(role, 2), str(row_id))
+    return sorted(rows, key=key)
 
 
 
@@ -468,11 +509,27 @@ def _valid_uuids(ids):
 #   {user_id?, messages: [UIMessage...]} → {stored: n}
 #
 # The transcript. GET seeds the client runtime on thread
-# open; POST is the container's onFinish persistence —
-# upserts by (thread, message id) so a retried turn never
-# duplicates, stamps last_message_at, and titles the
-# thread from its first user message. Content is stored
-# verbatim: it IS the UIMessage the runtime replays.
+# open, in transcript_order; POST is the container's onEnd
+# persistence — CREATES the rows the thread lacks (a retried
+# or replayed turn never duplicates) and updates exactly one
+# existing row: `reply_id`, this turn's own reply, which a
+# tool round's continuation grows in place. A replay never
+# rewrites stored history — the replayed tail is the phone's
+# copy, and it once rewrote real answers and stored forged
+# tool "sources" (KNF-068). It stamps last_message_at and
+# titles the thread from its first user message — the title
+# written by a conditional UPDATE, so two first turns racing
+# cannot overwrite each other. `began_ownerless` (set only by
+# the container, for a guest turn whose thread it verified
+# ownerless when the turn began) admits that one write into a
+# thread a login CLAIMED mid-answer — the answer is not lost
+# to the claim. `replaced_id` (a regenerate, or the error
+# strip's Retry, sent only with a reply that has content)
+# drops the answer it replaced — the transcript is linear,
+# and replaying both answers one after the other misread as
+# two replies to one question; a rated answer stays, it is
+# evidence. Content is stored verbatim: it IS the UIMessage
+# the runtime replays.
 #
 # Used by:
 #   - the assistant container — thread open + stream onFinish
@@ -485,7 +542,7 @@ def thread_messages(request, thread_id):
         thread = _thread_for(thread_id, clean_param(request.GET.get("user_id")))
         if thread is None:
             return json_error("Not found", 404)
-        rows = thread.messages.order_by("created_at", "id").values("id", "format", "content", "created_at")
+        rows = transcript_order(thread.messages.values("id", "format", "content", "created_at"))
         return json_response({"messages": [
             {"id": row["id"], "format": row["format"], "content": row["content"],
              "createdAt": row["created_at"]}
@@ -497,6 +554,12 @@ def thread_messages(request, thread_id):
     if body is None:
         return json_error("Invalid JSON", 400)
     thread = _thread_for(thread_id, body.get("user_id"))
+    if thread is None and body.get("began_ownerless") is True and not body.get("user_id"):
+        # Claimed mid-answer: the turn started as a guest's on an
+        # ownerless thread, and a login adopted it before the
+        # answer was stored — the answer still belongs in it
+        thread = AssistantThread.objects.filter(id=thread_id, deleted_at__isnull=True,
+                                                user_id__isnull=False).first()
     if thread is None:
         return json_error("Not found", 404)
     messages = body.get("messages")
@@ -507,22 +570,24 @@ def thread_messages(request, thread_id):
         if not isinstance(message, dict) or not message.get("id") or not message.get("role"):
             return json_error("each message needs id and role", 400)
 
-    # A message someone already put a thumb on is EVIDENCE — a
-    # replayed batch naming its id must not rewrite what was
-    # judged (client-chosen ids made that a one-request edit of
-    # a rated answer). The replay tail re-presents old ids by
-    # design; skipping the rated ones costs nothing.
-    rated = set(
-        AssistantMessage.objects
-        .filter(thread=thread, id__in=[str(message["id"]) for message in messages],
-                rating__isnull=False)
-        .values_list("id", flat=True)
-    )
+    # Stored rows are never rewritten by a replay — the tail
+    # re-presents old ids by design, and the phone's copy of an
+    # old message is not the record. The one exception is this
+    # turn's own reply (reply_id), unless someone already put a
+    # thumb on it: a rated message is EVIDENCE
+    reply_id = str(body.get("reply_id") or "")
+    existing = {
+        row["id"]: row["rating"]
+        for row in AssistantMessage.objects
+        .filter(thread=thread, id__in=[str(message["id"]) for message in messages])
+        .values("id", "rating")
+    }
 
     now = timezone.now()
     stored = 0
     for position, message in enumerate(messages):
-        if str(message["id"]) in rated:
+        message_id = str(message["id"])
+        if message_id in existing and (message_id != reply_id or existing[message_id] is not None):
             continue
         # Each message gets its OWN microsecond-stepped stamp (a
         # shared one makes ORDER BY a coin flip), and created_at
@@ -536,18 +601,29 @@ def thread_messages(request, thread_id):
         )
         stored += 1
 
+    # Only once the new answer is stored does the old one go
+    replaced_id = str(body.get("replaced_id") or "")
+    if (replaced_id and reply_id and replaced_id != reply_id
+            and AssistantMessage.objects.filter(thread=thread, id=reply_id).exists()):
+        (AssistantMessage.objects
+         .filter(thread=thread, id=replaced_id, rating__isnull=True, content__role="assistant")
+         .delete())
+
     updates = ["last_message_at"]
     thread.last_message_at = now
-    if not thread.title:
-        title = _first_user_text(messages)
-        if title:
-            thread.title = title[:TITLE_CHARS]
-            updates.append("title")
     preview = _preview_text(messages)
     if preview:
         thread.preview = preview[:PREVIEW_CHARS]
         updates.append("preview")
     thread.save(update_fields=updates)
+    if not thread.title:
+        title = _first_user_text(messages)
+        if title:
+            # First writer wins — a racing first turn finds the
+            # title taken and leaves it
+            (AssistantThread.objects
+             .filter(Q(title__isnull=True) | Q(title=""), id=thread.id)
+             .update(title=title[:TITLE_CHARS]))
     return json_response({"stored": stored})
 
 
@@ -629,9 +705,10 @@ def _first_user_text(messages):
 #
 # The reader's thumbs verdict on one assistant message:
 # +1 / -1 sets, 0 clears (a tapped-again thumb). Same
-# access rule as the transcript, and only messages that
-# exist in the thread take a rating — a stale client
-# pointing at a pruned message gets the same cloaked 404.
+# access rule as the transcript, and only ASSISTANT messages
+# that exist in the thread take a rating — a stale client
+# pointing at a pruned message, or a crafted request naming
+# the student's own question, gets the same cloaked 404.
 #
 # Used by:
 #   - the assistant container — the kit's thumbs buttons
@@ -655,7 +732,7 @@ def message_feedback(request, thread_id):
         return json_error("message_id is required", 400)
 
     changed = (AssistantMessage.objects
-               .filter(thread=thread, id=message_id)
+               .filter(thread=thread, id=message_id, content__role="assistant")
                .update(rating=None if rating == 0 else rating))
     if not changed:
         return json_error("Not found", 404)

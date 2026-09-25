@@ -258,6 +258,38 @@ class InfoTests(TestCase):
         self.assertEqual(len(body["contacts"][0]["items"]), 6)   # borrowed
         self.assertIn("How do I", body["faq"][0]["q"])           # curated English
 
+    def test_the_tag_turns_when_an_older_section_ages_out(self):
+        # The newest stamp alone stayed put while an older
+        # section went stale and the body changed — a client
+        # holding the old tag was told "not modified"
+        now = datetime.now(timezone.utc)
+        _overlay_row("contacts", _contacts(6), scraped_at=(now - timedelta(days=29, hours=23)).isoformat())
+        _overlay_row("programs", [{"name": f"Programa {i}", "degree": "Bakalauras"} for i in range(4)],
+                     scraped_at=(now - timedelta(days=1)).isoformat())
+        first = self.client.get("/api/info")
+        self.assertEqual(len(first.json()["contacts"][0]["items"]), 6)
+
+        FacultyInfo.objects.filter(section="contacts").update(
+            scraped_at=(now - timedelta(days=31)).isoformat())
+        again = self.client.get("/api/info", HTTP_IF_NONE_MATCH=first["ETag"])
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(again.json()["contacts"][0]["category"], "Dekanatas")
+        self.assertNotEqual(again["ETag"], first["ETag"])
+
+    def test_a_current_copy_revalidates_before_the_handbook_is_built(self):
+        # KNF-134: the 304 is decided from the cheap signature —
+        # the merge never runs for a client that is up to date
+        from unittest import mock
+        from knfapp.info.api import views
+
+        _overlay_row("contacts", _contacts(6))
+        first = self.client.get("/api/info?lang=en")
+        with mock.patch.object(views, "effective_handbook", side_effect=AssertionError("built")):
+            cached = self.client.get("/api/info?lang=en", HTTP_IF_NONE_MATCH=first["ETag"])
+        self.assertEqual(cached.status_code, 304)
+        self.assertEqual(cached["ETag"], first["ETag"])
+        self.assertIn("max-age", cached["Cache-Control"])
+
     def test_an_unknown_section_is_a_400_with_the_slug(self):
         response = self.client.get("/api/info?section=personalas")
         self.assertEqual((response.status_code, response.json()["code"]), (400, "unknown_section"))

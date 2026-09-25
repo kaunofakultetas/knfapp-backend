@@ -66,7 +66,9 @@ from knfapp.common.timestamps import as_aware, utc_now
 from knfapp.uploads.gates import MAX_IMAGE_PIXELS as BOMB_GUARD_PIXELS
 from knfapp.users.auth import require_role
 from knfapp.wayfind.graph import (
+    ENTITY_ID_RE,
     ENTITY_KINDS,
+    _finite,
     compile_document,
     document_etag,
     document_text,
@@ -75,6 +77,7 @@ from knfapp.wayfind.graph import (
 )
 from knfapp.wayfind.models import WfBuilding, WfEntity, WfOp, WfPanorama, WfPlan, WfVersion
 from knfapp.wayfind.store import store_dir as _store_dir, write_once as _write_once
+from knfapp.wayfind.svg import PlanRefused, sanitize_plan
 
 
 logger = logging.getLogger(__name__)
@@ -82,7 +85,6 @@ logger = logging.getLogger(__name__)
 EDITOR_ROLES = ("admin", "curator")
 
 BUILDING_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}\Z")
-ENTITY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 STORED_NAME_RE = re.compile(r"^[0-9a-f]{64}\.(?:jpg|svg)\Z")
 
 # One batch is one transaction; a phone replaying a long
@@ -105,11 +107,12 @@ PANO_MAX_EDGE = 8192
 PANO_MAX_PIXELS = 2 * BOMB_GUARD_PIXELS
 PLAN_MAX_BYTES = 2 * 1024 * 1024
 
-# An SVG plan is drawn, never run: scripts, event handlers
-# and script URLs are cut before the bytes are hashed
-SVG_SCRIPT_RE = re.compile(r"<script\b[^>]*>.*?</script\s*>|<script\b[^>]*/>", re.IGNORECASE | re.DOTALL)
-SVG_HANDLER_RE = re.compile(r"\s+on[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*')", re.IGNORECASE)
-SVG_JS_HREF_RE = re.compile(r"(\s(?:xlink:)?href\s*=\s*)([\"'])\s*javascript:[^\"']*\2", re.IGNORECASE)
+# What a served plan may do once a browser opens it directly:
+# nothing — no script, no load of any kind, no framing (the
+# ingress sets the same policy; this is the belt for a
+# deployment without it). Inline style stays, so the drawing
+# still draws
+PLAN_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox; frame-ancestors 'none'"
 
 
 
@@ -182,8 +185,11 @@ def _body_too_large(request):
 # answers 409.
 #
 # Used by:
-#   - mobile services/api/wayfind.ts fetchBuildings; the
-#     admin's first-run setup / the seed import
+#   - GET: the Vite admin panel — Wayfind BuildingsTable
+#     (the phone reads one building's graph, never the list)
+#   - POST: the admin panel's NewBuilding dialog and the
+#     phone map editor's first-run setup (services/
+#     wayfindTransport.ts createBuilding, the seed import)
 ############################################################
 
 @require_methods("GET")
@@ -225,15 +231,21 @@ def create_building(request):
     if not isinstance(name, str) or not name.strip():
         return json_error("name is required", 400, code="bad_name")
     north = body.get("northDeg")
-    if north is not None and not isinstance(north, (int, float)):
+    # Finite, never a bool: the body parser takes Infinity, the
+    # float column stores it, and the published document could
+    # then not be written as JSON at all
+    if north is not None and not _finite(north):
         return json_error("northDeg must be a number", 400, code="bad_north")
+    entrance = body.get("entranceNodeId")
+    if entrance is not None and not (isinstance(entrance, str) and ENTITY_ID_RE.match(entrance)):
+        return json_error("entranceNodeId must be an id", 400, code="bad_entrance")
 
     if WfBuilding.objects.filter(id=building_id).exists():
         return json_error("A building with that id exists", 409, code="exists")
 
     now = utc_now()
     WfBuilding.objects.create(
-        id=building_id, name=name.strip(), north_deg=north, entrance_node_id=body.get("entranceNodeId"),
+        id=building_id, name=name.strip(), north_deg=north, entrance_node_id=entrance,
         draft_revision=0, published_revision=None, created_at=now, updated_at=now,
     )
 
@@ -378,13 +390,16 @@ def get_draft(request, building_id):
 # id was seen before IN THIS BUILDING; the answer says what
 # the original did: `of` is its status, reason its reason,
 # revision the revision it applied at). A conflict is an
-# entity whose revision is past the op's baseRevision. An
-# upsert must say what the phone's copy was — baseRevision,
-# or `fresh: true` for a create the server never heard of:
-# one that says neither is a blind overwrite in the making
-# and refuses the WHOLE batch with 400 no_base before
-# anything is applied, so a client that forgot the stamp
-# learns at once. A delete without baseRevision is a plain
+# entity whose revision is past the op's baseRevision, or a
+# `fresh` create that finds the entity alive (a tombstone it
+# revives). An upsert must say what the phone's copy was —
+# baseRevision, or `fresh: true` for a create the server
+# never heard of: one that says neither is a blind overwrite
+# in the making and refuses the WHOLE batch with 400 no_base
+# before anything is applied, so a client that forgot the
+# stamp learns at once. A baseRevision that is present but
+# not an integer ("1", 1.0, true) rejects its op rather than
+# reading as absent. A delete without baseRevision is a plain
 # overwrite. "building" ops patch the building row. A
 # delete is a tombstone: the row stays, marked, so a `since`
 # delta can carry it. Batches serialise on the building
@@ -401,12 +416,17 @@ def get_draft(request, building_id):
 #     op log
 ############################################################
 
+# A revision number as the wire must carry it: an integer,
+# and not a bool (True would read as 1)
+def _is_revision(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 # An upsert's licence to write: a real integer baseRevision
-# (a bool is not one — True would read as 1) for the conflict
-# check to anchor on, or the fresh mark of a create
+# for the conflict check to anchor on, or the fresh mark of a
+# create
 def _stamped(op):
-    base = op.get("baseRevision")
-    return (isinstance(base, int) and not isinstance(base, bool)) or op.get("fresh") is True
+    return _is_revision(op.get("baseRevision")) or op.get("fresh") is True
 
 
 @require_methods("POST")
@@ -516,7 +536,7 @@ def _apply_op(building_id, op, revision, author, now):
                 else:
                     changes["name"] = data["name"].strip()
             if "northDeg" in data and rejection is None:
-                if data["northDeg"] is not None and not isinstance(data["northDeg"], (int, float)):
+                if data["northDeg"] is not None and not _finite(data["northDeg"]):
                     rejection = "northDeg must be a number or null"
                 else:
                     changes["north_deg"] = data["northDeg"]
@@ -541,11 +561,23 @@ def _apply_op(building_id, op, revision, author, now):
             rejection = "kind must be level, node, edge or room"
         elif not isinstance(entity_id, str) or not ENTITY_ID_RE.match(entity_id):
             rejection = "entityId must be a short id (letters, digits, . _ : -)"
+        elif "baseRevision" in op and not _is_revision(op["baseRevision"]):
+            # A malformed stamp ("1", 1.0, true) must not quietly
+            # read as "no stamp" — that is a blind overwrite
+            # answered 'applied' (KNF-159)
+            rejection = "baseRevision must be an integer revision"
         else:
             row = (WfEntity.objects.filter(building_id=building_id, kind=entity_kind, id=entity_id)
                    .values("data", "revision", "deleted").first())
             base = op.get("baseRevision")
-            if row is not None and isinstance(base, int) and row["revision"] > base:
+            # A conflict: the row moved past the phone's copy — or
+            # a `fresh` create finds a LIVE row, i.e. the phone's
+            # "the server never heard of this" is wrong and the
+            # create would clobber someone's entity (a tombstone
+            # is fair game: the create revives it)
+            stale = row is not None and base is not None and row["revision"] > base
+            clobber = row is not None and base is None and op.get("fresh") is True and not row["deleted"]
+            if stale or clobber:
                 rejection = "conflict"
                 current = {"data": None if row["deleted"] else row["data"], "revision": row["revision"], "deleted": bool(row["deleted"])}
             elif kind == "delete":
@@ -815,14 +847,20 @@ def upload_panorama(request, building_id):
 # name IS the content, so a year of caching is safe and a
 # changed picture is a different url. Anything but a 64-hex
 # name with the right extension is a 404 before the disk is
-# touched. (FileResponse serves no Range requests — the
+# touched. Both answer nosniff; a plan also carries PLAN_CSP,
+# so even a drawing opened straight in a browser runs and
+# loads nothing. (FileResponse serves no Range requests — the
 # app's image loaders never send one for a jpg/svg, and the
-# immutable cache header makes revalidation moot.)
+# immutable cache header makes revalidation moot.) Neither
+# touches the database, so neither runs inside the
+# ATOMIC_REQUESTS transaction (KNF-135): a picture GET opens
+# no connection for an empty BEGIN/COMMIT.
 #
 # Used by:
 #   - the app's panorama stage and floor plan
 ############################################################
 
+@transaction.non_atomic_requests
 @require_methods("GET")
 def serve_panorama(request, name):
     if not STORED_NAME_RE.match(name or "") or not name.endswith(".jpg"):
@@ -832,9 +870,11 @@ def serve_panorama(request, name):
         return json_error("Not found", 404, code="not_found")
     response = FileResponse(open(path, "rb"), content_type="image/jpeg")
     response["Cache-Control"] = "public, max-age=31536000, immutable"
+    response["X-Content-Type-Options"] = "nosniff"
     return response
 
 
+@transaction.non_atomic_requests
 @require_methods("GET")
 def serve_plan(request, name):
     if not STORED_NAME_RE.match(name or "") or not name.endswith(".svg"):
@@ -845,6 +885,7 @@ def serve_plan(request, name):
     response = FileResponse(open(path, "rb"), content_type="image/svg+xml")
     response["Cache-Control"] = "public, max-age=31536000, immutable"
     response["X-Content-Type-Options"] = "nosniff"
+    response["Content-Security-Policy"] = PLAN_CSP
     return response
 
 
@@ -861,10 +902,15 @@ def serve_plan(request, name):
 # POST /api/wayfind/buildings/<building_id>/plans
 #
 # Multipart: file (an SVG drawing, 2 MB), optional levelId.
-# The text must carry an <svg> root; scripts, event-handler
-# attributes and script hrefs are cut, and the sha256 of the
-# sanitised text names the file. Answers the id and the
-# relative url a level's `plan` field stores.
+# The bytes must be UTF-8 and parse as an <svg> document;
+# svg.py's sanitize_plan then REBUILDS the drawing from an
+# element / attribute allowlist (no script, no handler, no
+# foreign object, no animation, no external reference) and
+# the sha256 of that rebuilt text names the file. A drawing
+# that will not parse, is not SVG or declares entities is
+# refused 400 bad_plan with the reason — never repaired.
+# Answers the id and the relative url a level's `plan` field
+# stores.
 #
 # Used by:
 #   - the admin level sheet in the app; the seed import
@@ -885,18 +931,19 @@ def upload_plan(request, building_id):
     if len(raw) > PLAN_MAX_BYTES:
         return json_error("Plan too large. Max 2 MB", 413, code="too_large")
     try:
-        text = raw.decode("utf-8")
+        raw.decode("utf-8")
     except UnicodeDecodeError:
         return json_error("Plan must be UTF-8 SVG text", 400, code="bad_plan")
-    if "<svg" not in text[:4096].lower():
-        return json_error("Plan must be an SVG drawing", 400, code="bad_plan")
     level_id = form.get("levelId")
     if level_id is not None and not ENTITY_ID_RE.match(level_id):
         return json_error("levelId must be a short id", 400, code="bad_level")
 
-    clean = SVG_SCRIPT_RE.sub("", text)
-    clean = SVG_HANDLER_RE.sub("", clean)
-    clean = SVG_JS_HREF_RE.sub(r'\1\2\2', clean)
+    # Parse and rebuild — the stored drawing is the allowlist's
+    # copy, never the upload
+    try:
+        clean = sanitize_plan(raw)
+    except PlanRefused as refusal:
+        return json_error(str(refusal), 400, code="bad_plan")
     blob = clean.encode("utf-8")
     digest = hashlib.sha256(blob).hexdigest()
     name = f"{digest}.svg"

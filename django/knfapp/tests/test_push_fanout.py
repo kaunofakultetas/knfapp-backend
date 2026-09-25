@@ -7,7 +7,9 @@
 #  missing notification_channels row means ENABLED, only an
 #  explicit enabled=0 suppresses), the unknown-channel
 #  refusal that would otherwise ignore every opt-out, the
-#  language split routing the English copy, the distinct-
+#  language split routing the English copy (ONE batch when a
+#  caller has no English copy at all, and a copy given for one
+#  field only falling back per field — KNF-071), the distinct-
 #  owner count behind stats["users"], the orphan-token
 #  prune, the dead-device retirement that must never
 #  recycle the connection from inside a transaction (an
@@ -110,6 +112,27 @@ class FanoutTargetingTests(TestCase):
         self.assertEqual(by_title["News"], ["ExponentPushToken[en1]"])
         # Two devices, ONE owner — reach is reported in people
         self.assertEqual(stats["users"], 1)
+
+    def test_no_english_copy_is_one_batch_for_every_device(self):
+        # A caller with nothing to translate (a human-typed
+        # broadcast) — the split would send the same bytes in
+        # two round-trips; one batch carries every device
+        _token(self.reader, "lt1", language="lt")
+        _token(self.reader, "en1", language="en")
+        push.notify_channel("news", "Naujienos", "Tekstas")
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(sorted(self.calls[0]["tokens"]), ["ExponentPushToken[en1]", "ExponentPushToken[lt1]"])
+        self.assertEqual((self.calls[0]["title"], self.calls[0]["body"]), ("Naujienos", "Tekstas"))
+
+    def test_english_copy_given_alone_falls_back_per_field(self):
+        # The chat fan-out's shape: the title (a sender's name)
+        # needs no translation, the composed body does
+        _token(self.reader, "lt1", language="lt")
+        _token(self.reader, "en1", language="en")
+        push.notify_channel_users("chat", [self.reader.id], "Tomas", "Nauja žinutė", body_en="New message")
+        by_token = {call["tokens"][0]: (call["title"], call["body"]) for call in self.calls}
+        self.assertEqual(by_token["ExponentPushToken[lt1]"], ("Tomas", "Nauja žinutė"))
+        self.assertEqual(by_token["ExponentPushToken[en1]"], ("Tomas", "New message"))
 
     def test_the_channel_stamp_rides_a_copy_of_the_callers_data(self):
         _token(self.reader, "a")

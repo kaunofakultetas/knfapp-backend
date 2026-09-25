@@ -120,6 +120,31 @@ class ReencodeTests(SimpleTestCase):
         with Image.open(io.BytesIO(blob)) as out:
             self.assertEqual(dict(out.getexif()), {})
 
+    def test_a_portrait_photo_is_stored_upright_and_its_tag_still_dropped(self):
+        # A camera JPEG keeps the sensor's landscape pixels and a
+        # "rotate to display" Orientation tag; dropping the tag
+        # without applying it stored every portrait sideways
+        source = Image.new("RGB", (400, 200), (200, 10, 10))
+        exif = source.getexif()
+        exif[0x0112] = 6
+        buf = io.BytesIO()
+        source.save(buf, format="JPEG", exif=exif.tobytes())
+        ext, blob, rejection = gates.reencode_image(buf.getvalue())
+        self.assertIsNone(rejection)
+        with Image.open(io.BytesIO(blob)) as stored:
+            self.assertEqual((ext, stored.size), ("jpg", (200, 400)))
+            self.assertNotIn(0x0112, stored.getexif())
+
+    def test_a_broken_orientation_block_never_costs_the_upload(self):
+        source = Image.new("RGB", (40, 20), (200, 10, 10))
+        exif = source.getexif()
+        exif[0x0112] = 99   # not an orientation any transpose knows
+        buf = io.BytesIO()
+        source.save(buf, format="JPEG", exif=exif.tobytes())
+        ext, blob, rejection = gates.reencode_image(buf.getvalue())
+        self.assertIsNone(rejection)
+        self.assertEqual(ext, "jpg")
+
     def test_transparency_becomes_png(self):
         ext, _, rejection = gates.reencode_image(_png(mode="RGBA", color=(1, 2, 3, 128)))
         self.assertIsNone(rejection)

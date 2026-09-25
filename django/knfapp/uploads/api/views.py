@@ -3,10 +3,10 @@
 #
 #  One POST that accepts a photo (re-encoded), a document,
 #  a video or a voice note; a public GET serving the flat
-#  directory with browser-only caching; an owner-or-admin
-#  DELETE. Every rejection carries the machine `code`
-#  beside the human `error`, exactly the slugs the mobile
-#  app translates.
+#  directory with browser-only caching (plus one thumbnail
+#  size for still photos); an owner-or-admin DELETE. Every
+#  rejection carries the machine `code` beside the human
+#  `error`, exactly the slugs the mobile app translates.
 #
 #  Split into:
 #
@@ -26,8 +26,10 @@ import uuid
 
 
 from PIL import Image
-from django.db import models
-from django.http import FileResponse
+from django.db import models, transaction
+from django.http import FileResponse, HttpResponse
+from django.utils.cache import get_conditional_response
+from django.utils.http import http_date, quote_etag
 
 
 from knfapp.common import ratelimit
@@ -36,10 +38,12 @@ from knfapp.common.timestamps import utc_now
 from knfapp.uploads import gates
 from knfapp.uploads.models import Upload
 from knfapp.uploads.storage import (
+    THUMB_DIRNAME,
     UPLOAD_QUOTA_BYTES,
     UPLOAD_RATE_MAX,
     atomic_write,
     delete_upload,
+    ensure_thumbnail,
     safe_upload_name,
     upload_dir,
 )
@@ -228,12 +232,15 @@ def upload_file(request):
 # row goes and the caller got what it asked for — but a
 # file that SURVIVES the unlink answers 500 delete_failed
 # rather than lying: this is the erasure and moderation
-# path.
+# path. Runs in its own transaction: the /api/uploads/<name>
+# dispatcher is non-atomic for the GET's sake (see
+# serve_file), and a delete must still commit as one unit.
 #
 # Used by:
 #   - admin/moderation tooling and manual erasure requests
 ############################################################
 
+@transaction.atomic
 @require_auth
 def delete_file(request, filename):
     safe_name = safe_upload_name(filename)
@@ -286,10 +293,29 @@ def delete_file(request, filename):
 # ONLY the uuid-hex names this app writes, and a realpath
 # check makes sure the bytes actually live where the name
 # says — a symlink planted in the volume must not turn this
-# unauthenticated route into an arbitrary file read. 24 h
-# of BROWSER caching only (Cache-Control: private): chat
-# photos share this route, and a shared proxy cache has no
-# business holding them.
+# unauthenticated route into an arbitrary file read.
+#
+# Caching: a stored name is a uuid written once, so its
+# bytes can never change — a year of BROWSER caching,
+# `immutable` (Cache-Control stays private: chat photos
+# share this route, and a shared proxy cache has no
+# business holding them), plus a strong ETag and a
+# Last-Modified off one os.stat, so a client whose copy
+# lapsed revalidates with a 304 instead of re-downloading
+# the whole file. The old 24 h window with no validator
+# could only ever re-transfer everything.
+#
+# ?s=thumb asks for the one derivative size (storage.
+# ensure_thumbnail, made on first request): a 40 pt avatar
+# no longer downloads the 2048 px original. Any other value
+# — and a file with no derivative (a document, an
+# animation, a photo already that small) — serves the
+# original. The derivative passes the same realpath check.
+#
+# Never touches the database, and the dispatcher that
+# routes it is marked non-atomic — under ATOMIC_REQUESTS
+# every image GET used to open a connection for a BEGIN/
+# COMMIT around no query at all (KNF-135).
 #
 # Byte ranges are honoured (single range only): the mobile
 # video player refuses a file it cannot seek — iOS AVPlayer
@@ -306,6 +332,9 @@ def delete_file(request, filename):
 
 # "bytes=start-end", either side optional but not both
 _RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+# Stored bytes never change under a name — a year, immutable
+_FILE_CACHE_CONTROL = "private, max-age=31536000, immutable"
 
 
 # A file opened at an offset that stops read() at the range
@@ -328,6 +357,16 @@ class _RangeReader:
         self._handle.close()
 
 
+# The cache headers every served answer carries — the 200,
+# the 206 and the 304 alike
+def _stamp_file_cache(response, etag, last_modified):
+    response["Cache-Control"] = _FILE_CACHE_CONTROL
+    response["ETag"] = etag
+    response["Last-Modified"] = http_date(last_modified)
+    return response
+
+
+@transaction.non_atomic_requests
 def serve_file(request, filename):
     safe_name = safe_upload_name(filename)
     if not safe_name:
@@ -348,10 +387,37 @@ def serve_file(request, filename):
     ext = safe_name.rsplit(".", 1)[1]
     content_type = (gates.MIME_BY_EXT.get(ext) or mimetypes.guess_type(safe_name)[0]
                     or "application/octet-stream")
-    size = os.path.getsize(file_path)
 
 
-    # STEP 1: a valid single range answers 206 with just that
+    # STEP 1: the variant — ?s=thumb swaps in the derivative when
+    # one exists (or can be made); everything else is the original
+    # =============================================================
+    variant = "o"
+    if clean_param(request.GET.get("s")) == "thumb":
+        thumb = ensure_thumbnail(safe_name)
+        if thumb and os.path.realpath(thumb) == os.path.join(
+                os.path.realpath(directory), THUMB_DIRNAME, safe_name):
+            file_path = thumb
+            variant = "t"
+
+
+    # STEP 2: one stat for the size and both validators; a
+    # request whose copy is still current gets its 304 here
+    # (a failed If-Match gets its 412)
+    # =====================================================
+    stat = os.stat(file_path)
+    size = stat.st_size
+    last_modified = int(stat.st_mtime)
+    etag = quote_etag(f"{safe_name.split('.', 1)[0]}-{variant}-{size:x}-{last_modified:x}")
+
+    template = _stamp_file_cache(HttpResponse(), etag, last_modified)
+    conditional = get_conditional_response(request, etag=etag, last_modified=last_modified,
+                                           response=template)
+    if conditional is not template:
+        return conditional
+
+
+    # STEP 3: a valid single range answers 206 with just that
     # window; suffix form ("bytes=-N") means the last N bytes
     # =======================================================
     match = _RANGE_RE.match(request.headers.get("Range", "").strip())
@@ -375,14 +441,12 @@ def serve_file(request, filename):
         response["Content-Range"] = f"bytes {start}-{end}/{size}"
         response["Content-Length"] = str(end - start + 1)
         response["Accept-Ranges"] = "bytes"
-        response["Cache-Control"] = "private, max-age=86400"
-        return response
+        return _stamp_file_cache(response, etag, last_modified)
 
 
-    # STEP 2: no (or malformed) range — the whole file, with
+    # STEP 4: no (or malformed) range — the whole file, with
     # Accept-Ranges advertising that seeking works here
     # ======================================================
     response = FileResponse(open(file_path, "rb"), content_type=content_type)
     response["Accept-Ranges"] = "bytes"
-    response["Cache-Control"] = "private, max-age=86400"
-    return response
+    return _stamp_file_cache(response, etag, last_modified)

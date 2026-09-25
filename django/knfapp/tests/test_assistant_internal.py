@@ -11,7 +11,12 @@
 #  threads, the search route with retrieval faked (the
 #  cosine SQL is postgres-only; sqlite exercises the
 #  callers), and the telemetry route folding bad labels
-#  instead of erroring.
+#  instead of erroring. A replay never rewrites a stored
+#  row — only this turn's reply may grow (KNF-068); a guest
+#  answer whose thread a login claimed mid-turn still lands;
+#  a rating only ever lands on an assistant message; and the
+#  transcript's order is total — a tied pair reads question
+#  first whatever its ids (KNF-149).
 ############################################################
 
 
@@ -214,6 +219,120 @@ class AssistantInternalTests(TestCase):
         bad = self._post(f"/internal/assistant/threads/{thread_id}/feedback",
                          {"user_id": owner.id, "message_id": "m2", "rating": 5})
         self.assertEqual(bad.status_code, 400)
+
+
+    def test_a_replay_never_rewrites_a_stored_row_only_this_turns_reply_grows(self):
+        thread_id = self._create_thread()
+        answer = {"id": "srv-a", "role": "assistant", "parts": [{"type": "text", "text": "Tikras atsakymas."}]}
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [_user_message(), answer], "reply_id": "srv-a"})
+
+        # The phone's copy of both, "edited", replayed as the tail
+        # of the next turn — nothing already stored may change
+        forged = {"id": "srv-a", "role": "assistant", "parts": [{"type": "text", "text": "Suklastota."}]}
+        edited_question = _user_message(text="Kitas klausimas")
+        reply = {"id": "srv-b", "role": "assistant", "parts": [{"type": "text", "text": "Antras."}]}
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [edited_question, forged, _user_message("m3", "O dar?"), reply],
+                    "reply_id": "srv-b"})
+        stored = {row.id: row.content for row in AssistantMessage.objects.filter(thread_id=thread_id)}
+        self.assertEqual(stored["srv-a"]["parts"][0]["text"], "Tikras atsakymas.")
+        self.assertEqual(stored["m1"]["parts"][0]["text"], "Kaip gauti stipendija?")
+        self.assertIn("m3", stored)
+
+        # A tool round's continuation grows ITS reply in place
+        grown = {"id": "srv-b", "role": "assistant",
+                 "parts": [{"type": "text", "text": "Antras."}, {"type": "text", "text": " Ir daugiau."}]}
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [grown], "reply_id": "srv-b"})
+        self.assertEqual(len(AssistantMessage.objects.get(thread_id=thread_id, id="srv-b").content["parts"]), 2)
+
+    def test_a_regenerated_answer_replaces_the_old_one_in_the_transcript(self):
+        thread_id = self._create_thread()
+        old = {"id": "srv-old", "role": "assistant", "parts": [{"type": "text", "text": "Senas atsakymas."}]}
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [_user_message(), old], "reply_id": "srv-old"})
+
+        new = {"id": "srv-new", "role": "assistant", "parts": [{"type": "text", "text": "Naujas atsakymas."}]}
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [_user_message(), new], "reply_id": "srv-new", "replaced_id": "srv-old"})
+        replay = self._get(f"/internal/assistant/threads/{thread_id}/messages").json()
+        self.assertEqual([row["id"] for row in replay["messages"]], ["m1", "srv-new"])
+
+        # A rated answer is evidence and stays; a question is never
+        # "replaced"; and nothing goes before the new answer exists
+        self._post(f"/internal/assistant/threads/{thread_id}/feedback", {"message_id": "srv-new", "rating": 1})
+        again = {"id": "srv-3", "role": "assistant", "parts": [{"type": "text", "text": "Trečias."}]}
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [_user_message(), again], "reply_id": "srv-3", "replaced_id": "srv-new"})
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [_user_message("m5", "Kitas?")], "reply_id": "srv-missing", "replaced_id": "srv-3"})
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [{"id": "srv-4", "role": "assistant", "parts": [{"type": "text", "text": "4"}]}],
+                    "reply_id": "srv-4", "replaced_id": "m1"})
+        stored = set(AssistantMessage.objects.filter(thread_id=thread_id).values_list("id", flat=True))
+        self.assertEqual(stored, {"m1", "srv-new", "srv-3", "m5", "srv-4"})
+
+    def test_a_rated_reply_is_evidence_even_for_its_own_turn(self):
+        thread_id = self._create_thread()
+        reply = {"id": "srv-r", "role": "assistant", "parts": [{"type": "text", "text": "Įvertintas."}]}
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [_user_message(), reply], "reply_id": "srv-r"})
+        self._post(f"/internal/assistant/threads/{thread_id}/feedback", {"message_id": "srv-r", "rating": -1})
+        rewrite = {"id": "srv-r", "role": "assistant", "parts": [{"type": "text", "text": "Perrašyta."}]}
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [rewrite], "reply_id": "srv-r"})
+        self.assertEqual(AssistantMessage.objects.get(thread_id=thread_id, id="srv-r").content["parts"][0]["text"],
+                         "Įvertintas.")
+
+    def test_a_guest_answer_lands_in_a_thread_claimed_mid_turn(self):
+        owner = create_user(username="ona")
+        thread_id = self._create_thread()
+        # The login claims the thread while its guest turn streams
+        self._post("/internal/assistant/threads/claim", {"ids": [thread_id], "user_id": owner.id})
+        batch = {"messages": [_user_message(), {"id": "srv-g", "role": "assistant",
+                                                "parts": [{"type": "text", "text": "Atsakymas."}]}],
+                 "reply_id": "srv-g"}
+
+        # Without the container's word it is a stranger's write
+        plain = self._post(f"/internal/assistant/threads/{thread_id}/messages", batch)
+        self.assertEqual(plain.status_code, 404)
+        # With it — a turn that BEGAN on the ownerless thread — it lands
+        claimed = self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                             {**batch, "began_ownerless": True})
+        self.assertEqual(claimed.status_code, 200)
+        self.assertTrue(AssistantMessage.objects.filter(thread_id=thread_id, id="srv-g").exists())
+        # ...but a deleted thread stays closed, flag or not
+        self._post(f"/internal/assistant/threads/{thread_id}/delete", {"user_id": owner.id})
+        gone = self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                          {**batch, "began_ownerless": True})
+        self.assertEqual(gone.status_code, 404)
+
+    def test_a_rating_lands_only_on_an_assistant_message(self):
+        thread_id = self._create_thread()
+        self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                   {"messages": [_user_message(), {"id": "m2", "role": "assistant",
+                                                   "parts": [{"type": "text", "text": "Atsakymas"}]}]})
+        on_question = self._post(f"/internal/assistant/threads/{thread_id}/feedback",
+                                 {"message_id": "m1", "rating": -1})
+        self.assertEqual(on_question.status_code, 404)
+        self.assertIsNone(AssistantMessage.objects.get(thread_id=thread_id, id="m1").rating)
+
+    def test_a_tied_pair_reads_question_first_whatever_its_ids(self):
+        thread_id = self._create_thread()
+        # A legacy batch: both rows share ONE stamp, and the
+        # answer's id sorts BEFORE the question's
+        from django.utils import timezone
+        stamp = timezone.now()
+        thread = AssistantThread.objects.get(id=thread_id)
+        AssistantMessage.objects.create(thread=thread, id="zzz-question", format="aisdk-v7", created_at=stamp,
+                                        content={"id": "zzz-question", "role": "user",
+                                                 "parts": [{"type": "text", "text": "Klausimas?"}]})
+        AssistantMessage.objects.create(thread=thread, id="aaa-answer", format="aisdk-v7", created_at=stamp,
+                                        content={"id": "aaa-answer", "role": "assistant",
+                                                 "parts": [{"type": "text", "text": "Atsakymas."}]})
+        replay = self._get(f"/internal/assistant/threads/{thread_id}/messages").json()
+        self.assertEqual([row["id"] for row in replay["messages"]], ["zzz-question", "aaa-answer"])
 
 
     # ----- search (retrieval faked — the SQL is postgres-only) -----

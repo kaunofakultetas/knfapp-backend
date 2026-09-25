@@ -4,15 +4,22 @@
 #  The AI support agent's protocol head, baked: source and
 #  locked dependencies in the image, nothing mounted. Runs
 #  read_only in compose — node needs no writable disk here.
+#  Dependencies come from a clean `npm ci` against the
+#  lockfile (every package hash checked), installed before
+#  the source is copied so a source edit reuses the layer;
+#  the dev host's node_modules, tests and eval never enter
+#  the image (see .dockerignore, KNF-152).
 # -----------------------------------------------------------
 
 FROM node:24.16.0-alpine
 
 WORKDIR /app
 
-COPY app /app
+COPY app/package.json app/package-lock.json /app/
 
-RUN npm install --omit=dev
+RUN npm ci --omit=dev
+
+COPY app /app
 
 ENV PORT=3000
 EXPOSE 3000

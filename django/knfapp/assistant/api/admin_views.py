@@ -54,6 +54,7 @@ from knfapp.assistant.curated import (
     MAX_ANSWER_CHARS, MAX_QUESTION_CHARS, delete_entry, entry_exists, entry_payload,
     list_entries, save_entry,
 )
+from knfapp.assistant.api.internal_views import transcript_order
 from knfapp.assistant.gateway import GatewayError
 from knfapp.assistant.indexing import run_index
 from knfapp.assistant.models import (
@@ -310,14 +311,16 @@ def assistant_overview(request):
 # reindex_knowledge
 ############################################################
 #
-# POST /api/admin/assistant/knowledge/reindex {all?}
+# POST /api/admin/assistant/knowledge/reindex {all?, allowMassRetire?}
 #
 # Cron's exact sync, on demand — the button for "I just
 # fixed the handbook, index it NOW". Synchronous on
 # purpose: the incremental run is subsecond when nothing
 # changed, and even a forced full re-embed of this corpus
 # is well inside the request budget. A dead gateway
-# answers 502 having written nothing.
+# answers 502 having written nothing; a run that would
+# retire over a quarter of the corpus answers retireBlocked
+# > 0 having retired nothing, unless allowMassRetire.
 #
 # Used by:
 #   - the admin console — the re-index buttons
@@ -328,12 +331,16 @@ def assistant_overview(request):
 def reindex_knowledge(request):
     body = get_json_object(request) or {}
     reindex_all = bool(body.get("all"))
+    # The operator's override for a real, large shrink — the
+    # run otherwise refuses to retire over a quarter of the
+    # knowledge base and answers retireBlocked
+    allow_mass_retire = body.get("allowMassRetire") is True
     try:
-        counts = run_index(reindex_all=reindex_all)
+        counts = run_index(reindex_all=reindex_all, allow_mass_retire=allow_mass_retire)
     except GatewayError as exc:
         return json_error(f"Embedding gateway unavailable: {exc}", 502)
     write_audit(request.user["id"], "assistant_reindex",
-                payload={"all": reindex_all, **counts})
+                payload={"all": reindex_all, "allowMassRetire": allow_mass_retire, **counts})
     return json_response(counts)
 
 
@@ -561,7 +568,9 @@ def delete_curated(request, entry_id):
 # holding at least one thumbs-down — the complaint queue.
 # Soft-deleted threads stay listed (flagged) until cron
 # hard-prunes them: a complaint does not vanish because the
-# student swiped the thread away.
+# student swiped the thread away. Titles and previews are
+# the students' own words, so a page read writes an audit
+# row too, like a transcript read.
 #
 # Used by:
 #   - the admin console — the review list
@@ -594,6 +603,10 @@ def review_threads(request):
                   down=Count("id", filter=Q(rating=-1)),
                   up=Count("id", filter=Q(rating=1)))
     }
+    write_audit(request.user["id"], "assistant_threads_list",
+                payload={"page": page, "perPage": per_page,
+                         "rating": clean_param(request.GET.get("rating")) or None,
+                         "threads": len(page_threads)})
     rows = [{
         "id": str(thread.id),
         "title": thread.title,
@@ -623,9 +636,11 @@ def review_threads(request):
 #
 # One transcript, flattened for reading: per message the
 # role, the joined text parts, the tool names it called and
-# its thumbs verdict. Every read writes an audit row —
-# student conversations are personal data, and WHO looked
-# at WHOSE chat must be answerable.
+# its thumbs verdict — in transcript_order, the same total
+# order the app replays (created_at alone left eight legacy
+# tied pairs in no defined order, KNF-149). Every read writes
+# an audit row — student conversations are personal data,
+# and WHO looked at WHOSE chat must be answerable.
 #
 # Used by:
 #   - the admin console — the transcript reader
@@ -639,7 +654,7 @@ def review_thread(request, thread_id):
         return json_error("Not found", 404)
 
     messages = []
-    for row in thread.messages.order_by("created_at"):
+    for row in transcript_order(thread.messages.all()):
         parts = row.content.get("parts") if isinstance(row.content, dict) else None
         texts = []
         tools = []

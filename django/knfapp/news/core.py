@@ -13,9 +13,13 @@
 #    parse_iso / as_utc / to_utc_iso — timestamp repairs
 #    block_set / blocked_pair        — the block relation
 #    can_view_post                   — the visibility gate
+#    lock_post                       — the writers' lock order
 #    wall_visibility_q               — the wall list's slice
+#    subtract_blocked_engagement     — the reader's tallies
+#    derive_title                    — an untitled post's title
 #    post_to_dict                    — the NewsPost wire shape
 #    feed_version                    — the ETag seed
+#    inactive_authors_stamp          — the seed's liveness term
 #    poll_shape / polls_for_posts / poll_to_dict
 ############################################################
 
@@ -26,13 +30,16 @@ from datetime import datetime, timezone
 from django.db import models
 
 
-from knfapp.news.models import NewsPost, Poll, PollOption, PollVote
+from knfapp.news.models import NewsComment, NewsLike, NewsPost, Poll, PollOption, PollVote
 from knfapp.social.models import Friendship, UserBlock
+from knfapp.users.models import User
 
 
 STAFF_ROLES = ("admin", "curator", "teacher")
 
 MAX_TITLE_LENGTH = 200
+# How long a title derived from an untitled post's body may run
+DERIVED_TITLE_LENGTH = 80
 MAX_CONTENT_LENGTH = 10000
 SUMMARY_LENGTH = 200
 MAX_COMMENT_LENGTH = 2000
@@ -184,19 +191,35 @@ def blocked_pair(a, b):
 # has one (a page of rows); otherwise the gate fetches it
 # for the wall rows that need it.
 #
+# The liveness rule sits in front of both: a WALL post whose
+# author is deactivated (the admin console's moderation
+# lever, and erasure's end state) is nobody's but an
+# admin's — the social app's own rule (social_feed,
+# get_profile, get_user_posts), so a moderated account's
+# post cannot stay readable, likeable and shareable through
+# /api/news while every social surface calls it gone.
+# Official rows ride on as with the block. The row carries
+# the author's flag as author__active (both projections
+# below fetch it); None — no author joined, or a hand-built
+# row — places no liveness restriction.
+#
 # Callers answer 404 (never 403) on False: a stranger must
 # not be able to tell "private" — or "blocked" — from
-# "missing". The row needs is_public, author_id and source
-# — GATE_FIELDS is exactly that.
+# "missing". The row needs is_public, author_id, source and
+# the author's active flag — GATE_FIELDS is exactly that.
 #
 # Used by:
 #   - api/views.py — every per-post route
 ############################################################
 
-GATE_FIELDS = ("id", "author_id", "source", "is_public")
+GATE_FIELDS = ("id", "author_id", "source", "is_public", "author__active")
 
 
 def can_view_post(row, user, blocked=None):
+    author_active = row.get("author__active")
+    if (row["source"] == "user" and row["author_id"] and author_active is not None
+            and not author_active and not (user and user["role"] == "admin")):
+        return False
     if (user and row["source"] == "user" and user["role"] != "admin"
             and row["author_id"] and row["author_id"] != user["id"]):
         if blocked is None:
@@ -214,6 +237,45 @@ def can_view_post(row, user, blocked=None):
     if row["source"] != "user":
         return user["role"] in STAFF_ROLES
     return Friendship.objects.filter(user_id=user["id"], friend_id=row["author_id"]).exists()
+
+
+
+
+
+
+
+
+############################################################
+# lock_post
+############################################################
+#
+# The one lock order of every writer that touches a post's
+# children: the news_posts row FIRST (SELECT … FOR UPDATE,
+# held to the request's commit under ATOMIC_REQUESTS), the
+# likes, comments, poll options and votes after. Two racing
+# likes then serialise on the post — the second one's
+# correlated recount runs on a snapshot that already holds
+# the first one's news_likes row, the window a one-statement
+# COUNT alone cannot close (a blocked UPDATE re-checks only
+# its target row, never the subquery) — and because the
+# deletes, the vote and the comment routes all take the SAME
+# row first, no two writers can deadlock by holding a child
+# while waiting for the post (erasure, the only writer
+# outside the two apps, also moves the post rows before
+# their children). Join-free on purpose: FOR UPDATE refuses
+# the nullable side of an outer join, and the gate reads
+# that follow join users. SQLite ignores the clause — it
+# serialises writers anyway.
+#
+# Used by:
+#   - api/views.py — toggle_like, add_comment,
+#     delete_comment, delete_post, create_poll, delete_poll,
+#     vote_poll
+#   - social/api/views.py — delete_post (the wall delete)
+############################################################
+
+def lock_post(post_id):
+    list(NewsPost.objects.select_for_update().filter(id=post_id).values_list("id", flat=True))
 
 
 
@@ -263,6 +325,88 @@ def wall_visibility_q(viewer, author_id, is_friend, blocked=False):
 
 
 ############################################################
+# subtract_blocked_engagement
+############################################################
+#
+# The engagement a reader can NOT see, taken out of the
+# tallies they are shown: likes and comments on these posts
+# by accounts on either side of a block with the reader.
+# get_comments already drops those comments (its total
+# follows), so the denormalised counter on a card said 5
+# where the thread the reader opened showed 4; every route
+# that serves post counters subtracts this reader's slice,
+# so the numbers agree with what they can open. The stored
+# counters stay the global truth. Two grouped queries per
+# page — and none at all for a reader with no block, the
+# common case. `posts` are wire dicts (likes / comments),
+# patched in place.
+#
+# Used by:
+#   - api/views.py — get_feed, get_post, delete_comment
+#   - social/api/views.py — social_feed, get_user_posts
+############################################################
+
+def subtract_blocked_engagement(posts, blocked):
+    if not blocked or not posts:
+        return
+    ids = [p["id"] for p in posts]
+
+
+    def hidden(model):
+        return dict(
+            model.objects.filter(post_id__in=ids, user_id__in=blocked)
+            .values("post_id").annotate(c=models.Count("*")).values_list("post_id", "c")
+        )
+
+    likes, comments = hidden(NewsLike), hidden(NewsComment)
+    for p in posts:
+        p["likes"] = max(0, p["likes"] - likes.get(p["id"], 0))
+        p["comments"] = max(0, p["comments"] - comments.get(p["id"], 0))
+
+
+
+
+
+
+
+
+############################################################
+# derive_title
+############################################################
+#
+# The title an untitled post gets: its first line, whole
+# when it fits DERIVED_TITLE_LENGTH, else cut at the last
+# word boundary with an ellipsis — never mid-word ("…geria"),
+# never across a line break. A first line with no boundary
+# late enough (one long word, a URL) is hard-cut. The client
+# recognises a derived title as the head of the body
+# (services/newsText titleRepeatsBody) and never prints the
+# same words twice — a short post's card shows it once, the
+# article shows the body alone.
+#
+# Used by:
+#   - api/views.py — create_post
+#   - social/api/views.py — create_post, update_post
+############################################################
+
+def derive_title(content):
+    first = (content or "").strip().split("\n", 1)[0].strip()
+    if len(first) <= DERIVED_TITLE_LENGTH:
+        return first
+    head = first[:DERIVED_TITLE_LENGTH - 1]
+    cut = head.rfind(" ")
+    if cut >= DERIVED_TITLE_LENGTH // 2:
+        head = head[:cut]
+    return head.rstrip(" ,.;:!?–—-") + "…"
+
+
+
+
+
+
+
+
+############################################################
 # post_to_dict
 ############################################################
 #
@@ -273,26 +417,40 @@ def wall_visibility_q(viewer, author_id, is_friend, blocked=False):
 # the JOINed live display name with the row's snapshot as
 # fallback; the counters are the denormalised columns.
 #
+# truncate=True cuts the body to SUMMARY_LENGTH for list
+# pages — a feed card renders the summary, never the body,
+# and the article screen fetches the post whole anyway —
+# and `truncated` tells a cut body from a genuinely short
+# one (the same contract social's _post_row_to_dict keeps
+# for the community feed). Python slices by code point, so
+# a cut never strands half a surrogate pair.
+#
 # Takes the values() dict of POST_FIELDS plus the annotated
-# live_author_name.
+# live_author_name; POST_FIELDS also carries the author's
+# active flag, because get_post runs these rows through
+# can_view_post (the liveness rule).
 #
 # Used by:
-#   - api/views.py — get_feed, create_post, get_post
+#   - api/views.py — get_feed (truncated on ?truncate=1),
+#     create_post, get_post
 ############################################################
 
 POST_FIELDS = (
     "id", "title", "content", "summary", "image_url", "author_id",
     "author_name", "source", "source_url", "post_type",
     "likes_count", "comments_count", "shares_count",
-    "published_at", "is_public",
+    "published_at", "is_public", "author__active",
 )
 
 
-def post_to_dict(row):
+def post_to_dict(row, truncate=False):
+    content = row["content"] or ""
+    truncated = truncate and len(content) > SUMMARY_LENGTH
     return {
         "id": row["id"],
         "title": row["title"],
-        "content": row["content"],
+        "content": content[:SUMMARY_LENGTH] if truncated else content,
+        "truncated": truncated,
         "summary": row["summary"],
         "imageUrl": row["image_url"],
         "author": row.get("live_author_name") or row["author_name"],
@@ -350,6 +508,36 @@ def feed_version():
         f"{row['rows_total']}:{feed_stamp(row['newest'])}:{feed_stamp(row['touched'])}"
         f":{row['likes'] or 0}:{row['comments'] or 0}:{row['shares'] or 0}"
     )
+
+
+
+
+
+
+
+
+############################################################
+# inactive_authors_stamp
+############################################################
+#
+# The seed term for the feed's liveness filter: a wall post
+# drops out of every page the moment its author is
+# deactivated, and deactivation writes the users row, never
+# news_posts — so feed_version alone would answer a 304 and
+# keep the moderated post on a cached page. Both writers of
+# the flag (the admin console's user update and erasure)
+# stamp users.updated_at, so the count of inactive accounts
+# plus their newest stamp moves on every deactivation and
+# every reactivation. One aggregate over the users table.
+#
+# Used by:
+#   - api/views.py — get_feed's ETag seed
+############################################################
+
+def inactive_authors_stamp():
+    from django.db.models import Count, Max
+    row = User.objects.filter(active=False).aggregate(n=Count("id"), touched=Max("updated_at"))
+    return f"{row['n']}:{feed_stamp(row['touched'])}"
 
 
 

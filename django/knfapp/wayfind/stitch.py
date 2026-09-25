@@ -22,10 +22,16 @@
 #  (yawDeg clockwise from above, pitchDeg positive up,
 #  rollDeg positive = tilted clockwise from upright
 #  portrait) is trusted as-is. Each frame is a pinhole
-#  camera at frame_hfov_deg; the canvas (2048x1024) is
-#  inverse-mapped per frame with a cosine-falloff weight
-#  from the frame centre as the feather. Everything is
-#  vectorised numpy; 36 frames at 1280 px stitch in seconds.
+#  camera at frame_hfov_deg; the canvas (2048x1024, the
+#  whole sphere) is inverse-mapped per frame with a cosine-
+#  falloff weight from the frame centre as the feather, then
+#  CROPPED to the row band the frames covered: the stored
+#  image is a full turn by that band, and the panorama row
+#  says exactly that (hfov 360, vfov = the band) — pixels and
+#  geometry describe the same picture, so the stage wraps the
+#  photo onto the band instead of squashing a whole sphere
+#  into it (KNF-025). Everything is vectorised numpy; 36
+#  frames at 1280 px stitch in seconds.
 #  numpy is imported INSIDE the compose call, so a container
 #  without numpy still boots and only an actual stitch
 #  fails.
@@ -41,7 +47,9 @@
 #
 #  The finished JPEG goes through the same content-hash
 #  store as a direct panorama upload, gets a wf_panoramas
-#  row, and the capture's frames directory is deleted.
+#  row (its hfov / vfov the stored image's own extent, the
+#  convention upload_panorama's aspect default follows too),
+#  and the capture's frames directory is deleted.
 ############################################################
 
 
@@ -359,6 +367,9 @@ def _run_stitch(capture):
     # A one-row bulk_create for its ignore_conflicts: the pano
     # is content-addressed, so a re-stitch that lands on the
     # same bytes must keep the first record untouched
+    # hfov / vfov are the STORED image's extent (a full turn by
+    # the cropped band) — the measured arc stays in the report
+    # as capturedHfovDeg / capturedVfovDeg
     WfPanorama.objects.bulk_create([WfPanorama(
         id=digest, building_id=capture["building_id"], node_id=capture["node_id"],
         width=image.width, height=image.height, bytes=len(blob),
@@ -398,9 +409,19 @@ def _run_stitch(capture):
 # pitchDeg, rollDeg}) + the shared frame hfov + an optional
 # centre_yaw_deg (the finish body's request; with None the
 # frames are ORDERED and the first one's yaw becomes the
-# centre column) -> (a 2048x1024 uint8 RGB canvas, the
-# coverage dict {hfovDeg, vfovDeg, vOffsetDeg, centreYawDeg,
-# coveredPct}).
+# centre column) -> (a 2048-wide uint8 RGB canvas cropped to
+# the covered row band, the coverage dict).
+#
+# The coverage dict describes the RETURNED canvas first:
+# hfovDeg 360 (the canvas is always a full turn — columns no
+# frame reached carry FILL_RGB), vfovDeg the band's height
+# (exactly the cropped rows' share of 180°), vOffsetDeg the
+# band's centre above the horizon, centreYawDeg the centre
+# column's yaw. What the frames actually covered rides
+# beside it under names nobody can mistake for the image's
+# extent: capturedHfovDeg (the arc — 360 when every column
+# saw a frame), capturedVfovDeg, and coveredPct (of the
+# whole sphere).
 #
 # Per frame the mapping is INVERSE: the canvas rows inside
 # the frame's angular footprint are turned into world
@@ -415,10 +436,11 @@ def _run_stitch(capture):
 # reached are filled with FILL_RGB.
 #
 # Coverage is measured BEFORE the centre rotation (a column
-# roll changes no coverage): hfov is 360 when every column
-# saw a frame, else the covered arc (360 minus the largest
-# circular column gap); vfov and vOffset come from the
-# covered row band. All numpy — no per-pixel Python — and
+# roll changes no coverage): the captured arc is 360 when
+# every column saw a frame, else 360 minus the largest
+# circular column gap; the row band is every row at least
+# ROW_COVER_FRACTION covered, and the canvas is cut to it.
+# All numpy — no per-pixel Python — and
 # numpy is imported here, lazily, so the module (pulled in
 # at serving start by knfapp/wsgi.py) never needs it at
 # boot.
@@ -531,12 +553,12 @@ def compose_panorama(frames, frame_hfov_deg, on_progress=None, centre_yaw_deg=No
     if cols.size == 0:
         raise StitchError("the frames covered no part of the sphere")
     if bool(col_covered.all()):
-        hfov = 360.0
+        captured_hfov = 360.0
     else:
         gaps = np.diff(cols) - 1
         wrap_gap = int(cols[0]) + (CANVAS_W - 1 - int(cols[-1]))
         largest_gap = max(int(gaps.max(initial=0)), wrap_gap)
-        hfov = round(360.0 - largest_gap * 360.0 / CANVAS_W, 2)
+        captured_hfov = round(360.0 - largest_gap * 360.0 / CANVAS_W, 2)
 
     band = np.flatnonzero(covered.mean(axis=1) > ROW_COVER_FRACTION)
     if band.size == 0:
@@ -544,6 +566,12 @@ def compose_panorama(frames, frame_hfov_deg, on_progress=None, centre_yaw_deg=No
     top_row, bottom_row = int(band[0]), int(band[-1])
     vfov = round((bottom_row - top_row + 1) * 180.0 / CANVAS_H, 2)
     v_offset = round(90.0 - (top_row + bottom_row + 1) / 2.0 * 180.0 / CANVAS_H, 2)
+    covered_pct = round(float(covered.mean()) * 100.0, 1)
+
+    # The stored picture is the band, nothing above or below
+    # it: its rows are exactly vfov of the sphere, centred at
+    # v_offset, so the geometry the row carries IS the image
+    canvas = canvas[top_row:bottom_row + 1]
 
 
     # STEP 4: rotate the columns so the requested yaw — or,
@@ -555,10 +583,12 @@ def compose_panorama(frames, frame_hfov_deg, on_progress=None, centre_yaw_deg=No
     canvas = np.roll(canvas, shift, axis=1)
 
     coverage = {
-        "hfovDeg": hfov,
+        "hfovDeg": 360.0,
         "vfovDeg": vfov,
         "vOffsetDeg": v_offset,
         "centreYawDeg": round(centre_yaw, 2),
-        "coveredPct": round(float(covered.mean()) * 100.0, 1),
+        "capturedHfovDeg": captured_hfov,
+        "capturedVfovDeg": vfov,
+        "coveredPct": covered_pct,
     }
     return np.clip(canvas, 0.0, 255.0).astype(np.uint8), coverage

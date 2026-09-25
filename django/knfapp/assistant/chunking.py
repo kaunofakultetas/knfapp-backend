@@ -23,8 +23,13 @@
 #  lines a model can quote (an unknown scraped section
 #  falls back to a generic key/value walk), and every FAQ
 #  entry becomes its own chunk — question-shaped passages
-#  retrieve best for question-shaped queries. Long texts
-#  split on paragraph seams with overlap.
+#  retrieve best for question-shaped queries. Every chunk
+#  carries a HUMAN title — it is what a student reads in an
+#  answer's Sources list, so an unmapped section is titled
+#  from its key made readable, never the raw code key
+#  ("general_contact — general_contact" was cited once,
+#  KNF-150). Long texts split on paragraph seams with
+#  overlap.
 #
 #  Split into:
 #
@@ -32,6 +37,7 @@
 #    split_text        — the long-text splitter
 #    _flatten_generic  — unknown JSON → indented lines
 #    _handbook_*       — one renderer per known section
+#    _section_title    — the human title of a section
 #    handbook_chunks   — the merged handbook, chunked
 #    news_chunks       — public news posts, chunked
 #    admin_entry_chunk — one console-authored entry → chunk
@@ -221,14 +227,19 @@ def _flatten_generic(value, indent=0):
 
 ############################################################
 # _handbook_contacts / _handbook_links / _handbook_hours /
-# _handbook_programs / _handbook_faq
+# _handbook_programs / _handbook_faq /
+# _handbook_general_contact
 ############################################################
 #
-# One renderer per curated section: each returns a list of
+# One renderer per known section: each returns a list of
 # (section_label, text) pairs — most sections render as one
 # text, the FAQ as one pair PER ENTRY, because a chunk
 # shaped like the question it answers is what cosine
-# search finds first.
+# search finds first. general_contact is the scraper's
+# faculty block ({address, phone, email}), laid out like a
+# contacts entry under the contacts label; a key it does not
+# know still lands as a key: value line, and a blob that is
+# not an object takes the generic walk.
 ############################################################
 
 def _handbook_contacts(blob):
@@ -279,12 +290,29 @@ def _handbook_faq(blob):
     return pairs
 
 
+def _handbook_general_contact(blob):
+    if not isinstance(blob, dict):
+        return [("general_contact", "\n".join(_flatten_generic(blob)))]
+    lines = []
+    if blob.get("address"):
+        lines.append(str(blob["address"]).strip())
+    if blob.get("phone"):
+        lines.append(f"tel. {str(blob['phone']).strip()}")
+    if blob.get("email"):
+        lines.append(str(blob["email"]).strip())
+    for key, value in blob.items():
+        if key not in ("address", "phone", "email") and value not in (None, ""):
+            lines.append(f"{key}: {value}")
+    return [("contacts", "\n".join(lines))]
+
+
 _SECTION_RENDERERS = {
     "contacts": _handbook_contacts,
     "links": _handbook_links,
     "hours": _handbook_hours,
     "programs": _handbook_programs,
     "faq": _handbook_faq,
+    "general_contact": _handbook_general_contact,
 }
 
 
@@ -320,13 +348,23 @@ _SECTION_RENDERERS = {
 ############################################################
 
 # What the chunk lists as its human title per section, per
-# language — the model shows these when it cites
+# language — the model shows these when it cites, and the
+# app's Sources list prints them
 _SECTION_TITLES = {
     "lt": {"contacts": "Kontaktai", "links": "Nuorodos", "hours": "Darbo laikas",
-           "programs": "Studijų programos", "faq": "D.U.K."},
+           "programs": "Studijų programos", "faq": "D.U.K.",
+           "general_contact": "Fakulteto kontaktai"},
     "en": {"contacts": "Contacts", "links": "Links", "hours": "Opening hours",
-           "programs": "Study programs", "faq": "FAQ"},
+           "programs": "Study programs", "faq": "FAQ",
+           "general_contact": "Faculty contacts"},
 }
+
+
+def _section_title(lang, section):
+    # A section the table does not know yet is titled from its
+    # key made readable — never the raw snake_case identifier
+    return (_SECTION_TITLES.get(lang, {}).get(section)
+            or section.replace("_", " ").strip().capitalize())
 
 
 def handbook_chunks(failures=None):
@@ -351,7 +389,7 @@ def handbook_chunks(failures=None):
                     text = BLANK_RUN_RE.sub("\n\n", text).strip()
                     if not text:
                         continue
-                    title = _SECTION_TITLES.get(lang, {}).get(section, section)
+                    title = _section_title(lang, section)
                     # FAQ chunks take their question as the title —
                     # that is the line the assistant cites
                     if section == "faq":
@@ -390,14 +428,17 @@ def handbook_chunks(failures=None):
 def news_chunks(failures=None):
     # Imported here, not at module top: chunking is also used
     # by tests that fake the news table entirely
-    from knfapp.news.models import NewsPost
+    from knfapp.news.models import SCRAPED_SOURCES, NewsPost
 
     chunks = []
     # STAFF AND SCRAPED posts only — a student's own post must
     # never become citable knowledge-base content (any public
-    # user post is attacker-authorable prose)
+    # user post is attacker-authorable prose). The scraped
+    # sources come from the news model itself: a hand-copied
+    # list drifts silently the day the scraper renames one,
+    # and an empty news unit raises nothing (KNF-051)
     posts = (NewsPost.objects.filter(is_public=True,
-                                     source__in=("faculty", "knf.vu.lt", "vu.lt"))
+                                     source__in=(*SCRAPED_SOURCES, "faculty"))
              .order_by("-published_at")
              .values("id", "title", "summary", "content", "source", "published_at")[:MAX_NEWS_POSTS])
     for post in posts:

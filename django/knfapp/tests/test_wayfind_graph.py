@@ -16,7 +16,16 @@
 #  a publish with the engine's own error codes, an unchanged
 #  draft cannot be re-published, and the published document
 #  round-trips byte-for-byte under its ETag (304 on
-#  If-None-Match).
+#  If-None-Match). Shapes are typed at the door (KNF-023 /
+#  KNF-024): an id field that is an object, a coordinate that
+#  is a string, NaN or a bool, a polygon or an alias list of
+#  the wrong shape is rejected per op with its reason, and a
+#  row that predates the checks degrades to validator issues
+#  (bad_coordinate among them) instead of a 500 on GET /draft
+#  and on publish. A baseRevision that is not an integer
+#  rejects its op (KNF-159), a fresh create over a live
+#  entity is a conflict, and a building's northDeg must be a
+#  finite number.
 ############################################################
 
 
@@ -27,8 +36,10 @@ from django.test import Client, TestCase
 
 
 from knfapp.common import ratelimit
+from knfapp.common.timestamps import utc_now
 from knfapp.users import auth
 from knfapp.wayfind.graph import compile_document, document_text, validate_document
+from knfapp.wayfind.models import WfBuilding, WfEntity
 from .utils import bearer, create_user
 
 
@@ -103,7 +114,10 @@ class OpLogTests(WayfindTestCase):
     def test_a_stale_edit_is_a_conflict_carrying_the_current_entity(self):
         first = self._ops([_op("op-1", "level", "l1", LEVEL)])
         base = first["revision"]
-        self._ops([_op("op-2", "level", "l1", dict(LEVEL, label="Naujas"))])
+        # The other editor's edit, stamped the way the phone stamps
+        # one (a bare `fresh` create over the live row would itself
+        # be a conflict now)
+        self._ops([_op("op-2", "level", "l1", dict(LEVEL, label="Naujas"), base=base)])
 
         # An edit from the old copy loses; a fresh op in the same
         # batch still lands
@@ -179,6 +193,147 @@ class OpLogTests(WayfindTestCase):
         delta = json.loads(response.content)
         self.assertEqual([(e["id"], e["deleted"], e["data"]) for e in delta["entities"]],
                          [("n1", True, None)])
+
+
+class ShapeTypingTests(WayfindTestCase):
+
+    def test_a_malformed_entity_is_rejected_at_the_door_with_its_reason(self):
+        self._ops([_op("ok-1", "level", "l1", LEVEL), _op("ok-2", "node", "n1", NODE_A), _op("ok-3", "node", "n2", NODE_B)])
+        bad = [
+            ("node", "b1", dict(NODE_A, level={"oops": 1}), "level must be a level id"),
+            ("node", "b2", dict(NODE_A, x="not-a-number"), "x and y must be finite numbers"),
+            ("node", "b3", dict(NODE_A, y=None), "x and y must be finite numbers"),
+            ("node", "b4", dict(NODE_A, x=True), "x and y must be finite numbers"),
+            ("node", "b5", dict(NODE_A, panoYaw="90"), "panoYaw must be a number or null"),
+            ("node", "b6", dict(NODE_A, panoGeometry={"hfovDeg": "wide"}), "panoGeometry"),
+            ("node", "b7", dict(NODE_A, pano=["x"]), "pano must be a string or null"),
+            ("node", "b7a", dict(NODE_A, panoLinks=5), "panoLinks"),
+            ("node", "b7b", dict(NODE_A, panoLinks=[{"yaw": 1}]), "panoLinks"),
+            ("node", "b7c", dict(NODE_A, panoHeading="aligned"), "panoHeading must be an object or null"),
+            ("edge", "b8", {"a": ["n1"], "b": "n2", "kind": "hallway"}, "a and b must be node ids"),
+            ("level", "b9", dict(LEVEL, ordinal="1"), "ordinal must be a number"),
+            ("level", "b10", dict(LEVEL, viewBox=[0, 0, 0, 60]), "viewBox"),
+            ("level", "b11", dict(LEVEL, metersPerPixel=True), "metersPerPixel"),
+            ("level", "b12", dict(LEVEL, label=""), "label must be a non-empty string"),
+            ("room", "b13", {"name": "A", "level": "l1", "nodeId": {"n": 1}}, "nodeId must be a node id"),
+            ("room", "b14", {"name": "A", "level": "l1", "nodeId": "n1", "polygon": "0,0 1,1"}, "polygon"),
+            ("room", "b15", {"name": "A", "level": "l1", "nodeId": "n1", "aliases": "A1"}, "aliases"),
+            ("room", "b16", {"name": 7, "level": "l1", "nodeId": "n1"}, "name must be a non-empty string"),
+        ]
+        batch = self._ops([_op(f"bad-{i}", kind, entity, data) for i, (kind, entity, data, _) in enumerate(bad)])
+        for result, (_, entity, _, reason) in zip(batch["results"], bad):
+            self.assertEqual(result["status"], "rejected", (entity, result))
+            self.assertIn(reason, result["reason"], entity)
+
+        # None of it landed, so the draft still opens and publishes
+        draft = bearer(self.client.get, "/api/wayfind/buildings/b1/draft", self.token)
+        self.assertEqual(draft.status_code, 200, draft.content)
+        self.assertEqual(sorted(json.loads(draft.content)["revisions"]), ["level:l1", "node:n1", "node:n2"])
+
+        # A room unlinked from its force-deleted node ("" node) is
+        # a shape the editor writes — accepted, flagged at publish
+        unlinked = self._ops([_op("ok-4", "room", "r1", {"name": "A", "level": "l1", "nodeId": "", "polygon": [[0, 0], [5, 0], [5, 5]]})])
+        self.assertEqual(unlinked["results"][0]["status"], "applied")
+
+    def test_rows_that_predate_the_checks_degrade_to_issues_not_a_500(self):
+        # Written straight to the table, the way a row stored
+        # before the checks existed looks
+        self._ops([_op("ok-1", "level", "l1", LEVEL), _op("ok-2", "node", "n1", NODE_A)])
+        now = utc_now()
+        for kind, entity, data in (
+            ("node", "n-obj", dict(NODE_A, level={"oops": 1})),
+            ("node", "n-nan", dict(NODE_A, x="not-a-number", y=None)),
+            ("edge", "e-list", {"a": ["n1"], "b": "n1", "kind": "hallway"}),
+            ("room", "r-list", {"name": "A", "level": ["l1"], "nodeId": {"n": 1}}),
+        ):
+            WfEntity.objects.create(building_id="b1", kind=kind, id=entity, data=data, revision=9,
+                                    updated_at=now, updated_by=None, deleted=False)
+
+        draft = bearer(self.client.get, "/api/wayfind/buildings/b1/draft", self.token)
+        self.assertEqual(draft.status_code, 200, draft.content)
+        codes = {(issue["code"], issue["ref"]) for issue in json.loads(draft.content)["issues"]}
+        self.assertIn(("unknown_level", "n-obj"), codes)
+        self.assertIn(("bad_coordinate", "n-nan"), codes)
+        self.assertIn(("dangling_edge", "['n1']-n1"), codes)
+        self.assertIn(("room_without_node", "r-list"), codes)
+        self.assertIn(("unknown_level", "r-list"), codes)
+
+        response = self._post_json("/api/wayfind/buildings/b1/publish", {})
+        self.assertEqual(response.status_code, 422, response.content)
+        self.assertIn("bad_coordinate", [issue["code"] for issue in json.loads(response.content)["issues"]])
+
+    def test_validate_document_never_raises_on_an_unhashable_value(self):
+        document = {
+            "levels": [{"id": "l1"}],
+            "nodes": [{"id": "n1", "level": {"x": 1}, "x": 1, "y": 1}],
+            "edges": [{"a": {"x": 1}, "b": ["n1"], "kind": "hallway"}],
+            "rooms": [{"id": "r1", "nodeId": ["n1"], "level": {"l": 1}}],
+            "entranceNodeId": ["n1"],
+        }
+        codes = [issue["code"] for issue in validate_document(document)]
+        self.assertEqual(sorted(set(codes)), ["dangling_edge", "missing_entrance", "room_without_node", "unknown_level"])
+
+
+class RevisionStampTests(WayfindTestCase):
+
+    def test_a_malformed_base_revision_rejects_its_op_instead_of_overwriting(self):
+        self._ops([_op("op-1", "level", "l1", LEVEL), _op("op-2", "node", "n1", NODE_A)])
+        self._ops([_op("op-3", "node", "n1", dict(NODE_A, x=9), base=0)])  # a conflict — the row is past 0
+        moved = self._ops([_op("op-4", "node", "n1", dict(NODE_A, x=9), base=10**6)])
+        self.assertEqual(moved["results"][0]["status"], "applied")
+
+        for op_id, base, op_type, fresh in (("s-1", "1", "upsert", True), ("s-2", 1.0, "upsert", True),
+                                            ("s-3", "1", "delete", False), ("s-4", 1.0, "delete", False),
+                                            ("s-5", True, "delete", False)):
+            op = {"id": op_id, "type": op_type, "kind": "node", "entityId": "n1", "baseRevision": base}
+            if op_type == "upsert":
+                op["data"] = dict(NODE_A, x=1)
+            if fresh:
+                op["fresh"] = True
+            result = self._ops([op])["results"][0]
+            self.assertEqual((result["status"], result["reason"]), ("rejected", "baseRevision must be an integer revision"), op_id)
+
+        # The stale writes never landed: the node stands where the
+        # one well-stamped edit put it
+        draft = json.loads(bearer(self.client.get, "/api/wayfind/buildings/b1/draft", self.token).content)
+        self.assertEqual([n["x"] for n in draft["document"]["nodes"]], [9])
+
+        # And an upsert whose ONLY licence is a malformed stamp is
+        # still the whole-batch no_base refusal
+        bare = {"id": "s-6", "type": "upsert", "kind": "node", "entityId": "n1", "data": NODE_A, "baseRevision": "1"}
+        response = self._post_json("/api/wayfind/buildings/b1/ops", {"ops": [bare]})
+        self.assertEqual((response.status_code, json.loads(response.content)["code"]), (400, "no_base"))
+
+    def test_a_fresh_create_over_a_live_entity_is_a_conflict(self):
+        self._ops([_op("op-1", "level", "l1", LEVEL), _op("op-2", "node", "n1", NODE_A)])
+        clash = self._ops([_op("op-3", "node", "n1", NODE_B)])["results"][0]
+        self.assertEqual((clash["status"], clash["reason"]), ("rejected", "conflict"))
+        self.assertEqual(clash["current"]["data"]["kind"], NODE_A["kind"])
+        self.assertFalse(clash["current"]["deleted"])
+
+        # Keep-mine, the phone's way: the retry carries the revision
+        # the conflict showed and overwrites exactly that copy
+        kept = self._ops([_op("op-4", "node", "n1", NODE_B, base=clash["current"]["revision"])])
+        self.assertEqual(kept["results"][0]["status"], "applied")
+
+    def test_a_building_north_must_be_a_finite_number(self):
+        # An Infinity token is not JSON at all: common/http's
+        # get_json_object refuses the WHOLE body (for every API),
+        # so it never reaches the northDeg check — still a 400,
+        # and nothing is created
+        response = bearer(self.client.post, "/api/wayfind/buildings", self.token,
+                          data='{"id": "b2", "name": "Antras", "northDeg": Infinity}', content_type="application/json")
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(WfBuilding.objects.filter(id="b2").exists())
+        # A non-finite-number northDeg that IS valid JSON still
+        # answers the view's own code
+        response = bearer(self.client.post, "/api/wayfind/buildings", self.token,
+                          data='{"id": "b3", "name": "Trecias", "northDeg": true}', content_type="application/json")
+        self.assertEqual((response.status_code, json.loads(response.content)["code"]), (400, "bad_north"))
+        self._post_json("/api/wayfind/buildings", {"id": "b4", "name": "Ketvirtas", "entranceNodeId": {"x": 1}}, expect=400)
+
+        rejected = self._ops([{"id": "op-n", "type": "building", "data": {"northDeg": True}}])["results"][0]
+        self.assertEqual((rejected["status"], rejected["reason"]), ("rejected", "northDeg must be a number or null"))
 
 
 class PublishTests(WayfindTestCase):

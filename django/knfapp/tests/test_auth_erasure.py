@@ -188,6 +188,9 @@ class DeleteMeTests(TestCase):
         response = self._delete(token=token)
         self.assertEqual(response.status_code, 400)
         self.assertIn("last active admin", json.loads(response.content)["error"])
+        # The machine code the delete-account screen keys on — it
+        # used to tell this apart from a wrong password by prose
+        self.assertEqual(json.loads(response.content)["code"], "last_admin")
         # A second active admin unblocks the same request
         create_user(username="pavaduotojas", role="admin")
         self.assertEqual(self._delete(token=token).status_code, 200)

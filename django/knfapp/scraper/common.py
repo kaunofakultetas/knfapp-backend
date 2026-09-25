@@ -345,7 +345,11 @@ def normalise_url(url: str) -> str:
 #   - a Content-Type check, so an unexpected PDF or image is
 #     not parsed as a page
 #   - a byte cap read chunk by chunk, so an endless body is
-#     cut instead of swallowing the run
+#     cut instead of swallowing the run — or, for a caller
+#     that cannot use half a document (a JSON feed passes
+#     allow_truncated=False), refused whole: None, exactly
+#     like any other failed fetch, never a cut body that
+#     looks complete
 # The body comes back as BYTES on purpose: BeautifulSoup
 # sniffs the document's own charset, which is more reliable
 # than the ISO-8859-1 requests falls back to when the header
@@ -359,7 +363,7 @@ def normalise_url(url: str) -> str:
 
 def fetch(url: str, allowed_hosts, params=None, timeout=DEFAULT_TIMEOUT,
           content_types=HTML_CONTENT_TYPES, max_bytes=MAX_RESPONSE_BYTES,
-          extra_headers=None):
+          extra_headers=None, allow_truncated=True):
     # STEP 1: refuse anything off the allowlist before a
     # single packet leaves the container
     # ==================================================
@@ -401,8 +405,9 @@ def fetch(url: str, allowed_hosts, params=None, timeout=DEFAULT_TIMEOUT,
 
 
         # STEP 4: read with a hard budget — the cap is on the
-        # bytes kept, so a truncated page still parses
-        # ==================================================
+        # bytes kept, so a truncated page still parses; a caller
+        # that cannot parse half a body gets None instead
+        # ======================================================
         chunks = []
         total = 0
         for chunk in resp.iter_content(chunk_size=16384):
@@ -410,7 +415,13 @@ def fetch(url: str, allowed_hosts, params=None, timeout=DEFAULT_TIMEOUT,
                 continue
             chunks.append(chunk)
             total += len(chunk)
-            if total >= max_bytes:
+            # PAST the cap, not at it — a body exactly max_bytes
+            # long is complete and must not be reported as cut
+            if total > max_bytes:
+                if not allow_truncated:
+                    logger.warning("Body of %s exceeded %d bytes — refused as incomplete",
+                                   resp.url, max_bytes)
+                    return None
                 logger.warning("Body of %s exceeded %d bytes — truncated", resp.url, max_bytes)
                 break
 

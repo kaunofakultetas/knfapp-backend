@@ -24,7 +24,7 @@ import logging
 import warnings
 
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 
 logger = logging.getLogger(__name__)
@@ -235,6 +235,10 @@ def sniff_image_format(blob):
 # many times over), transparency becomes PNG, everything
 # else progressive JPEG; still images are downscaled to
 # MAX_EDGE first — what keeps a 30 MP photo off a phone.
+# A still image is turned upright by its EXIF Orientation
+# BEFORE the metadata goes: camera JPEGs store the sensor's
+# pixels plus a "rotate to display" tag, and dropping the
+# tag alone stored every portrait photo sideways.
 #
 # Used by:
 #   - api/views.py upload_file — the image branch
@@ -289,10 +293,18 @@ def reencode_image(raw):
         return None, None, unreadable
 
     # STEP 4: re-encode into the canonical container — only pixels
-    # cross over, never the source's metadata
+    # cross over, never the source's metadata; a still image is
+    # first turned the way its Orientation tag says it displays
     # ============================================================
     buffer = io.BytesIO()
     try:
+        if frames == 1:
+            # Best-effort: a malformed EXIF block keeps the stored
+            # orientation — it must never cost the upload itself
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception:
+                logger.info("Upload kept its stored orientation: the EXIF block is unreadable")
         if frames > 1 and img.format == "WEBP":
             img.save(buffer, format="WEBP", save_all=True)
             ext = "webp"

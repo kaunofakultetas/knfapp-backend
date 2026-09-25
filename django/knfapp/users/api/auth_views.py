@@ -643,8 +643,12 @@ def _disconnect_user_sockets(user_id, *, only_session=None, except_session=None)
 # already set by `me`'s require_auth.
 #
 # Used by:
-#   - services/api/auth.ts — updateMe (profile screen, the
-#     student-card editor)
+#   - no client today — the app and the admin panel both
+#     edit a profile through PUT /api/social/profile
+#     (services/api/social.ts updateProfile), a thin caller
+#     of the same users/profile.py; this route is kept as
+#     its REST-shaped twin (KNF-139: the banner used to name
+#     an updateMe that never existed)
 ############################################################
 
 @ratelimit.per_user("profile", max_attempts=30)
@@ -821,7 +825,9 @@ def delete_me(request):
     if request.user["role"] == "admin":
         remaining = User.objects.filter(role="admin", active=1).exclude(id=user_id).count()
         if remaining == 0:
-            return json_error("Cannot delete the last active admin", 400)
+            # The machine code lets the client say THIS instead of
+            # reading the prose apart from a wrong password
+            return json_error("Cannot delete the last active admin", 400, code="last_admin")
 
 
     # STEP 4: erase — one transaction — then kick live sockets

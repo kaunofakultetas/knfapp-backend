@@ -120,3 +120,56 @@ class WayfindSweepTests(TestCase):
 
         remaining = list(WfOp.objects.values_list("id", flat=True))
         self.assertEqual(remaining, ["knf:naujas"])
+
+
+
+
+
+
+
+
+############################################################
+# OrphanUploadMaintenanceTests
+############################################################
+#
+# KNF-118 through the daily tick: the sweep only COUNTS by
+# default — a student's file is deleted only once the owner
+# has read the dry-run counts and passes the flag.
+############################################################
+
+class OrphanUploadMaintenanceTests(TestCase):
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        from datetime import timedelta
+
+        from knfapp.common.timestamps import utc_now
+        from knfapp.uploads import storage
+        from knfapp.uploads.models import Upload
+        from .utils import create_user, register_upload
+
+        self.storage = storage
+        self.tmp = tempfile.mkdtemp(prefix="knfapp-maint-")
+        storage._upload_dir = self.tmp
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.addCleanup(lambda: setattr(storage, "_upload_dir", None))
+        owner = create_user()
+        self.orphan = register_upload(self.tmp, owner, blob=b"x" * 400)
+        Upload.objects.filter(filename=self.orphan).update(created_at=utc_now() - timedelta(days=9))
+
+    def test_the_default_run_counts_and_deletes_nothing(self):
+        from knfapp.uploads.models import Upload
+
+        out = io.StringIO()
+        call_command("maintenance", stdout=out)
+        self.assertIn("Would remove (dry run) 1 orphan upload(s), 400 bytes", out.getvalue())
+        self.assertTrue(Upload.objects.filter(filename=self.orphan).exists())
+
+    def test_the_flag_deletes_the_orphan(self):
+        from knfapp.uploads.models import Upload
+
+        out = io.StringIO()
+        call_command("maintenance", "--delete-orphan-uploads", stdout=out)
+        self.assertIn("Removed 1 orphan upload(s), 400 bytes", out.getvalue())
+        self.assertFalse(Upload.objects.filter(filename=self.orphan).exists())

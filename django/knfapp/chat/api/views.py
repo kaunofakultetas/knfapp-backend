@@ -96,6 +96,16 @@ _MARK_READ_CAP = 500
 _SEARCH_Q_MAX = 200
 _SEARCH_TOTAL_CAP = 500
 
+# How far BEFORE the request a change-feed cursor is stamped.
+# The writers stamp edited_at / deleted_at and only then
+# commit, so a cursor read at "now" could sit past a write
+# that commits after the page's SELECT — that edit would be
+# neither on the page nor in any later feed. Backdating the
+# cursor re-delivers the last few seconds of changes instead
+# (the client applies a change idempotently); a write
+# transaction open longer than this is not one chat has
+_CHANGES_CURSOR_SLACK = timedelta(seconds=10)
+
 
 def _get_sio():
     # Imported at call time: socket.py imports events.py which
@@ -318,23 +328,39 @@ def _reply_payload(row):
 # _insert_system_message
 ############################################################
 #
-# The room narrating itself: "X sukūrė grupę „Y“", "X paliko
-# pokalbį". A 'system' row is stored like any message (the
-# actor is its sender, so every JOIN keeps working) and the
-# returned payload is what emit_new_message broadcasts; the
-# client renders kind 'system' as a centred caption. LT text
-# on purpose — the app is Lithuanian-first. Bumps the
-# conversation so the room sorts to the top of the list.
-# kind, forwarded and created_at are stamped explicitly —
-# the table carries no DDL defaults.
+# The room narrating itself. A 'system' row is stored like
+# any message (the actor is its sender, so every JOIN keeps
+# working) and the returned payload is what
+# emit_new_message broadcasts; the client renders kind
+# 'system' as a centred caption.
+#
+# The row carries TWO forms of the same line: `event`, a
+# code plus parameters — {"event": "group_created",
+# "title": …}, {"event": "left"}, {"event": "ttl_on",
+# "seconds": …}, {"event": "ttl_off"} — kept in
+# attachment_meta.system (a system row has no media, and a
+# JSON column needs no migration), and `text`, the
+# Lithuanian sentence. Clients render the event through
+# their own catalog with the sender as the actor, so an
+# English reader never sees a Lithuanian line; the prose
+# stays only as the fallback for rows written before events
+# existed and for clients that do not know an event yet.
+# Every wire shape ships the event as `system`
+# (_system_payload). A system line is never UNREAD — both
+# unread aggregates skip kind 'system' — and a caller that
+# has just stamped watermarks passes `at` so the line shares
+# that instant. Bumps the conversation so the room sorts to
+# the top of the list. kind, forwarded and created_at are
+# stamped explicitly — the table carries no DDL defaults.
 ############################################################
 
-def _insert_system_message(conv_id, actor, text):
+def _insert_system_message(conv_id, actor, text, event=None, at=None):
     msg_id = str(uuid.uuid4())
-    now = utc_now()
+    now = at or utc_now()
     Message.objects.create(
         id=msg_id, conversation_id=conv_id, sender_id=actor["id"], text=text,
         kind="system", forwarded=False, created_at=now,
+        attachment_meta={"system": event} if event else None,
     )
     Conversation.objects.filter(id=conv_id).update(updated_at=now)
     return {
@@ -354,6 +380,7 @@ def _insert_system_message(conv_id, actor, text):
         "kind": "system",
         "editedAt": None,
         "attachment": None,
+        "system": event,
     }
 
 
@@ -365,16 +392,21 @@ def _insert_system_message(conv_id, actor, text):
 
 ############################################################
 # _attachment_payload / _media_payload /
-# _link_preview_payload / _gallery_payload
+# _link_preview_payload / _gallery_payload /
+# _system_payload
 ############################################################
 #
 # The optional frames of the richer message shapes: the
 # `attachment` object of a 'file' message, the media frame
-# of a photo/video, the unfurled card of the first URL, and
-# the photo list of a multi-photo row. All None for other
-# rows, for unsent ones (the blanking clears the columns;
-# these mirror it on the wire) and for anything that is not
-# the shape its writer stores.
+# of a photo/video, the unfurled card of the first URL, the
+# photo list of a multi-photo row, and the event behind a
+# 'system' row. All None for other rows, for unsent ones
+# (the blanking clears the columns; these mirror it on the
+# wire) and for anything that is not the shape its writer
+# stores. A system row keeps its event in attachment_meta
+# (see _insert_system_message) — it never has a media frame,
+# so _media_payload skips it instead of shipping an all-null
+# frame the client would read as a photo's.
 ############################################################
 
 def _attachment_payload(row, deleted=False):
@@ -388,9 +420,17 @@ def _attachment_payload(row, deleted=False):
     }
 
 
+def _system_payload(row):
+    if (row.get("kind") or "text") != "system":
+        return None
+    meta = row.get("attachment_meta")
+    event = meta.get("system") if isinstance(meta, dict) else None
+    return event if isinstance(event, dict) and isinstance(event.get("event"), str) else None
+
+
 def _media_payload(row, deleted=False):
     meta = row.get("attachment_meta")
-    if deleted or not isinstance(meta, dict):
+    if deleted or not isinstance(meta, dict) or (row.get("kind") or "text") == "system":
         return None
     return {
         "width": meta.get("width"),
@@ -434,32 +474,75 @@ def _gallery_payload(row, deleted=False):
 
 
 ############################################################
-# _sweep_expired / _delete_expired_uploads
+# _stored_upload_urls
+############################################################
+#
+# Every stored-file slot of one message row, in the order
+# the deletion paths walk them: the photo, the attachment,
+# the video poster (attachment_meta.thumbnailUrl), the link
+# card's picture and every gallery photo. `row` is a
+# values() dict carrying those five columns; slots that are
+# empty or not the shape their writer stores are skipped,
+# and only this server's /api/uploads/ files are answered —
+# the SAME rule (_is_local_upload_url) the send accepted
+# them under, so no form the send takes can be one a delete
+# leaves behind. ONE walker on purpose: the last-member
+# purge once dropped a whole room's messages without it and
+# orphaned every file they held.
+#
+# Used by:
+#   - _sweep_expired (below) — disappearing messages
+#   - delete_message — the unsend
+#   - leave_conversation — the last member's purge
+############################################################
+
+def _stored_upload_urls(row, request=None):
+    stored_urls = [row.get("image_url"), row.get("attachment_url")]
+    meta = row.get("attachment_meta")
+    if isinstance(meta, dict):
+        stored_urls.append(meta.get("thumbnailUrl"))
+    card = row.get("link_preview")
+    if isinstance(card, dict):
+        stored_urls.append(card.get("imageUrl"))
+    gallery = row.get("gallery")
+    if isinstance(gallery, list):
+        stored_urls.extend(item.get("url") for item in gallery if isinstance(item, dict))
+    return [stored for stored in stored_urls if _is_local_upload_url(stored, request)]
+
+
+
+
+
+
+
+
+############################################################
+# _sweep_expired / _delete_message_uploads
 ############################################################
 #
 # Disappearing messages: hard-deletes this conversation's
 # rows whose expires_at has passed — the reaction and
 # receipt rows, then the messages, in one atomic block —
-# and hands their files (photo, attachment, poster, link
-# card image, every gallery photo) to the uploads sink ON
-# THE COMMIT, as the sender: the sink refuses a file the
-# sender never owned (a forwarded copy of somebody else's
-# photo) and one another live message still shows, and
-# because the expired rows are gone by the time the
-# callback runs, they cannot hold their own files back.
-# Called opportunistically from get_messages, send_message
-# and search_messages (autocommit views — the callback runs
-# right after the block commits; the partial index
-# idx_messages_expires makes the lookup a no-op for a room
-# without a TTL). The surfaces that read WITHOUT a sweep —
-# list_conversations' preview seek, get_pins — filter on
-# expires_at instead, and the room's clients drop expired
-# rows by their own clocks too, so a row that slips into a
-# page between sweeps still vanishes on screen. The daily
-# maintenance command runs the same sweep for rooms nobody
-# reopens — no transaction there, so on_commit runs at
-# once. A file that will not go is logged, never raised:
-# the rows stay gone either way.
+# and hands their files (_stored_upload_urls) to the
+# uploads sink ON THE COMMIT, as the sender: the sink
+# refuses a file the sender never owned (a forwarded copy
+# of somebody else's photo) and one another live message
+# still shows, and because the expired rows are gone by the
+# time the callback runs, they cannot hold their own files
+# back. Called opportunistically from get_messages,
+# send_message and search_messages (autocommit views — the
+# callback runs right after the block commits; the partial
+# index idx_messages_expires makes the lookup a no-op for a
+# room without a TTL). The surfaces that read WITHOUT a
+# sweep — list_conversations' preview seek, get_pins —
+# filter on expires_at instead, and the room's clients drop
+# expired rows by their own clocks too, so a row that slips
+# into a page between sweeps still vanishes on screen. The
+# daily maintenance command runs the same sweep for rooms
+# nobody reopens — no transaction there, so on_commit runs
+# at once. A file that will not go is logged, never raised:
+# the rows stay gone either way. _delete_message_uploads is
+# that on-commit half, shared with the last-member purge.
 ############################################################
 
 def _sweep_expired(conv_id, request=None):
@@ -475,15 +558,7 @@ def _sweep_expired(conv_id, request=None):
 
     doomed = []
     for row in rows:
-        stored_urls = [row["image_url"], row["attachment_url"]]
-        if isinstance(row["attachment_meta"], dict):
-            stored_urls.append(row["attachment_meta"].get("thumbnailUrl"))
-        if isinstance(row["link_preview"], dict):
-            stored_urls.append(row["link_preview"].get("imageUrl"))
-        if isinstance(row["gallery"], list):
-            stored_urls.extend(item.get("url") for item in row["gallery"] if isinstance(item, dict))
-        doomed.extend((stored, row["sender_id"]) for stored in stored_urls
-                      if _is_local_upload_url(stored, request))
+        doomed.extend((stored, row["sender_id"]) for stored in _stored_upload_urls(row, request))
 
 
     # STEP 2: the rows first — the files only once these are gone,
@@ -500,16 +575,16 @@ def _sweep_expired(conv_id, request=None):
         _exec(f"DELETE FROM messages WHERE id IN ({marks})", ids)
 
     if doomed:
-        transaction.on_commit(lambda: _delete_expired_uploads(doomed))
+        transaction.on_commit(lambda: _delete_message_uploads(doomed))
 
 
-def _delete_expired_uploads(doomed):
+def _delete_message_uploads(doomed):
     from knfapp.uploads.storage import delete_upload
     for stored, sender_id in doomed:
         try:
             delete_upload(stored, sender_id)
         except Exception:
-            logger.exception("Upload cleanup failed for expired message")
+            logger.exception("Upload cleanup failed for a deleted message")
 
 
 
@@ -655,6 +730,60 @@ def _reactions_for(msg_ids, current_user_id=None):
 
 
 ############################################################
+# _receipts_for / _own_status
+############################################################
+#
+# The read-receipt half of a message row, shared by every
+# route that ships full rows (the history page AND the
+# change feed — the feed once hard-coded status "read",
+# readBy [] and reactions [], so a resync flipped the
+# sender's unread message to the read tick and wiped real
+# receipts off the screen).
+#
+# _receipts_for: {message_id: [reader ids]} for a whole id
+# list in one IN (...) query, ordered by the receipt stamp
+# so readBy never depends on which index the planner walks.
+#
+# _own_status: the delivery ladder of the CALLER'S own
+# message — "read" needs a receipt from every other member,
+# "delivered" from at least one, a room with no other
+# member is trivially read; the sender's own receipt never
+# counts. Everybody else's message is simply "read" (status
+# only means something on own rows).
+#
+# Used by:
+#   - get_messages / get_changes (below)
+############################################################
+
+def _receipts_for(msg_ids):
+    read_map = {}
+    if not msg_ids:
+        return read_map
+    for rd in MessageRead.objects.filter(message_id__in=list(msg_ids)) \
+            .order_by("message_id", "read_at").values("message_id", "user_id"):
+        read_map.setdefault(rd["message_id"], []).append(rd["user_id"])
+    return read_map
+
+
+def _own_status(is_own, read_by, user_id, participant_count):
+    if not is_own:
+        return "read"
+    other_readers = [uid for uid in read_by if uid != user_id]
+    others_count = participant_count - 1
+    if others_count <= 0 or len(other_readers) >= others_count:
+        return "read"
+    if other_readers:
+        return "delivered"
+    return "sent"
+
+
+
+
+
+
+
+
+############################################################
 # _push_chat_message
 ############################################################
 #
@@ -662,17 +791,24 @@ def _reactions_for(msg_ids, current_user_id=None):
 # send answers 201 without waiting on Expo's HTTP
 # round-trip. Goes straight through the batched
 # notify_channel_users (one query, one Expo batch per
-# language, "chat" opt-outs honoured in SQL). No
-# request context in here — everything arrives as
-# arguments, and every failure is logged and swallowed
-# (push never owes anybody an error). The thread's DB
-# connection is closed on the way out.
+# language, "chat" opt-outs honoured in SQL). title/body
+# are the Lithuanian copy; title_en/body_en the English one
+# for devices registered as 'en' — passed whenever the
+# BACKEND composed the words (a media marker, the
+# content-free body, the mention title), left None where
+# the words are the sender's own (their name, their text),
+# which reads the same in any language. No request context
+# in here — everything arrives as arguments, and every
+# failure is logged and swallowed (push never owes anybody
+# an error). The thread's DB connection is closed on the
+# way out.
 ############################################################
 
-def _push_chat_message(recipient_ids, title, body, data):
+def _push_chat_message(recipient_ids, title, body, data, title_en=None, body_en=None):
     try:
         from knfapp.notifications.push import notify_channel_users
-        notify_channel_users("chat", recipient_ids, title, body, data=data)
+        notify_channel_users("chat", recipient_ids, title, body, data=data,
+                             title_en=title_en, body_en=body_en)
     except Exception:
         logger.exception("Chat push fan-out failed")
     finally:
@@ -737,14 +873,17 @@ def _find_direct_conversation(user_id, other_id):
 # then newest activity, with participants, the last LIVE
 # message and an unread count per row — FOUR queries for
 # the whole tab (the memberships, then participants, last
-# messages and unread counts set-based over the id list).
+# messages and unread counts set-based over the id list),
+# plus a fifth only when some room's newest row is a
+# system line (its event, for a localized preview).
 # A disappearing message past its expires_at never
 # previews: the seek skips it and lands on the previous
 # live message, so the row reads exactly as it will after
 # the sweep instead of showing a lapsed body or going blank.
 # unreadCount is other people's messages newer than the
 # caller's last_read_at; a NULL last_read_at counts
-# everything, and unsent messages never count. A direct
+# everything, and unsent messages and system lines never
+# count. A direct
 # chat without a title is named after the other
 # participant; when nobody else is (left) in it the
 # title stays null and the client renders its localized
@@ -785,6 +924,7 @@ def list_conversations(request):
     participants_map = {}
     last_msg_map = {}
     unread_map = {}
+    system_events = {}
     if conv_ids:
         placeholders = ",".join(["%s"] * len(conv_ids))
 
@@ -821,10 +961,21 @@ def list_conversations(request):
         ):
             last_msg_map[m["conversation_id"]] = m
 
+        # A system row previews through its event (the reader's
+        # own language) — read through the ORM, which decodes the
+        # JSON column alike on both engines; only rooms whose
+        # newest row IS a system line pay for this query
+        system_ids = [m["id"] for m in last_msg_map.values() if m["kind"] == "system"]
+        if system_ids:
+            for row in Message.objects.filter(id__in=system_ids).values("id", "kind", "attachment_meta"):
+                system_events[row["id"]] = _system_payload(row)
+
         # One GROUP BY, the same definition total_unread_count
         # uses: a NULL last_read_at must count every message,
         # hence the epoch floor; unsent messages are out — the
-        # badge must agree with what the reader can still read
+        # badge must agree with what the reader can still read —
+        # and so are system lines ("X left", "X created the
+        # group"): the room narrating itself is nobody's unread
         for cnt in _q(
             f"""
             SELECT m.conversation_id, COUNT(*) AS unread
@@ -834,6 +985,7 @@ def list_conversations(request):
             WHERE m.conversation_id IN ({placeholders})
               AND m.sender_id != %s
               AND m.deleted_at IS NULL
+              AND m.kind != 'system'
               AND m.created_at > COALESCE(cp.last_read_at, '1970-01-01T00:00:00')
             GROUP BY m.conversation_id
             """,
@@ -889,6 +1041,9 @@ def list_conversations(request):
                 "senderId": last_msg["sender_id"],
                 "senderName": last_msg["sender_name"],
                 "deleted": last_msg["deleted_at"] is not None,
+                # A system line's event — the client words the
+                # preview in the reader's language (None otherwise)
+                "system": system_events.get(last_msg["id"]),
             }
 
         conversations.append(conv)
@@ -1064,9 +1219,14 @@ def create_conversation(request):
             # what it is called — so the room never starts blank
             system_payload = None
             if conv_type == "group":
+                # Stamped with the SAME `now` as every member's
+                # last_read_at — a later stamp read as one unread
+                # message for everybody the creator invited
+                group_title = (title or "").strip()
                 system_payload = _insert_system_message(
                     conv_id, request.user,
-                    f"{request.user['display_name']} sukūrė grupę „{(title or '').strip()}“",
+                    f"{request.user['display_name']} sukūrė grupę „{group_title}“",
+                    event={"event": "group_created", "title": group_title}, at=now,
                 )
     except IntegrityError:
         # Caught OUTSIDE the atomic block (the failed statement
@@ -1120,7 +1280,7 @@ def create_conversation(request):
 
 
 ############################################################
-# _page_rows / get_messages / get_changes
+# _history_row / _page_rows / get_messages / get_changes
 ############################################################
 #
 # One history page, fetched newest-first and reversed to
@@ -1145,22 +1305,73 @@ def create_conversation(request):
 # as LIMIT -n. Members only (403).
 #
 # Each message carries reactions (with bySelf here), readBy,
-# replyTo, clientMsgId, deleted (unsent — content blanked)
-# and, for the caller's OWN messages, status derived from
-# how many OTHER members hold a receipt. The envelope also
-# ships participants (sorted by display name) and the
+# replyTo, clientMsgId, deleted (unsent — content blanked),
+# the system event of a 'system' row and, for the caller's
+# OWN messages, status derived from how many OTHER members
+# hold a receipt (_own_status). The envelope also ships
+# participants (sorted by display name) and the
 # conversation row itself, so a room opened from a push
 # notification draws its header without a second call, plus
 # the server-clock cursor the change feed resumes from.
 #
 # get_changes (?since=<iso>) answers every message edited or
-# unsent after that moment as full rows — the resync door
-# for edits/unsends outside the client's newest page. 400 on
-# a malformed since; at most 500 rows.
+# unsent after that moment as full rows — status, readBy
+# and reactions computed exactly as the page computes them,
+# never placeholders — the resync door for edits/unsends
+# outside the client's newest page. 400 on a malformed
+# since; at most 500 rows.
+#
+# Both cursors are stamped FIRST, before a single row is
+# read, and backdated by _CHANGES_CURSOR_SLACK: a write that
+# commits while the page is being read lands in the next
+# feed instead of falling between the two. The price is a
+# few seconds of re-delivered changes, which the client
+# applies idempotently.
 #
 # Used by:
-#   - services/api/chat.ts — fetchMessages / fetchChanges
+#   - packages/chatengine/src/adapters/knf/rest.ts —
+#     fetchMessages (the room's first page, older pages, the
+#     around/after windows of a jump) and fetchChanges (the
+#     resync after a reconnect)
 ############################################################
+
+def _history_row(row, conv_id, user_id, reaction_map, read_map, participant_count):
+    # One wire row of a history page or change feed. An unsent
+    # message keeps its slot but ships no content
+    msg_id = row["id"]
+    is_own = row["sender_id"] == user_id
+    read_by = read_map.get(msg_id, [])
+    deleted = row["deleted_at"] is not None
+    return {
+        "id": msg_id,
+        "conversationId": conv_id,
+        "senderId": row["sender_id"],
+        "senderName": row["sender_name"],
+        "senderAvatar": row["sender_avatar"],
+        "text": "" if deleted else row["text"],
+        "imageUrl": None if deleted else row["image_url"],
+        "time": _format_time(row["created_at"]),
+        "createdAt": row["created_at"],
+        "clientMsgId": row["client_msg_id"],
+        "isOwn": is_own,
+        "status": _own_status(is_own, read_by, user_id, participant_count),
+        "readBy": read_by,
+        "reactions": reaction_map.get(msg_id, []),
+        "replyTo": _reply_payload(row),
+        "deleted": deleted,
+        "kind": row["kind"] or "text",
+        "editedAt": row["edited_at"],
+        "attachment": _attachment_payload(row, deleted),
+        "media": _media_payload(row, deleted),
+        "linkPreview": _link_preview_payload(row, deleted),
+        "gallery": _gallery_payload(row, deleted),
+        "system": _system_payload(row),
+        "pinnedAt": row.get("pinned_at"),
+        "pinnedBy": row.get("pinned_by"),
+        "forwarded": bool(row.get("forwarded")),
+        "expiresAt": row.get("expires_at"),
+    }
+
 
 def _page_rows(window, order, limit):
     ordering = ("-created_at", "-id") if order == "DESC" else ("created_at", "id")
@@ -1187,9 +1398,11 @@ def _page_rows(window, order, limit):
 @transaction.non_atomic_requests
 @require_auth
 def get_messages(request, conv_id):
-    # STEP 1: membership gate — outsiders get 403 before any
-    # message row is read
+    # STEP 1: the change-feed cursor, before anything is read
+    # (see the banner), then the membership gate — outsiders
+    # get 403 before any message row is read
     # ======================================================
+    cursor = utc_now() - _CHANGES_CURSOR_SLACK
     user_id = request.user["id"]
     if not _is_member(conv_id, user_id):
         return json_error("Not a participant", 403)
@@ -1268,13 +1481,7 @@ def get_messages(request, conv_id):
     # ======================================================
     msg_ids = [row["id"] for row in rows]
     reaction_map_all = _reactions_for(msg_ids, user_id)
-    read_map_all = {}
-    if msg_ids:
-        # Ordered by the receipt stamp on purpose — the readBy
-        # order must not depend on which index the planner walks
-        for rd in MessageRead.objects.filter(message_id__in=msg_ids) \
-                .order_by("message_id", "read_at").values("message_id", "user_id"):
-            read_map_all.setdefault(rd["message_id"], []).append(rd["user_id"])
+    read_map_all = _receipts_for(msg_ids)
 
 
     # STEP 4: the members and the conversation row — the room
@@ -1306,63 +1513,14 @@ def get_messages(request, conv_id):
     } if conv_row else None
 
 
-    # STEP 5: shape each message — reactions with bySelf,
-    # readBy, and for the caller's own messages a status
-    # derived from how many OTHER members hold a receipt
-    # ===================================================
-    messages = []
-    for row in rows:
-        msg_id = row["id"]
-        reactions = reaction_map_all.get(msg_id, [])
-        read_by = read_map_all.get(msg_id, [])
-        is_own = row["sender_id"] == user_id
-        # An unsent message keeps its slot but ships no content
-        deleted = row["deleted_at"] is not None
-        if is_own:
-            # "read" needs a receipt from every other member,
-            # "delivered" from at least one; a chat with no other
-            # member is trivially read
-            other_readers = [uid for uid in read_by if uid != user_id]
-            others_count = participant_count - 1  # the sender's own receipt never counts
-            if others_count <= 0 or len(other_readers) >= others_count:
-                status = "read"
-            elif len(other_readers) > 0:
-                status = "delivered"
-            else:
-                status = "sent"
-        else:
-            # status only means something on own messages — a
-            # fixed value for everybody else's
-            status = "read"
-
-        messages.append({
-            "id": msg_id,
-            "conversationId": conv_id,
-            "senderId": row["sender_id"],
-            "senderName": row["sender_name"],
-            "senderAvatar": row["sender_avatar"],
-            "text": "" if deleted else row["text"],
-            "imageUrl": None if deleted else row["image_url"],
-            "time": _format_time(row["created_at"]),
-            "createdAt": row["created_at"],
-            "clientMsgId": row["client_msg_id"],
-            "isOwn": is_own,
-            "status": status,
-            "readBy": read_by,
-            "reactions": reactions,
-            "replyTo": _reply_payload(row),
-            "deleted": deleted,
-            "kind": row["kind"] or "text",
-            "editedAt": row["edited_at"],
-            "attachment": _attachment_payload(row, deleted),
-            "media": _media_payload(row, deleted),
-            "linkPreview": _link_preview_payload(row, deleted),
-            "gallery": _gallery_payload(row, deleted),
-            "pinnedAt": row.get("pinned_at"),
-            "pinnedBy": row.get("pinned_by"),
-            "forwarded": bool(row.get("forwarded")),
-            "expiresAt": row.get("expires_at"),
-        })
+    # STEP 5: shape each message (_history_row) — reactions
+    # with bySelf, readBy, and for the caller's own messages a
+    # status derived from how many OTHER members hold a receipt
+    # =========================================================
+    messages = [
+        _history_row(row, conv_id, user_id, reaction_map_all, read_map_all, participant_count)
+        for row in rows
+    ]
 
 
     # STEP 6: DESC fetch → chronological list
@@ -1375,9 +1533,9 @@ def get_messages(request, conv_id):
         "hasNewer": has_newer,
         "participants": participants,
         "conversation": conversation,
-        # The server clock at the time of the page — the point
-        # the client's change feed resumes from
-        "cursor": utc_now(),
+        # The point the client's change feed resumes from —
+        # stamped before the page was read (STEP 1)
+        "cursor": cursor,
     })
 
 
@@ -1385,8 +1543,10 @@ def get_messages(request, conv_id):
 @transaction.non_atomic_requests
 @require_auth
 def get_changes(request, conv_id):
-    # STEP 1: the cursor — an ISO stamp, nothing else
-    # ===============================================
+    # STEP 1: the NEXT cursor, before anything is read (see the
+    # banner), then the incoming one — an ISO stamp, nothing else
+    # ============================================================
+    cursor = utc_now() - _CHANGES_CURSOR_SLACK
     user_id = request.user["id"]
     since = (clean_param(request.GET.get("since")) or "").strip()
     if not since:
@@ -1424,41 +1584,23 @@ def get_changes(request, conv_id):
         )[:500]
     )
 
-    messages = []
-    for row in rows:
-        deleted = row["deleted_at"] is not None
-        messages.append({
-            "id": row["id"],
-            "conversationId": conv_id,
-            "senderId": row["sender_id"],
-            "senderName": row["sender_name"],
-            "senderAvatar": row["sender_avatar"],
-            "text": "" if deleted else row["text"],
-            "imageUrl": None if deleted else row["image_url"],
-            "time": _format_time(row["created_at"]),
-            "createdAt": row["created_at"],
-            "clientMsgId": row["client_msg_id"],
-            "isOwn": row["sender_id"] == user_id,
-            "status": "read",
-            "readBy": [],
-            "reactions": [],
-            "replyTo": _reply_payload(row),
-            "deleted": deleted,
-            "kind": row["kind"] or "text",
-            "editedAt": row["edited_at"],
-            "attachment": _attachment_payload(row, deleted),
-            "media": _media_payload(row, deleted),
-            "linkPreview": _link_preview_payload(row, deleted),
-            "gallery": _gallery_payload(row, deleted),
-            "pinnedAt": row.get("pinned_at"),
-            "pinnedBy": row.get("pinned_by"),
-            "forwarded": bool(row.get("forwarded")),
-            "expiresAt": row.get("expires_at"),
-        })
+
+    # STEP 4: the SAME shaping as a history page — real
+    # receipts, reactions and own-message status, never
+    # placeholders the client would paint over the truth
+    # ======================================================
+    msg_ids = [row["id"] for row in rows]
+    reaction_map = _reactions_for(msg_ids, user_id)
+    read_map = _receipts_for(msg_ids)
+    participant_count = ConversationParticipant.objects.filter(conversation_id=conv_id).count() if rows else 0
+    messages = [
+        _history_row(row, conv_id, user_id, reaction_map, read_map, participant_count)
+        for row in rows
+    ]
 
     return json_response({
         "messages": messages,
-        "cursor": utc_now(),
+        "cursor": cursor,
     })
 
 
@@ -1509,11 +1651,16 @@ def get_changes(request, conv_id):
 # member WITHOUT a socket in that very
 # room — room membership, not global presence. The push
 # title is the sender's name (plus " · Group title" in a
-# group); preview is the first 100 chars or a Lithuanian
-# media marker with data.preview for re-localizing;
-# recipients with chat_push_preview off get the content-
-# free body; @mentions get their own lane and leave the
-# plain ones. The Expo round-trips run on a daemon thread.
+# group); preview is the first 100 chars or a media marker
+# (photo, video, voice message, file) with data.preview
+# naming the kind; recipients with chat_push_preview off
+# get the content-free body; @mentions get their own lane
+# and leave the plain ones. Every line the BACKEND words —
+# the markers, the content-free body, "X mentioned you" —
+# goes out in Lithuanian AND English, and devices
+# registered as 'en' get the English copy (the sender's
+# own name and text read the same in both). The Expo
+# round-trips run on a daemon thread.
 # A URL in the text starts the unfurl task. Capped at 150
 # sends per 5 min per user (429).
 #
@@ -1531,7 +1678,11 @@ def get_changes(request, conv_id):
 # the same way.
 #
 # Used by:
-#   - services/api/chat.ts — sendMessageApi
+#   - packages/chatengine/src/adapters/knf/rest.ts —
+#     sendMessage (every composer send, retry and outbox
+#     replay)
+#   - app/(main)/chat-room/index.tsx — the forward flow,
+#     through the same transport
 ############################################################
 
 @require_methods("POST")
@@ -1932,22 +2083,26 @@ def send_message(request, conv_id):
                 push_title = f"{push_title} · {conv_row['title']}"
 
             push_data = {"type": "chat_message", "conversationId": conv_id}
+            # A push with an empty body renders nothing on a lock
+            # screen, so a caption-less media message ships the
+            # word for its kind — in BOTH languages: the push lane
+            # sends preview_en to devices registered as 'en' (None
+            # means "the sender's own words", identical in both);
+            # data.preview names the kind for a foreground client
+            preview_en = None
             if text:
                 preview = text[:100]
             elif attachment and kind == "video":
-                # LT for the same reason the photo marker is
-                preview = "Vaizdo įrašas"
+                preview, preview_en = "Vaizdo įrašas", "Video"
                 push_data["preview"] = "video"
+            elif attachment and kind == "audio":
+                preview, preview_en = "Balso žinutė", "Voice message"
+                push_data["preview"] = "audio"
             elif attachment:
-                preview = "Failas"
+                preview, preview_en = "Failas", "File"
                 push_data["preview"] = "file"
             else:
-                # A push with an empty body renders nothing on a
-                # lock screen, so a photo-only message ships the
-                # Lithuanian word (LT is the app default); the
-                # marker in data lets a foreground client
-                # re-localize
-                preview = "Nuotrauka"
+                preview, preview_en = "Nuotrauka", "Photo"
                 push_data["preview"] = "photo"
             # Preview privacy: a recipient who turned
             # chat_push_preview off gets the content-free body —
@@ -1980,24 +2135,30 @@ def send_message(request, conv_id):
                         start = lowered.find(needle, start + 1)
             if mentioned:
                 mention_title = f"{user['display_name']} paminėjo jus"
+                mention_title_en = f"{user['display_name']} mentioned you"
                 if conv_row and conv_row["type"] == "group" and conv_row["title"]:
                     mention_title = f"{mention_title} · {conv_row['title']}"
+                    mention_title_en = f"{mention_title_en} · {conv_row['title']}"
                 mention_data = {**push_data, "type": "chat_mention"}
                 full_mentioned = [r for r in full_recipients if r in mentioned]
                 quiet_mentioned = [r for r in quiet_recipients if r in mentioned]
                 if full_mentioned:
-                    _spawn(_push_chat_message, full_mentioned, mention_title, preview, mention_data)
+                    _spawn(_push_chat_message, full_mentioned, mention_title, preview, mention_data,
+                           mention_title_en, preview_en)
                 if quiet_mentioned:
                     _spawn(_push_chat_message, quiet_mentioned, mention_title,
-                           "Nauja žinutė", {**mention_data, "preview": "hidden"})
+                           "Nauja žinutė", {**mention_data, "preview": "hidden"},
+                           mention_title_en, "New message")
                 full_recipients = [r for r in full_recipients if r not in mentioned]
                 quiet_recipients = [r for r in quiet_recipients if r not in mentioned]
             if full_recipients:
-                _spawn(_push_chat_message, full_recipients, push_title, preview, push_data)
+                _spawn(_push_chat_message, full_recipients, push_title, preview, push_data,
+                       None, preview_en)
             if quiet_recipients:
-                # LT for the same reason the photo marker is
+                # The content-free body, worded per language too
                 _spawn(_push_chat_message, quiet_recipients, push_title,
-                       "Nauja žinutė", {**push_data, "preview": "hidden"})
+                       "Nauja žinutė", {**push_data, "preview": "hidden"},
+                       None, "New message")
     except Exception:
         logger.exception("Push notification failed for chat message")
 
@@ -2052,7 +2213,10 @@ def send_message(request, conv_id):
 # at 100 edits per 5 min.
 #
 # Used by:
-#   - services/api/chat.ts — deleteMessageApi / editMessageApi
+#   - packages/chatengine/src/adapters/knf/rest.ts —
+#     deleteMessage (the room's optimistic unsend and its
+#     offline replay) / editMessage (edit mode's save and its
+#     offline replay)
 ############################################################
 
 @require_methods("DELETE")
@@ -2092,21 +2256,15 @@ def delete_message(request, conv_id, msg_id):
             )
             MessageReaction.objects.filter(message_id=msg_id).delete()
 
-        # The photo blob goes with the message — matched by
-        # _is_local_upload_url, the SAME rule the send accepted
-        # it under, so neither form can leave an orphan on disk.
-        # The sink acts as the sender: "forbidden" (never theirs —
-        # a forward) and "referenced" (still shown by another
-        # message) keep the file and are only logged; the slots
-        # above are already NULL, so this row cannot hold its own
-        # file back
-        poster = row["attachment_meta"].get("thumbnailUrl") if isinstance(row["attachment_meta"], dict) else None
-        preview_image = row["link_preview"].get("imageUrl") if isinstance(row["link_preview"], dict) else None
-        gallery_urls = [item.get("url") for item in row["gallery"] if isinstance(item, dict)] \
-            if isinstance(row["gallery"], list) else []
-        for stored in (row["image_url"], row["attachment_url"], poster, preview_image, *gallery_urls):
-            if not _is_local_upload_url(stored, request):
-                continue
+        # The photo blob goes with the message — every slot
+        # _stored_upload_urls walks, matched by the SAME rule the
+        # send accepted it under, so neither form can leave an
+        # orphan on disk. The sink acts as the sender:
+        # "forbidden" (never theirs — a forward) and "referenced"
+        # (still shown by another message) keep the file and are
+        # only logged; the slots above are already NULL, so this
+        # row cannot hold its own file back
+        for stored in _stored_upload_urls(row, request):
             try:
                 from knfapp.uploads.storage import delete_upload
                 outcome = delete_upload(stored, user_id)
@@ -2196,11 +2354,18 @@ def edit_message(request, conv_id, msg_id):
 # messages TTL — 0 or null switches it off, otherwise
 # 60s..365d. Only messages sent AFTER the change carry an
 # expires_at (history is never retroactively burned). The
-# room narrates the change with a system row and every
-# client hears 'conversation_updated' {messageTtlSeconds}.
+# room narrates the change with a system row (event ttl_on
+# with the window in SECONDS, or ttl_off — the client words
+# the window in its own language) and every client hears
+# 'conversation_updated' {messageTtlSeconds}. Setting the
+# window the room already has is a no-op answer — no second
+# "turned it off" line for every member, no room bump.
 #
 # Used by:
-#   - the mobile chat room — pin banner, room menu
+#   - packages/chatengine/src/adapters/knf/rest.ts —
+#     pinMessage / unpinMessage / fetchPins (the room's
+#     pinned banner and menu rows, via usePins) and
+#     setMessageTtl (the room's disappearing-messages sheet)
 ############################################################
 
 @require_methods("PUT", "DELETE")
@@ -2321,6 +2486,10 @@ def set_message_ttl(request, conv_id):
         return json_error("Not a participant", 403, code="not_a_participant")
 
     with transaction.atomic():
+        current = (Conversation.objects.select_for_update().filter(id=conv_id)
+                   .values_list("message_ttl_seconds", flat=True).first())
+        if (current or None) == ttl:
+            return json_response({"messageTtlSeconds": ttl})
         Conversation.objects.filter(id=conv_id).update(message_ttl_seconds=ttl)
 
         if ttl:
@@ -2331,9 +2500,11 @@ def set_message_ttl(request, conv_id):
             else:
                 window = f"{ttl // 86_400} d."
             narration = f"{request.user['display_name']} įjungė nykstančias žinutes ({window})"
+            event = {"event": "ttl_on", "seconds": ttl}
         else:
             narration = f"{request.user['display_name']} išjungė nykstančias žinutes"
-        system_payload = _insert_system_message(conv_id, request.user, narration)
+            event = {"event": "ttl_off"}
+        system_payload = _insert_system_message(conv_id, request.user, narration, event=event)
 
     from knfapp.chat.events import emit_conversation_updated, emit_new_message
     emit_new_message(_get_sio(), conv_id, system_payload)
@@ -2368,8 +2539,10 @@ def set_message_ttl(request, conv_id):
 # reaction budget (429).
 #
 # Used by:
-#   - services/api/chat.ts — reactToMessageApi /
-#     removeReactionApi
+#   - packages/chatengine/src/adapters/knf/rest.ts —
+#     setReaction / removeReaction (the room's picker and the
+#     bubbles' accessibility React action, via useReactions,
+#     and their offline replay)
 ############################################################
 
 @require_methods("POST")
@@ -2521,7 +2694,9 @@ def toggle_pin(request, conv_id):
 # broadcast as 'messages_read'.
 #
 # Used by:
-#   - services/api/chat.ts — markConversationRead
+#   - packages/chatengine/src/adapters/knf/rest.ts — markRead
+#     (the durable twin the room sends beside the socket's
+#     volatile mark_read)
 #   - chat/events.py — handle_mark_read, the socket twin
 ############################################################
 
@@ -2664,7 +2839,10 @@ def mark_read(request, conv_id):
 # for the room go in the SAME transaction, so the remaining
 # members' read/status math never counts a ghost reader;
 # once nobody is left the messages, their reads and
-# reactions and the conversation itself are purged too. The
+# reactions and the conversation itself are purged too —
+# and every file those messages held goes to the uploads
+# sink on the commit, as its sender (_stored_upload_urls),
+# so a destroyed room leaves no orphan on disk. The
 # members who stay see who left (a group's narration); after
 # the commit every socket of the leaver is evicted from room
 # conv:<id> (best effort). The remaining members keep the
@@ -2672,8 +2850,8 @@ def mark_read(request, conv_id):
 #
 # total_unread_count answers the tab badge: other people's
 # messages newer than the caller's last_read_at, unsent ones
-# excluded, over every conversation they belong to — one
-# flat COUNT(*) join. Same definition as the per-row
+# and system lines excluded, over every conversation they
+# belong to — one flat COUNT(*) join. Same definition as the per-row
 # unreadCount, so the tab badge and the row badges agree;
 # it does NOT consult message_reads.
 #
@@ -2712,6 +2890,17 @@ def leave_conversation(request, conv_id):
         remaining = ConversationParticipant.objects.filter(conversation_id=conv_id).count()
 
         if remaining == 0:
+            # Every file the dying messages hold, paired with the
+            # sender the delete acts for — collected BEFORE the
+            # rows go, handed to the uploads sink once they are
+            # gone (on the commit, exactly as the expiry sweep
+            # does): a forwarded copy of somebody else's photo is
+            # refused and one still shown elsewhere is kept
+            doomed = []
+            for row in Message.objects.filter(conversation_id=conv_id).values(
+                "sender_id", "image_url", "attachment_url", "attachment_meta", "link_preview", "gallery",
+            ):
+                doomed.extend((stored, row["sender_id"]) for stored in _stored_upload_urls(row, request))
             MessageRead.objects.filter(message_id__in=conv_msg_ids).delete()
             MessageReaction.objects.filter(message_id__in=conv_msg_ids).delete()
             # Raw on purpose — the ORM delete would collect
@@ -2719,6 +2908,8 @@ def leave_conversation(request, conv_id):
             # over rows that are all dying anyway
             _exec("DELETE FROM messages WHERE conversation_id = %s", (conv_id,))
             Conversation.objects.filter(id=conv_id).delete()
+            if doomed:
+                transaction.on_commit(lambda: _delete_message_uploads(doomed))
         else:
             # The members who stay see who left — a group's
             # narration; a direct chat's other half simply keeps
@@ -2732,6 +2923,7 @@ def leave_conversation(request, conv_id):
             if conv_type_row and conv_type_row["type"] == "group":
                 system_payload = _insert_system_message(
                     conv_id, request.user, f"{request.user['display_name']} paliko pokalbį",
+                    event={"event": "left"},
                 )
 
     if system_payload:
@@ -2775,6 +2967,7 @@ def total_unread_count(request):
           ON cp.conversation_id = m.conversation_id AND cp.user_id = %s
         WHERE m.sender_id != %s
           AND m.deleted_at IS NULL
+          AND m.kind != 'system'
           AND m.created_at > COALESCE(cp.last_read_at, '1970-01-01T00:00:00')
         """,
         (user_id, user_id),
@@ -2917,12 +3110,18 @@ def search_messages(request, conv_id):
 # {online: {id: bool}, lastSeen: {id: iso|null}} — whether
 # each id currently has a socket in THIS process and when
 # they last held one (users.last_active_at, stamped on both
-# socket edges), but ONLY for users who share at least one
-# conversation with the caller. Everyone else answers
-# false/null, exactly like a genuinely offline user nobody
-# ever saw, so the route is not a free presence-or-history
-# oracle over arbitrary ids. Silently truncated to the
-# first 200 ids; non-string ids dropped.
+# socket edges), but ONLY for users who chose a relationship
+# with the caller: an accepted friend, or someone who has
+# actually written in a conversation the caller is in. Bare
+# co-membership is NOT enough — anyone can create a room
+# with anyone, so a gate on membership alone let a stranger
+# manufacture it in one request and then poll a victim's
+# online timeline. A block pair (either direction) reveals
+# nothing. Everyone else answers false/null, exactly like a
+# genuinely offline user nobody ever saw, so the route is
+# not a free presence-or-history oracle over arbitrary ids.
+# Silently truncated to the first 200 ids; non-string ids
+# dropped.
 #
 # search_users: ?q substring match on username OR
 # display_name (LIKE: ASCII-only case folding; escaped so
@@ -2965,19 +3164,32 @@ def online_status(request):
         user_ids = user_ids[:200]
 
 
-    # STEP 2: the relationship gate — presence is only
-    # revealed for users sharing at least one conversation
-    # with the caller; a stranger's id probes exactly nothing
-    # ======================================================
+    # STEP 2: the relationship gate — presence is only revealed
+    # for a friend or for someone who has written in one of the
+    # caller's conversations (a relationship THEY took part in);
+    # a stranger's id, or one merely added to a room, probes
+    # exactly nothing, and a block pair hides both ways
+    # ========================================================
     shared = set()
     if user_ids:
-        shared = set(
-            ConversationParticipant.objects.filter(
-                user_id__in=user_ids,
-                conversation_id__in=ConversationParticipant.objects
-                    .filter(user_id=user_id).values("conversation_id"),
-            ).values_list("user_id", flat=True).distinct()
+        from knfapp.social.models import Friendship
+
+        my_rooms = ConversationParticipant.objects.filter(user_id=user_id).values("conversation_id")
+        spoke = set(
+            Message.objects.filter(sender_id__in=user_ids, conversation_id__in=my_rooms)
+            .values_list("sender_id", flat=True).distinct()
         )
+        friends = set(
+            Friendship.objects.filter(user_id=user_id, friend_id__in=user_ids)
+            .values_list("friend_id", flat=True)
+        )
+        blocked = set()
+        for row in UserBlock.objects.filter(
+            Q(blocker_id=user_id, blocked_id__in=user_ids) | Q(blocked_id=user_id, blocker_id__in=user_ids),
+        ).values("blocker_id", "blocked_id"):
+            blocked.add(row["blocked_id"] if row["blocker_id"] == user_id else row["blocker_id"])
+        # The caller may always see themselves
+        shared = ((spoke | friends) - blocked) | ({user_id} & set(user_ids))
 
 
     # STEP 3: presence is this process's socket table; an

@@ -8,7 +8,14 @@
 #  changed, stamp sightings, retire vanished rows. The
 #  gateway is asked FIRST — a dead embeddings API raises
 #  before any stamp, upsert or delete runs, so a broken
-#  gateway can never empty the knowledge base.
+#  gateway can never empty the knowledge base. And a run
+#  that would retire more than a quarter of the stored rows
+#  retires NOTHING (KNF-051): a chunker that silently
+#  returns [] — a source whitelist drifting from the news
+#  model, a scrape gone empty — raises no exception, so no
+#  per-unit guard can see it, while one lost table is most
+#  of the corpus. The operator re-runs with
+#  allow_mass_retire when the shrink is real.
 #
 #  Split into:
 #
@@ -46,14 +53,27 @@ logger = logging.getLogger(__name__)
 #
 # One incremental sync (or a forced full re-embed — the
 # move after changing AI_EMBED_MODEL). Raises GatewayError
-# untouched; the callers decide how to surface it.
+# untouched; the callers decide how to surface it. The
+# answer's `retireBlocked` counts rows a run WOULD have
+# retired but did not (the share guard); allow_mass_retire
+# is the operator's override for a real, large shrink.
 #
 # Used by:
 #   - management/commands/index_support_corpus.py — cron
 #   - api/admin_views.py — the console's re-index button
 ############################################################
 
-def run_index(reindex_all=False):
+# The largest share of the stored rows one run may retire —
+# a nightly run retires a handful (news ageing out of the
+# window, one edited section); a quarter means a source died
+MAX_RETIRE_SHARE = 0.25
+
+# Retirements up to this many never trip the share guard — a
+# small corpus legitimately loses a whole section at once
+RETIRE_FLOOR = 10
+
+
+def run_index(reindex_all=False, allow_mass_retire=False):
     now = timezone.now()
     # Units the chunkers could not read (a malformed section, an
     # unparseable post) — their stored rows must survive the
@@ -110,25 +130,33 @@ def run_index(reindex_all=False):
 
     # Retire rows whose source content vanished — with two
     # guards. Units that FAILED to chunk keep their stored rows
-    # (their content is unreadable tonight, not gone), and an
-    # entirely empty corpus retires nothing at all: the curated
-    # handbook base alone guarantees a healthy run is never
-    # empty, so an empty one is a broken run, and a broken run
-    # must not empty the knowledge base. A genuinely deleted
-    # post or entry still retires the same night — its unit
-    # chunked FINE, just without it.
+    # (their content is unreadable tonight, not gone). And a
+    # retirement larger than MAX_RETIRE_SHARE of the stored
+    # rows (past RETIRE_FLOOR) is refused whole: a chunker that
+    # returned [] without raising looks exactly like its
+    # content being deleted, and the share is what tells the
+    # two apart — an empty corpus is just the extreme case. A
+    # genuinely deleted post or entry still retires the same
+    # night — its unit chunked FINE, just without it.
     corpus_ids = {chunk["id"] for chunk in corpus}
+    retire = SupportChunk.objects.exclude(id__in=corpus_ids)
+    if failed_units:
+        spared = Q()
+        for source, source_id in failed_units:
+            spared |= Q(source=source, source_id=source_id)
+        retire = retire.exclude(spared)
+
     retired = 0
-    if corpus_ids:
-        retire = SupportChunk.objects.exclude(id__in=corpus_ids)
-        if failed_units:
-            spared = Q()
-            for source, source_id in failed_units:
-                spared |= Q(source=source, source_id=source_id)
-            retire = retire.exclude(spared)
+    blocked = 0
+    doomed = retire.count()
+    stored_total = SupportChunk.objects.count()
+    if doomed and not allow_mass_retire and doomed > max(RETIRE_FLOOR, stored_total * MAX_RETIRE_SHARE):
+        blocked = doomed
+        logger.error("Index run would retire %d of %d knowledge-base rows — refusing; a source "
+                     "probably returned nothing. Re-run with allow_mass_retire if the shrink is real",
+                     doomed, stored_total)
+    elif doomed:
         retired, _ = retire.delete()
-    else:
-        logger.warning("Index run produced an EMPTY corpus — retiring nothing")
 
     return {"corpus": len(corpus), "embedded": len(to_embed),
-            "unchanged": len(fresh_ids), "retired": retired}
+            "unchanged": len(fresh_ids), "retired": retired, "retireBlocked": blocked}

@@ -82,9 +82,17 @@ urlpatterns += [
 # Views live in knfapp/uploads/api/.
 ############################################################
 
+from django.db import transaction as _upload_tx
+
 from knfapp.uploads.api.views import delete_file, serve_file, upload_file
 
 
+# Non-atomic on purpose — the mark must sit on the callback
+# the resolver hands Django: the GET is a disk read that
+# never queries, and under ATOMIC_REQUESTS every image load
+# opened a connection for an empty BEGIN/COMMIT (KNF-135).
+# delete_file opens its own transaction
+@_upload_tx.non_atomic_requests
 def _upload_dispatch(request, filename):
     # One path, two verbs — DELETE is owner-or-admin, GET public
     if request.method == "DELETE":
@@ -174,7 +182,7 @@ def _news_poll_dispatch(request, post_id):
 urlpatterns += [
     path("api/news", _news_dispatch),                                  # GET the ranked feed / POST a member or faculty post
     path("api/news/<str:post_id>", _news_post_dispatch),               # GET one post / DELETE author-or-admin
-    path("api/news/<str:post_id>/like", toggle_like),                  # POST — flip the caller's like
+    path("api/news/<str:post_id>/like", toggle_like),                  # POST — set the like ({"liked": bool}); no body flips it
     path("api/news/<str:post_id>/share", share_post),                  # POST — count a completed share (guests too)
     path("api/news/<str:post_id>/comments", _news_comments_dispatch),  # GET the thread / POST a comment
     path("api/news/<str:post_id>/comments/<str:comment_id>", delete_comment),  # DELETE — author/owner/admin
@@ -354,7 +362,9 @@ urlpatterns += [
 # meme library is signed-in except its public file serve.
 ############################################################
 
-from knfapp.schedule.api.views import get_schedule, get_schedule_events, get_schedule_filters
+from knfapp.schedule.api.views import (
+    get_schedule, get_schedule_calendar, get_schedule_events, get_schedule_filters,
+)
 from knfapp.info.api.views import get_faculty_info
 from knfapp.memes.api.views import delete_meme, list_memes, push_meme, serve_meme
 
@@ -371,6 +381,7 @@ urlpatterns += [
     path("api/schedule", get_schedule),                    # GET — the folded weekly page (legacy)
     path("api/schedule/events", get_schedule_events),      # GET — dated events in a range
     path("api/schedule/filters", get_schedule_filters),    # GET — groups + semesters + days
+    path("api/schedule/calendar.ics", get_schedule_calendar),  # GET — one group's / teacher's iCalendar feed
     path("api/info", get_faculty_info),                    # GET — the bilingual handbook
     path("api/memes", _memes_dispatch),                    # GET the library / POST a push
     path("api/memes/<str:meme_id>", delete_meme),          # DELETE — pusher or admin

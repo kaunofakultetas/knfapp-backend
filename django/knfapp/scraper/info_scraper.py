@@ -6,8 +6,12 @@
 #  the faculty_info table: one JSON blob per (lang, section)
 #  for the sections 'contacts', 'programs' and
 #  'general_contact'. Lithuanian ONLY — nothing ever writes
-#  lang='en', so /api/info?lang=en never sees scraped data
-#  and serves the curated English handbook untouched.
+#  lang='en'; /api/info?lang=en BORROWS these Lithuanian
+#  rows (info/api/views.py effective_handbook +
+#  localize_borrowed: degree words and durations
+#  translated, names kept Lithuanian and flagged nameLang
+#  'lt'), so the English screen and the assistant's English
+#  knowledge base carry the live programme list too.
 #
 #  A section is upserted only when the run produced
 #  something for it, so a page that fails to fetch leaves
@@ -52,6 +56,7 @@ from django.db import transaction
 
 from knfapp.common.timestamps import utc_now
 from knfapp.info.models import FacultyInfo
+from knfapp.info.programs import is_program_name
 from knfapp.scraper.common import (
     KNF_HOSTS,
     close_run,
@@ -586,7 +591,10 @@ def _scrape_programs(bachelor_soup: BeautifulSoup | None,
             if ("/studij" in href or "/program" in href or re.search(r"-studijos/.+", href)) \
                     and len(text) > 8:
                 name = text.strip()
-                if name.lower() not in seen_names and "daugiau" not in name.lower():
+                # Admission documents share the programme URL
+                # shape — the name tells them apart (KNF-077)
+                if name.lower() not in seen_names and "daugiau" not in name.lower() \
+                        and is_program_name(name):
                     seen_names.add(name.lower())
                     # The card around the link is where a duration
                     # or an explicit degree is written, if anywhere
@@ -611,7 +619,7 @@ def _scrape_programs(bachelor_soup: BeautifulSoup | None,
                 if any(_fallback_programme(inner) for inner in el.find_all(_FALLBACK_TAGS)):
                     continue
 
-                if name.lower() not in seen_names:
+                if name.lower() not in seen_names and is_program_name(name):
                     seen_names.add(name.lower())
                     from_this_page.append(_program_entry(name, page_degree, name))
 

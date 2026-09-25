@@ -2,10 +2,11 @@
 #  [*] Regression tests — the assistant admin console API
 #
 #  The dashboard overview's shape, the review list with its
-#  thumbs-down filter and soft-delete flag, the transcript
-#  read flattening text and tool parts AND writing the
-#  audit row every single time (student chats are personal
-#  data), the on-demand re-index running the shared sync
+#  thumbs-down filter and soft-delete flag — its reads
+#  audited too, titles and previews are students' words —
+#  the transcript read flattening text and tool parts in the
+#  app's own total order AND writing the audit row every
+#  single time (student chats are personal data), the on-demand re-index running the shared sync
 #  through the faked gateway seam, the retrieval test box
 #  guard, the role gate on all of it — and the console's
 #  CURATED ANSWERS: embedded on save straight into
@@ -79,6 +80,11 @@ class AssistantAdminTests(TestCase):
                             self.token).json()
         self.assertEqual([row["id"] for row in complaints["threads"]], [down])
 
+        # Both page reads left a trace — who read whose words
+        listed = AdminAudit.objects.filter(action="assistant_threads_list").order_by("created_at")
+        self.assertEqual(listed.count(), 2)
+        self.assertEqual(listed.last().payload["rating"], "down")
+
     def test_transcript_flattens_parts_and_audits_every_read(self):
         thread_id = self._thread_with_turn(rating=-1)
 
@@ -93,6 +99,19 @@ class AssistantAdminTests(TestCase):
         views = AdminAudit.objects.filter(action="assistant_thread_view",
                                           target=thread_id).count()
         self.assertEqual(views, 2)
+
+    def test_transcript_reads_a_tied_pair_question_first_like_the_app(self):
+        from django.utils import timezone
+        from knfapp.assistant.models import AssistantMessage, AssistantThread
+        thread_id = self._internal("/internal/assistant/threads", {}).json()["id"]
+        thread = AssistantThread.objects.get(id=thread_id)
+        stamp = timezone.now()
+        AssistantMessage.objects.create(thread=thread, id="zzz-q", format="aisdk-v7", created_at=stamp,
+                                        content={"role": "user", "parts": [{"type": "text", "text": "Q"}]})
+        AssistantMessage.objects.create(thread=thread, id="aaa-a", format="aisdk-v7", created_at=stamp,
+                                        content={"role": "assistant", "parts": [{"type": "text", "text": "A"}]})
+        answer = bearer(self.client.get, f"/api/admin/assistant/threads/{thread_id}", self.token).json()
+        self.assertEqual([row["id"] for row in answer["messages"]], ["zzz-q", "aaa-a"])
 
     def test_overview_counts_the_dashboard(self):
         self._thread_with_turn(rating=1)

@@ -87,8 +87,12 @@ class UploadFlowTests(TestCase):
 
         served = self.client.get(body["url"])
         self.assertEqual(served.status_code, 200)
-        # Browser cache only — chat photos ride this public route
-        self.assertEqual(served["Cache-Control"], "private, max-age=86400")
+        # Browser cache only — chat photos ride this public route.
+        # A year and immutable, not the old 24 h: the bytes behind
+        # a uuid name never change, and the old window came with no
+        # validator, so a lapsed copy could only be re-downloaded
+        # whole (KNF-188; test_uploads_serving pins the 304 path)
+        self.assertEqual(served["Cache-Control"], "private, max-age=31536000, immutable")
 
     def test_anonymous_uploads_are_refused(self):
         response = self.client.post("/api/uploads", data={"file": _jpg_bytes()})

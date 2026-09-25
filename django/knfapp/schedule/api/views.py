@@ -11,18 +11,27 @@
 #        contract; old app builds keep working)
 #    GET /api/schedule/events    — dated events in a date
 #        range, the shape the current app consumes
-#    GET /api/schedule/filters   — groups + semesters + days
+#    GET /api/schedule/filters   — groups + semesters (with
+#        each term's first and last date) + days + teachers
+#    GET /api/schedule/calendar.ics — one group's or one
+#        teacher's timetable as an iCalendar subscription
 #
 #  A row is always a (event × group) view: an event shared
 #  by two groups answers under each group_name, exactly as
 #  the per-group table used to, so group filtering stays a
 #  plain equality on the wire.
 #
+#  Every route decides its 304 BEFORE any body work: the
+#  ETag seed needs only the parsed parameters and one
+#  aggregate (_table_version), so a revalidation costs one
+#  query instead of the whole answer it discards.
+#
 #  Split into:
 #
-#    get_schedule         — the folded weekly page
-#    get_schedule_events  — one capped page of dated events
-#    get_schedule_filters — the filter-sheet values
+#    get_schedule          — the folded weekly page
+#    get_schedule_events   — one capped page of dated events
+#    get_schedule_filters  — the filter-sheet values
+#    get_schedule_calendar — the iCalendar feed
 ############################################################
 
 
@@ -31,15 +40,17 @@ import re
 from datetime import date as date_type, datetime, timedelta
 
 
-from django.db.models import Count, Max
+from django.db.models import Count, Max, Min
+from django.db.models.functions import ExtractIsoWeekDay
 from django.http import HttpResponse
 
 
 from knfapp.common.http import (
     clean_param, etag_for, if_none_match_contains, json_error, json_response, require_methods,
 )
-from knfapp.schedule.models import ScheduleEvent, ScheduleEventGroup, ScheduleTeacher
-from knfapp.scraper.schedule_scraper import _get_semester_label, _semester_key
+from knfapp.schedule.ical import render_calendar
+from knfapp.schedule.models import ScheduleEvent, ScheduleEventGroup, ScheduleGroup, ScheduleTeacher
+from knfapp.scraper.schedule_scraper import _get_semester_label, _semester_key, split_lecture_type
 
 
 # One page of rows — ?limit/?offset page through and
@@ -68,6 +79,21 @@ DIGITS_RE = re.compile(r"[0-9]{1,9}")
 # compact and week-number forms this API never means
 ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
+# Bumped whenever a route's BODY SHAPE changes, and mixed
+# into every ETag seed: a client revalidating a copy of the
+# old shape must get the new body, not a 304 that pins the
+# old one on an unchanged table
+WIRE_SHAPE = "2"
+
+# The iCalendar feed's window and caching: a fortnight back
+# (last week's room change still reads right), forward as far
+# as the table holds (the scraper's horizon is ~20 weeks, so
+# the cap only fences bad data), and an hour's client cache —
+# calendar apps poll on their own schedule anyway
+CALENDAR_BACK_DAYS = 14
+CALENDAR_AHEAD_DAYS = 400
+CALENDAR_MAX_AGE = 3600
+
 
 
 
@@ -76,22 +102,28 @@ ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 ############################################################
-# _parse_count / _semester_options / _table_version /
-# _conditional_json / _rows_for
+# _parse_count / _term_rows / _semester_options /
+# _table_state / _table_version / _not_modified /
+# _cacheable / _rows_for
 ############################################################
 #
 # The shared pieces: a clamped non-negative integer param
 # (garbage is a 400, an out-of-range number takes the cap),
 # the semester labels past the stray-row threshold in
 # SEASONAL order (the scraper's _semester_key — text order
-# would rank an autumn label above its own spring), the
-# cheap table fingerprint behind the ETags, the public
-# conditional response (Vary on Authorization all the same
-# — the body is nobody's, but every API answer keys a
-# cache on the credential so the rule has no exception to
-# remember), and the one query both read routes share:
-# (event × group) rows through the link table, filtered
-# and ordered.
+# would rank an autumn label above its own spring) together
+# with each label's first and last event date, the cheap
+# table fingerprint behind the ETags (with its newest stamp,
+# which the calendar prints), the conditional-GET pair —
+# _not_modified answers the 304 (or None) from a tag alone,
+# before the caller builds anything, and _cacheable stamps
+# the ETag (weak, or strong for a byte-stable body) and the
+# public caching headers on either answer (Vary on
+# Authorization all the same — the body is nobody's, but
+# every API answer keys a cache on the credential so the
+# rule has no exception to remember) — and the one query
+# every read route shares: (event × group) rows through the
+# link table, filtered and ordered.
 #
 # Used by:
 #   - get_schedule, get_schedule_events,
@@ -106,40 +138,60 @@ def _parse_count(raw, name, default, minimum, maximum):
     return min(max(int(raw), minimum), maximum), None
 
 
-def _semester_options():
+def _term_rows():
     rows = (
         ScheduleEvent.objects.exclude(semester=None).exclude(semester="")
-        .values("semester").annotate(c=Count("id")).filter(c__gte=MIN_SEMESTER_LESSONS)
-        .values_list("semester", flat=True)
+        .values("semester")
+        .annotate(c=Count("id"), first=Min("date"), last=Max("date"))
+        .filter(c__gte=MIN_SEMESTER_LESSONS)
     )
     # Seasonal order, newest first: the scraper's key ranks a
     # label year's spring ABOVE its autumn (plain text would
     # cling to "-R" all spring); off-grammar labels sort after
     # the real ones, by text
     return sorted(rows,
-                  key=lambda s: (_semester_key(s) is not None, _semester_key(s) or 0, s.casefold()),
+                  key=lambda r: (_semester_key(r["semester"]) is not None,
+                                 _semester_key(r["semester"]) or 0, r["semester"].casefold()),
                   reverse=True)
 
 
-def _table_version():
+def _semester_options():
+    return [row["semester"] for row in _term_rows()]
+
+
+def _table_state():
+    # The fingerprint AND its newest confirmation stamp — the
+    # calendar feed prints the stamp, so both come from ONE
+    # aggregate
     row = ScheduleEvent.objects.aggregate(rows_total=Count("id"), newest=Max("last_seen_at"))
-    return f"{row['rows_total']}:{row['newest'] or '-'}"
+    return f"{row['rows_total']}:{row['newest'] or '-'}", row["newest"]
 
 
-def _conditional_json(request, payload, seed):
-    tag = etag_for(seed)
-    if if_none_match_contains(request.headers.get("If-None-Match"), tag):
-        response = HttpResponse(status=304)
-    else:
-        response = json_response(payload)
-    response["ETag"] = f'W/"{tag}"'
+def _table_version():
+    return _table_state()[0]
+
+
+def _not_modified(request, tag, *, strong=False, max_age=CACHE_MAX_AGE):
+    if not if_none_match_contains(request.headers.get("If-None-Match"), tag):
+        return None
+    return _cacheable(HttpResponse(status=304), tag, strong=strong, max_age=max_age)
+
+
+def _cacheable(response, tag, *, strong=False, max_age=CACHE_MAX_AGE):
+    # Weak by default: the JSON routes promise the same MEANING,
+    # not the same bytes; the calendar feed's body is a pure
+    # function of its seed and earns the strong form
+    response["ETag"] = f'"{tag}"' if strong else f'W/"{tag}"'
     response["Vary"] = "Authorization, Accept-Encoding"
-    response["Cache-Control"] = f"public, max-age={CACHE_MAX_AGE}"
+    response["Cache-Control"] = f"public, max-age={max_age}"
     return response
 
 
 def _rows_for(group=None, semester=None, teacher=None, date_from=None, date_to=None):
-    query = ScheduleEventGroup.objects.select_related("event", "group")
+    # No select_related: every caller ends in .values(), which
+    # makes Django drop it anyway — the joins come from the
+    # named fields
+    query = ScheduleEventGroup.objects.all()
     if group:
         query = query.filter(group__group_name=group)
     if semester:
@@ -165,24 +217,32 @@ def _rows_for(group=None, semester=None, teacher=None, date_from=None, date_to=N
 # get_schedule
 ############################################################
 #
-# GET /api/schedule?day=&group=&semester=&limit=&offset= —
-# the LEGACY weekly shape, folded on the fly: the semester's
-# dated events collapse to distinct (weekday, times, title,
-# teacher, room, group) patterns, so an old app build keeps
-# seeing exactly the rows the retired schedule_lessons table
-# used to hold. day must be ASCII digits in 0..6;
-# group/semester are exact matches with empty meaning "no
-# filter". No ?semester means the CURRENT term (today's
-# label; the newest one only when today's has no rows) —
-# never every year interleaved — and ?semester=all is the
-# explicit opt-out. The answer is ONE page ordered day,
-# time, group, so days never interleave; the id is a stable
-# hash of the pattern.
+# GET /api/schedule?day=&group=&semester=&limit=&offset=
+#
+# The LEGACY weekly shape, folded on the fly: the
+# semester's dated events collapse to distinct (weekday,
+# times, title, teacher, room, group) patterns, so an old
+# app build keeps seeing exactly the rows the retired
+# schedule_lessons table used to hold. day must be ASCII
+# digits in 0..6; group/semester are exact matches with
+# empty meaning "no filter". No ?semester means the CURRENT
+# term (today's label; the newest one only when today's has
+# no rows) — never every year interleaved — and
+# ?semester=all is the explicit opt-out.
+#
+# The fold is ONE SQL statement: SELECT DISTINCT over the
+# pattern columns with the ISO weekday computed by the
+# database, the day filter a WHERE, ORDER BY day, time,
+# group (then the rest of the pattern, so the page order is
+# total) and the page cut by LIMIT/OFFSET — the database
+# returns one page, not the semester. One row past the page
+# answers hasMore. The id is a stable hash of the pattern.
 #
 # Used by:
-#   - services/api/schedule.ts fetchScheduleWeek — the
-#     schedule tab (the 'all' opt-out is part of the mobile
-#     wire contract)
+#   - no shipped client — the current app reads the dated
+#     GET /api/schedule/events (services/api/schedule.ts
+#     fetchScheduleEvents); this shape stays for the old
+#     app builds that still call it
 ############################################################
 
 @require_methods("GET")
@@ -209,7 +269,22 @@ def get_schedule(request):
         return err
 
 
-    # STEP 2: default the semester to the CURRENT one — the
+    # STEP 2: the conditional answer, before any body work —
+    # the default semester below is a pure function of the
+    # table (its version) and today's label, so the seed
+    # carries those instead of the resolved value. The filters
+    # ride as a repr'd tuple, so a "|" inside a group name
+    # cannot alias two seeds
+    # ========================================================
+    current = _get_semester_label(datetime.now())
+    tag = etag_for(f"schedule|{WIRE_SHAPE}|{_table_version()}|{current}|"
+                   f"{(day, group, semester, limit, offset)!r}")
+    cached = _not_modified(request, tag)
+    if cached:
+        return cached
+
+
+    # STEP 3: default the semester to the CURRENT one — the
     # rolling window imports the next term's exam session weeks
     # early, and its label must not steal the default while this
     # term is still running. "all" opts back into every semester
@@ -218,31 +293,31 @@ def get_schedule(request):
         semester = None
     elif not semester:
         options = _semester_options()
-        current = _get_semester_label(datetime.now())
         semester = current if current in options else (options[0] if options else None)
 
 
-    # STEP 3: fold the dated rows to weekly patterns — small
-    # enough to do in Python (one semester × one faculty), and
-    # weekday() spares a per-backend EXTRACT dialect
-    # ========================================================
-    patterns = {}
-    for row in _rows_for(group=group, semester=semester).values(
-        "event__title", "event__teacher", "event__room", "event__time_start",
-        "event__time_end", "event__date", "event__semester", "group__group_name",
-    ):
-        weekday = row["event__date"].weekday()
-        if day is not None and weekday != day:
-            continue
-        key = (weekday, row["event__time_start"], row["event__time_end"],
+    # STEP 4: fold the dated rows to weekly patterns IN SQL —
+    # one page plus one row, the weekday from the database's
+    # own ISO extract (1 = Monday), portable across engines
+    # =======================================================
+    pattern = ("iso_day", "event__time_start", "event__time_end", "event__title",
+               "event__teacher", "event__room", "group__group_name", "event__semester")
+    rows = _rows_for(group=group, semester=semester).annotate(iso_day=ExtractIsoWeekDay("event__date"))
+    if day is not None:
+        rows = rows.filter(iso_day=day + 1)
+    page = list(
+        rows.values(*pattern).distinct()
+        .order_by("iso_day", "event__time_start", "group__group_name", "event__time_end",
+                  "event__title", "event__teacher", "event__room", "event__semester")
+        [offset:offset + limit + 1]
+    )
+
+    lessons = []
+    for row in page[:limit]:
+        key = (row["iso_day"] - 1, row["event__time_start"], row["event__time_end"],
                row["event__title"], row["event__teacher"], row["event__room"],
                row["group__group_name"], row["event__semester"])
-        patterns.setdefault(key, None)
-
-    ordered = sorted(patterns, key=lambda k: (k[0], k[1], k[6]))
-
-    lessons = [
-        {
+        lessons.append({
             # Stable across runs — old clients key rows on it
             "id": hashlib.sha256("|".join(map(str, key)).encode()).hexdigest()[:16],
             "title": key[3],
@@ -253,16 +328,9 @@ def get_schedule(request):
             "dayOfWeek": key[0],
             "group": key[6],
             "semester": key[7],
-        }
-        for key in ordered[offset:offset + limit]
-    ]
+        })
 
-
-    # STEP 4: the ETag — the filters ride as a repr'd tuple, so
-    # a "|" inside a group name cannot alias two seeds
-    # =========================================================
-    seed = f"schedule|{_table_version()}|{(day, group, semester, limit, offset)!r}"
-    return _conditional_json(request, {"lessons": lessons}, seed)
+    return _cacheable(json_response({"lessons": lessons, "hasMore": len(page) > limit}), tag)
 
 
 
@@ -275,17 +343,24 @@ def get_schedule(request):
 # get_schedule_events
 ############################################################
 #
-# GET /api/schedule/events?group=&teacher=&from=&to=
-# &semester=&limit=&offset= — dated events, the real
-# timetable: one row per (event × group) with the calendar
-# date on it, ordered date, time, group. group and teacher
-# are exact matches (the teacher string as the filters
-# roster serves it — the mobile teacher perspective's feed,
-# where the FOLDED shape showed an alternating biweekly
-# lecture twice per week). from/to are inclusive ISO dates;
-# the default range is [today - 7, today + 28] and a
-# requested one is capped at MAX_RANGE_DAYS. dayOfWeek rides
-# along (0=Monday) so clients never re-derive it.
+# GET /api/schedule/events?group=&teacher=&from=&to=&semester=&limit=&offset=
+#
+# Dated events, the real timetable: one row per (event ×
+# group) with the calendar date on it, ordered date, time,
+# group. group and teacher are exact matches (the teacher
+# string as the filters roster serves it — the mobile
+# teacher perspective's feed, where the FOLDED shape showed
+# an alternating biweekly lecture twice per week). from/to
+# are inclusive ISO dates; the default range is [today - 7,
+# today + 28] and a requested one is capped at
+# MAX_RANGE_DAYS. dayOfWeek rides along (0=Monday) so
+# clients never re-derive it.
+#
+# lectureType is the event's kind as the site names it
+# ("Paskaita", "Pratybos", "Egzaminas", "" when unknown) and
+# subgroups the "Pogrupiai" it names (["1"], [] for the
+# whole group) — both split out of the stored lecture_type
+# (schedule_scraper.split_lecture_type).
 #
 # Used by:
 #   - services/api/schedule.ts fetchScheduleEvents — the
@@ -327,7 +402,17 @@ def get_schedule_events(request):
         return err
 
 
-    # STEP 2: one page of dated (event × group) rows
+    # STEP 2: the conditional answer, before the page query —
+    # every seed input is parsed by now
+    # =======================================================
+    tag = etag_for(f"events|{WIRE_SHAPE}|{_table_version()}|"
+                   f"{(group, teacher, semester, bounds['from'], bounds['to'], limit, offset)!r}")
+    cached = _not_modified(request, tag)
+    if cached:
+        return cached
+
+
+    # STEP 3: one page of dated (event × group) rows
     # ==============================================
     # DISTINCT: two slugs folding to one group_name ("1 grupė"/
     # "2 grupė" subgroups) can both link the same event — one
@@ -340,29 +425,25 @@ def get_schedule_events(request):
         "event__time_end", "event__semester", "group__group_name",
     ).distinct()[offset:offset + limit]
 
-    events = [
-        {
+    events = []
+    for r in rows:
+        kind, subgroups = split_lecture_type(r["event__lecture_type"])
+        events.append({
             "id": r["event__id"],
             "title": r["event__title"],
             "teacher": r["event__teacher"],
             "room": r["event__room"],
-            "lectureType": r["event__lecture_type"],
+            "lectureType": kind,
+            "subgroups": subgroups,
             "date": r["event__date"].isoformat(),
             "timeStart": r["event__time_start"],
             "timeEnd": r["event__time_end"],
             "dayOfWeek": r["event__date"].weekday(),
             "group": r["group__group_name"],
             "semester": r["event__semester"],
-        }
-        for r in rows
-    ]
+        })
 
-
-    # STEP 3: the conditional answer
-    # ==============================
-    seed = (f"events|{_table_version()}|"
-            f"{(group, teacher, semester, bounds['from'], bounds['to'], limit, offset)!r}")
-    return _conditional_json(request, {"events": events}, seed)
+    return _cacheable(json_response({"events": events}), tag)
 
 
 
@@ -375,40 +456,62 @@ def get_schedule_events(request):
 # get_schedule_filters
 ############################################################
 #
-# GET /api/schedule/filters — the filter sheet in one call:
-# groups, semesters (past the threshold, newest first), the
-# DISTINCT days, teachers (the roster the teacher-perspective
-# picker searches — exact strings ?teacher= matches), and
-# semesterGroups correlating which groups really exist in
-# which semester. ?semester= scopes groups and days to one
-# label; semesters, teachers and semesterGroups always
-# describe the whole table.
+# GET /api/schedule/filters?semester=
+#
+# The filter sheet in one call: groups, semesters (past the
+# threshold, newest first) with `terms` naming each one's
+# first and last event date, the DISTINCT days, teachers
+# (the roster the teacher-perspective picker searches —
+# exact strings ?teacher= matches), and semesterGroups
+# correlating which groups really exist in which semester.
+# ?semester= scopes groups and days to one label;
+# semesters, terms, teachers and semesterGroups always
+# describe the whole table. The terms are what lands the
+# app's semester jump on a term's first REAL week — the
+# nominal September/February Mondays miss both a term that
+# opens mid-week in August and a January exam session.
 #
 # Used by:
 #   - services/api/schedule.ts fetchScheduleFilters — the
-#     group/semester pickers
+#     group/teacher pickers and the semester time-jump
 ############################################################
 
 @require_methods("GET")
 def get_schedule_filters(request):
     semester = clean_param(request.GET.get("semester")) or None
 
-    # STEP 1: the semester options past the stray-label threshold
-    # ===========================================================
-    semesters = _semester_options()
+
+    # STEP 1: the conditional answer — the seed is the table
+    # version and the one parameter, both known already
+    # ======================================================
+    tag = etag_for(f"filters|{WIRE_SHAPE}|{_table_version()}|{semester}")
+    cached = _not_modified(request, tag)
+    if cached:
+        return cached
 
 
-    # STEP 2: groups and days, scoped when a label is given
-    # =====================================================
+    # STEP 2: the semester options past the stray-label
+    # threshold, with their date spans
+    # =================================================
+    terms = _term_rows()
+    semesters = [row["semester"] for row in terms]
+
+
+    # STEP 3: groups and days, scoped when a label is given —
+    # DISTINCT in the database: the link table holds one row
+    # per (event × group), the answer is a few dozen names
+    # =======================================================
     scoped = ScheduleEventGroup.objects.all()
     if semester:
         scoped = scoped.filter(event__semester=semester)
 
-    groups = sorted(set(scoped.values_list("group__group_name", flat=True)))
-    days = sorted({d.weekday() for d in scoped.values_list("event__date", flat=True).distinct()})
+    groups = sorted(scoped.values_list("group__group_name", flat=True).distinct())
+    days = sorted(iso_day - 1 for iso_day in
+                  scoped.annotate(iso_day=ExtractIsoWeekDay("event__date"))
+                  .values_list("iso_day", flat=True).distinct())
 
 
-    # STEP 3: which groups really exist in which semester —
+    # STEP 4: which groups really exist in which semester —
     # labels below the threshold are dropped here too
     # =====================================================
     known = set(semesters)
@@ -424,6 +527,8 @@ def get_schedule_filters(request):
     payload = {
         "groups": groups,
         "semesters": semesters,
+        "terms": [{"semester": row["semester"], "from": row["first"].isoformat(),
+                   "to": row["last"].isoformat()} for row in terms],
         "days": days,
         # Every known teacher, retention-pruned with the events —
         # the strings are exactly what ?teacher= matches
@@ -432,5 +537,113 @@ def get_schedule_filters(request):
         "semesterGroups": [{"semester": s, "groups": sorted(set(by_semester.get(s, [])))}
                            for s in semesters],
     }
-    seed = f"filters|{_table_version()}|{semester}"
-    return _conditional_json(request, payload, seed)
+    return _cacheable(json_response(payload), tag)
+
+
+
+
+
+
+
+
+############################################################
+# get_schedule_calendar
+############################################################
+#
+# GET /api/schedule/calendar.ics?group=|teacher=&lang=
+#
+# One group's (group_name, exact) or one teacher's (the
+# roster's exact string) timetable as an RFC 5545 feed a
+# phone calendar subscribes to: every event from a fortnight
+# back to the end of the last published term, one VEVENT
+# each (schedule/ical.py renders), UTC times from the
+# Vilnius wall clock, exams leading their SUMMARY. ?lang=en
+# words the calendar name and the event details in English;
+# anything else is Lithuanian.
+#
+# Exactly one of group/teacher, or 400; a name the timetable
+# does not know is a 404 — a feed of nothing would look like
+# a subscription that silently broke. The ETag is STRONG (the
+# body is a pure function of the table state, today's date
+# and the parameters) and answers a 304 from one aggregate
+# before any other query; a 200 costs that aggregate, the
+# existence probe and ONE data query — every (event × group)
+# row of the scope's events, so each VEVENT can name all its
+# groups. Clients may cache for an hour.
+#
+# Used by:
+#   - components/schedule/CalendarSubscribeSheet.tsx (via
+#     services/api/schedule.ts scheduleCalendarLinks) — the
+#     "Prenumeruoti kalendoriuje" webcal / Google Calendar /
+#     copy-link targets; then the subscribed calendar apps
+############################################################
+
+@require_methods("GET")
+def get_schedule_calendar(request):
+    # STEP 1: exactly one scope, and the feed's language
+    # ==================================================
+    # A blank value is no value — "?group= " names nothing
+    group = (clean_param(request.GET.get("group")) or "").strip() or None
+    teacher = (clean_param(request.GET.get("teacher")) or "").strip() or None
+    if bool(group) == bool(teacher):
+        return json_error("Pass exactly one of 'group' or 'teacher'", 400, code="calendar_scope")
+    lang = "en" if (clean_param(request.GET.get("lang")) or "").strip().lower().startswith("en") else "lt"
+
+
+    # STEP 2: the conditional answer — the window moves with
+    # today, so today rides the seed
+    # ======================================================
+    today = date_type.today()
+    version, newest = _table_state()
+    tag = etag_for(f"calendar|{WIRE_SHAPE}|{version}|{today}|{(group, teacher, lang)!r}")
+    cached = _not_modified(request, tag, strong=True, max_age=CALENDAR_MAX_AGE)
+    if cached:
+        return cached
+
+
+    # STEP 3: a scope the timetable never heard of is a 404
+    # =====================================================
+    known = (ScheduleGroup.objects.filter(group_name=group) if group
+             else ScheduleTeacher.objects.filter(name=teacher)).exists()
+    if not known:
+        return json_error("No such group or teacher in the timetable", 404, code="calendar_scope_unknown")
+
+
+    # STEP 4: every (event × group) row of the scope's events
+    # in the window — ONE query, the scope as a subquery
+    # =======================================================
+    scope = (ScheduleEventGroup.objects.filter(group__group_name=group).values("event_id") if group
+             else ScheduleEvent.objects.filter(teacher=teacher).values("id"))
+    rows = (
+        ScheduleEventGroup.objects
+        .filter(event_id__in=scope,
+                event__date__gte=today - timedelta(days=CALENDAR_BACK_DAYS),
+                event__date__lte=today + timedelta(days=CALENDAR_AHEAD_DAYS))
+        .values("event__id", "event__title", "event__teacher", "event__room",
+                "event__lecture_type", "event__date", "event__time_start",
+                "event__time_end", "group__group_name")
+        .order_by("event__date", "event__time_start", "event__id", "group__group_name")
+    )
+
+    events = {}
+    for row in rows:
+        event = events.get(row["event__id"])
+        if event is None:
+            kind, subgroups = split_lecture_type(row["event__lecture_type"])
+            event = events[row["event__id"]] = {
+                "id": row["event__id"], "title": row["event__title"], "kind": kind,
+                "subgroups": subgroups, "teacher": row["event__teacher"], "room": row["event__room"],
+                "date": row["event__date"], "time_start": row["event__time_start"],
+                "time_end": row["event__time_end"], "groups": [],
+            }
+        if row["group__group_name"] not in event["groups"]:
+            event["groups"].append(row["group__group_name"])
+
+
+    # STEP 5: the feed — UTF-8 text/calendar, the strong tag
+    # ======================================================
+    body = render_calendar(events.values(), name=group or teacher, lang=lang, stamp=newest)
+    response = HttpResponse(body.encode("utf-8"), content_type="text/calendar; charset=utf-8")
+    ascii_name = re.sub(r"[^A-Za-z0-9-]+", "-", group or "destytojas").strip("-") or "tvarkarastis"
+    response["Content-Disposition"] = f'inline; filename="knf-{ascii_name}.ics"'
+    return _cacheable(response, tag, strong=True, max_age=CALENDAR_MAX_AGE)

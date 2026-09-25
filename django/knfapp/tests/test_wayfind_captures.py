@@ -14,7 +14,8 @@
 #  declared past DATA_UPLOAD_MAX_MEMORY_SIZE — on its
 #  Content-Length, before it is read; finish gates on 8
 #  frames, on status and on its optional body. The SVG plan
-#  store cuts scripts before hashing.
+#  store cuts scripts before hashing (the rebuild has its
+#  own suite, test_wayfind_plans).
 ############################################################
 
 

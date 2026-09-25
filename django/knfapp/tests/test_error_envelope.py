@@ -6,7 +6,8 @@
 #  JSON body reaches the view without NUL or another C0
 #  control character: PostgreSQL's text type refuses NUL
 #  with a DataError — a 500 from a body no human typed —
-#  and SQLite stores it and answers wrong later. (2) What
+#  and SQLite stores it and answers wrong later; a body
+#  carrying NaN / Infinity is refused whole. (2) What
 #  no view answered still speaks JSON: an unknown /api/...
 #  path, a PermissionDenied, a request Django itself
 #  refuses (the oversized body answered 413 among them)
@@ -71,6 +72,15 @@ class BodyControlCharacterTests(TestCase):
     def test_keys_are_cleaned_too_and_non_objects_stay_none(self):
         self.assertEqual(get_json_object(self._post({"na\x00me": "x"})), {"name": "x"})
         self.assertIsNone(get_json_object(self._post(["a\x00"])))
+
+    def test_a_non_finite_number_makes_the_body_invalid(self):
+        # Python's json reads NaN / Infinity; no client writes
+        # them — a crafted body is refused whole, like bad JSON
+        for token in ("NaN", "Infinity", "-Infinity", "1e999", "-1e999"):
+            request = RequestFactory().post("/api/x", data='{"x": %s}' % token,
+                                            content_type="application/json")
+            self.assertIsNone(get_json_object(request), token)
+        self.assertEqual(get_json_object(self._post({"x": 1.5})), {"x": 1.5})
 
     def test_clean_param_strips_a_query_value_and_passes_none(self):
         self.assertEqual(clean_param("a\x00b\x01c\td"), "abc\td")

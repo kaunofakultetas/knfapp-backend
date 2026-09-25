@@ -62,6 +62,7 @@
 
 import hashlib
 import json
+import math
 import re
 from datetime import date, datetime, timezone
 from functools import wraps
@@ -110,9 +111,27 @@ def _strip_controls(value):
     return value
 
 
+# The NaN / Infinity / -Infinity tokens Python's json accepts
+# and no JSON client sends (JSON.stringify writes null): a
+# crafted body carrying one would reach a view as a float
+# that compares false with everything and makes every later
+# json.dumps of it invalid JSON — refused as a bad body
+def _reject_constant(token):
+    raise ValueError(f"non-finite number {token} in JSON body")
+
+
+# The other road to the same float: a literal too big for a
+# double (1e999) parses to inf without ever being a token
+def _finite_float(literal):
+    value = float(literal)
+    if not math.isfinite(value):
+        raise ValueError(f"number {literal[:20]} overflows")
+    return value
+
+
 def get_json_object(request):
     try:
-        data = json.loads(request.body)
+        data = json.loads(request.body, parse_constant=_reject_constant, parse_float=_finite_float)
     except (ValueError, UnicodeDecodeError):
         return None
     return _strip_controls(data) if isinstance(data, dict) else None

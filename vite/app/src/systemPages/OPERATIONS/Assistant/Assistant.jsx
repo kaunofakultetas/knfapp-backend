@@ -90,7 +90,11 @@ function StatTile({ label, value, bad = false }) {
 // stamp, and the two sync buttons. Both run cron's exact
 // sync synchronously — the buttons stay disabled until the
 // counts land; the full re-embed confirms first because it
-// pushes the whole corpus through the AI gateway.
+// pushes the whole corpus through the AI gateway. A run that
+// would retire over a quarter of the corpus retires nothing
+// (retireBlocked — usually a broken scrape); the page then
+// asks whether the shrink is real before re-running with
+// allowMassRetire.
 //
 // Used by:
 //   - Assistant (below)
@@ -121,7 +125,7 @@ function KnowledgeCard({ t, knowledge, reindex }) {
           size="small"
           startIcon={reindex.isPending ? <CircularProgress size={14} color="inherit" /> : <RefreshOutlinedIcon />}
           disabled={reindex.isPending}
-          onClick={() => reindex.mutate(false)}
+          onClick={() => reindex.mutate({ all: false })}
         >
           {t("knowledge.reindex")}
         </Button>
@@ -131,7 +135,7 @@ function KnowledgeCard({ t, knowledge, reindex }) {
           color="warning"
           disabled={reindex.isPending}
           onClick={() => {
-            if (window.confirm(t("knowledge.reindexAllConfirm"))) reindex.mutate(true);
+            if (window.confirm(t("knowledge.reindexAllConfirm"))) reindex.mutate({ all: true });
           }}
         >
           {t("knowledge.reindexAll")}
@@ -487,9 +491,10 @@ function PromptRow({ t, prompt, activate }) {
 // -----------------------------------------------------------
 //
 // The three queries load side by side; the six mutations
-// (re-index, save/delete a curated answer, save version,
-// activate, core-only) each invalidate the prefix on
-// success and toast their outcome —
+// (re-index — re-offered with allowMassRetire when the share
+// guard blocked a retirement —, save/delete a curated
+// answer, save version, activate, core-only) each
+// invalidate the prefix on success and toast their outcome —
 // api/client.js already toasts mutation FAILURES app-wide.
 //
 // Used by:
@@ -520,13 +525,20 @@ export default function Assistant({ authData }) {
   };
 
   const reindex = useMutation({
-    mutationFn: async (all) => (await api.post('/api/admin/assistant/knowledge/reindex', { all })).data,
-    onSuccess: (counts) => {
+    mutationFn: async ({ all = false, allowMassRetire = false }) =>
+      (await api.post('/api/admin/assistant/knowledge/reindex', { all, allowMassRetire })).data,
+    onSuccess: (counts, variables) => {
       toast.success(t("knowledge.reindexDone")
         .replace('{embedded}', counts.embedded)
         .replace('{unchanged}', counts.unchanged)
         .replace('{retired}', counts.retired));
       refetchBoth();
+      // The share guard held a mass retirement back — only an
+      // admin who knows the source really shrank lets it through
+      if (counts.retireBlocked > 0
+          && window.confirm(t("knowledge.retireBlockedConfirm").replace('{count}', counts.retireBlocked))) {
+        reindex.mutate({ all: variables.all, allowMassRetire: true });
+      }
     },
   });
   const create = useMutation({

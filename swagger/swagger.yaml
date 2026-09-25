@@ -586,6 +586,11 @@ paths:
 
         A wall post by an account on either side of a block with the caller
         is never listed; faculty and scraped rows are unaffected by blocks.
+        Each row's likes/comments counts are net of the caller's blocks (a
+        blocked account's like or comment is not counted), so a card agrees
+        with the thread the caller can open. A post whose author has been
+        deactivated is listed to admins only. An untitled post carries a
+        derived title cut at a word boundary with "…".
 
 
         Answers carry a weak `ETag` over the data watermark plus the caller,
@@ -620,6 +625,16 @@ paths:
           schema:
             type: string
             enum: [knf.vu.lt, vu.lt, faculty, user, app]
+        - name: truncate
+          in: query
+          description: >
+            1 / true cuts every body to its 200-character summary and marks the
+            row `truncated: true` (the app's feed asks for it — no card renders
+            a full body; the article screen fetches the post). Omitted, bodies
+            come whole, as the admin panel expects. Part of the ETag.
+          schema:
+            type: string
+            enum: ["1", "true"]
         - name: before
           in: query
           description: >
@@ -777,7 +792,13 @@ paths:
   /news/{postId}/like:
     post:
       tags: [news]
-      summary: Toggle like on a post
+      summary: Set (or toggle) the caller's like on a post
+      description: >
+        With a body {"liked": true|false} the like is SET to that state —
+        idempotent, so a burst of taps can never land the opposite state;
+        setting the state that already holds writes nothing. Without a body
+        the legacy toggle applies (older clients). A liked value that is not
+        a boolean is a 400.
       security:
         - bearerAuth: []
       parameters:
@@ -786,9 +807,17 @@ paths:
           required: true
           schema:
             type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                liked: {type: boolean, description: The state to set}
       responses:
         "200":
-          description: Like toggled
+          description: The resulting state
           content:
             application/json:
               schema:
@@ -798,6 +827,8 @@ paths:
                     type: boolean
                   likes:
                     type: integer
+        "400":
+          description: liked is present but not a boolean
         "401":
           description: Not authenticated
         "404":
@@ -1064,6 +1095,7 @@ paths:
             Body is not a JSON object, title missing/over-long, options not an
             array of strings, fewer than 2 or more than 10 after blanks are
             stripped, an option over 100 characters, an unparseable end_date,
+            an end_date that is not in the future (code end_date_in_the_past),
             or the post is a scraped article (those keep their own post type)
           content:
             application/json:
@@ -1280,6 +1312,9 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Lesson"
+                  hasMore:
+                    type: boolean
+                    description: Another page follows at offset + limit
         "304":
           description: Not modified - If-None-Match matched the ETag
         "400":
@@ -1363,7 +1398,18 @@ paths:
                               example: "2026-09-15"
                             lectureType:
                               type: string
-                              example: ""
+                              description: >-
+                                The event's type as the timetable site names it
+                                ("Paskaita", "Pratybos", "Egzaminas", "Paskaitos ir
+                                seminarai", …); "" only for rows stored before the
+                                scraper read types
+                              example: "Egzaminas"
+                            subgroups:
+                              type: array
+                              description: The subgroups ("Pogrupiai") the event is for; empty for the whole group
+                              items:
+                                type: string
+                              example: ["1"]
         "304":
           description: Not modified - If-None-Match matched the ETag
         "400":
@@ -1430,8 +1476,117 @@ paths:
                           type: array
                           items:
                             type: string
+                  terms:
+                    type: array
+                    description: >-
+                      The semesters again, each with its first and last event
+                      date (inclusive) — the app's semester jump lands on the
+                      week of `from`
+                    items:
+                      type: object
+                      properties:
+                        semester:
+                          type: string
+                          example: "2026-R"
+                        from:
+                          type: string
+                          format: date
+                          example: "2026-09-01"
+                        to:
+                          type: string
+                          format: date
+                          example: "2026-12-23"
         "304":
           description: Not modified - If-None-Match matched the ETag
+
+  /schedule/calendar.ics:
+    get:
+      tags: [schedule]
+      summary: One group's or one teacher's timetable as an iCalendar subscription
+      description: |
+        An RFC 5545 feed a phone calendar subscribes to (Apple Calendar through
+        `webcal://`, Google Calendar by URL): every event from 14 days back to the
+        end of the last published term, one `VEVENT` each. Public like the rest of
+        the schedule API.
+
+        - `DTSTART`/`DTEND` are UTC (`…Z`), computed from the Europe/Vilnius wall
+          times the timetable is published in, daylight saving included.
+        - `UID` is `<event id>@knfapp.knf-hosting.lt`; the id survives the
+          scraper's relabel-in-place, so a type or subgroup change edits the event
+          in a subscriber's calendar instead of duplicating it.
+        - `SUMMARY` is the title — exam-like types lead it (`Egzaminas: …`,
+          `Exam: …` with `lang=en`); `LOCATION` is the room; `DESCRIPTION` names
+          the type, teacher, subgroups and every group; `CATEGORIES` the type.
+        - The calendar carries `X-WR-CALNAME` ("KNF tvarkaraštis — ISKS-2"),
+          `X-WR-TIMEZONE:Europe/Vilnius`, `REFRESH-INTERVAL;VALUE=DURATION:PT6H`
+          and `X-PUBLISHED-TTL:PT6H`.
+        - CRLF line ends; every line folded at 75 octets on UTF-8 boundaries;
+          TEXT values escape backslash, `;`, `,` and newlines.
+
+        A **strong** `ETag` (the body is a pure function of the table state,
+        today's date and the parameters) with `Cache-Control: public,
+        max-age=3600`; a matching `If-None-Match` gets a 304 before the body is
+        built.
+      parameters:
+        - name: group
+          in: query
+          schema:
+            type: string
+          description: Exact group label ("ISKS-2") — exactly one of group / teacher
+        - name: teacher
+          in: query
+          schema:
+            type: string
+          description: Exact teacher string, as the /schedule/filters roster serves it
+        - name: lang
+          in: query
+          schema:
+            type: string
+            enum: [lt, en]
+            default: lt
+          description: The calendar name and event details in Lithuanian or English
+      responses:
+        "200":
+          description: The iCalendar feed
+          content:
+            text/calendar:
+              schema:
+                type: string
+                example: |
+                  BEGIN:VCALENDAR
+                  VERSION:2.0
+                  PRODID:-//VU Kauno fakultetas//KNFAPP tvarkarastis//LT
+                  CALSCALE:GREGORIAN
+                  METHOD:PUBLISH
+                  X-WR-CALNAME:KNF tvarkaraštis — ISKS-2
+                  X-WR-TIMEZONE:Europe/Vilnius
+                  REFRESH-INTERVAL;VALUE=DURATION:PT6H
+                  X-PUBLISHED-TTL:PT6H
+                  BEGIN:VEVENT
+                  UID:3871d240-94c2-4b12-ac61-f02085212808@knfapp.knf-hosting.lt
+                  DTSTAMP:20260925T121540Z
+                  DTSTART:20270107T070000Z
+                  DTEND:20270107T090000Z
+                  SUMMARY:Egzaminas: Akademinis ir informacinis raštingumas
+                  LOCATION:II k. kl. (knf)
+                  DESCRIPTION:Tipas: Egzaminas\nDėstytojas: Ilona Veitaitė\, Doc.\, Dr.\nPogrupiai: 1
+                  CATEGORIES:Egzaminas
+                  END:VEVENT
+                  END:VCALENDAR
+        "304":
+          description: Not modified - If-None-Match matched the strong ETag
+        "400":
+          description: Neither or both of group / teacher (code `calendar_scope`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: A group or teacher the timetable does not know (code `calendar_scope_unknown`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   # ── Chat ──────────────────────────────────────────────────────────────────
 
@@ -2091,9 +2246,11 @@ paths:
       summary: >
         Disappearing messages: any member sets the room's TTL (0/null off,
         else 60..31536000 seconds). Only messages sent AFTER the change get
-        an expiry; the room narrates it with a system row and hears the
+        an expiry; the room narrates it with a system row (a structured
+        `system` event the clients word per language) and hears the
         conversation_updated socket event {conversationId, patch:
-        {messageTtlSeconds}}.
+        {messageTtlSeconds}}. Setting the value the room already has is a
+        no-op — 200, no system row, no events.
       security:
         - bearerAuth: []
       parameters:
@@ -2294,9 +2451,11 @@ paths:
       summary: Presence lookup for conversation counterparts
       description: >
         Answers whether each requested user currently holds a Socket.IO connection
-        on this server. Presence is revealed ONLY for users who share at least one
-        conversation with the caller — everybody else reads false, exactly like a
-        genuinely offline user, so the route is no source of presence about
+        on this server. Presence is revealed ONLY for the caller's friends and for
+        users who have WRITTEN in one of the caller's conversations (merely
+        sharing a room one created is not enough), never across a block in either
+        direction, and always for the caller — everybody else reads false, exactly
+        like a genuinely offline user, so the route is no source of presence about
         strangers. Beside the boolean, lastSeen carries the user's last socket
         activity (users.last_active_at, ISO 8601) under the SAME gate — an
         ungated or never-connected user reads null. The list is silently
@@ -2923,7 +3082,10 @@ paths:
         previous page's last row, opaque to clients — echo it back verbatim.
         One row per (kind, actor, subject): a repeated gesture refreshes its
         one row to the top instead of piling duplicates, and an unlike or an
-        answered friend request takes its row away.
+        answered friend request takes its row away. Rows whose actor is on
+        either side of a block with the caller are never listed (a block also
+        deletes the pair's rows), a deleted post takes its like and comment
+        rows with it, and a deleted comment re-points or drops its row.
       security:
         - bearerAuth: []
       parameters:
@@ -2981,7 +3143,7 @@ paths:
     get:
       tags: [social]
       summary: The unread badge probe
-      description: A bare COUNT the mobile badge polls — kept apart from the list so the badge never pays for a page.
+      description: A bare COUNT the mobile badge polls — kept apart from the list so the badge never pays for a page. Counts exactly what the list would show (block pairs excluded).
       security:
         - bearerAuth: []
       responses:
@@ -4359,13 +4521,13 @@ paths:
               properties:
                 id: {type: string, description: "Lowercase slug: a-z, 0-9, -"}
                 name: {type: string}
-                northDeg: {type: number, nullable: true, description: Compass bearing of the plans' "up"}
-                entranceNodeId: {type: string, nullable: true}
+                northDeg: {type: number, nullable: true, description: "Compass bearing of the plans' \"up\" — a finite number (NaN / Infinity refused)"}
+                entranceNodeId: {type: string, nullable: true, description: A short entity id (letters, digits, . _ : -)}
       responses:
         "201":
           description: Created
         "400":
-          description: bad_id / bad_name / bad_north
+          description: bad_id / bad_name / bad_north (not a finite number) / bad_entrance (not an id)
           content:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
@@ -4460,11 +4622,19 @@ paths:
         on a conflict also the entity as it stands) or duplicate (op id
         seen before in THIS building; nothing re-applied, and `of`,
         `reason` and `revision` say what the logged op did). A conflict
-        is an entity whose revision is past the op's baseRevision; an op
-        without baseRevision overwrites. Deletes are tombstones. Batches
-        serialise on the building row's write lock, so overlapping
-        batches cannot both pass the conflict check on one entity. At
-        most 500 ops per batch.
+        is an entity whose revision is past the op's baseRevision, or a
+        `fresh` create that finds the entity alive (reviving a tombstone
+        is allowed). Every upsert must carry an integer baseRevision or
+        `fresh: true` — a batch holding one that carries neither is
+        refused WHOLE with 400 no_base (naming the op in `opId`) before
+        anything is applied; a baseRevision that is present but not an
+        integer ("1", 1.0, true) rejects that op. A delete without
+        baseRevision is a plain overwrite. Entity data is type-checked
+        (ids, non-empty names and labels, finite coordinates, polygons of
+        three or more finite points …): a malformed entity is rejected
+        with the reason. Deletes are tombstones. Batches serialise on the
+        building row's write lock, so overlapping batches cannot both
+        pass the conflict check on one entity. At most 500 ops per batch.
       security:
         - bearerAuth: []
       parameters:
@@ -4504,7 +4674,7 @@ paths:
                         revision: {type: integer, nullable: true, description: On a duplicate of an applied op — the revision it applied at; null for one of a rejected op}
                         current: {type: object, nullable: true, description: On a conflict — data, revision, deleted}
         "400":
-          description: bad_batch / batch_too_large
+          description: bad_batch / batch_too_large / no_base (an unstamped upsert; the body names it in opId)
         "404":
           description: not_found
 
@@ -4661,9 +4831,16 @@ paths:
     post:
       tags: [wayfind]
       summary: >
-        Store a level's SVG plan (admin / curator, 2 MB). Scripts,
-        event-handler attributes and script hrefs are cut; the sha256 of
-        the sanitised text names the file.
+        Store a level's SVG plan (admin / curator, 2 MB). The upload is
+        parsed and REBUILT from an explicit allowlist of SVG elements and
+        attributes: script, foreignObject, animation elements, event
+        handlers and editor namespaces are dropped; an href survives only
+        as a #fragment (or an inline png/jpeg/gif/webp raster on image),
+        url() only as url(#id), style only with allowlisted properties
+        and inert values. Values are judged after entity decoding. A
+        document that cannot be parsed, whose root is not svg, or that
+        declares entities is refused 400 bad_plan with the reason. The
+        sha256 of the rebuilt text names the file.
       security:
         - bearerAuth: []
       parameters:
@@ -4700,7 +4877,11 @@ paths:
   /wayfind/plans/{name}:
     get:
       tags: [wayfind]
-      summary: A stored plan by its hashed name — public, immutable, served with a no-script policy.
+      summary: >
+        A stored plan by its hashed name — public, immutable. Served with
+        X-Content-Type-Options nosniff and Content-Security-Policy
+        "default-src 'none'; style-src 'unsafe-inline'; sandbox;
+        frame-ancestors 'none'".
       parameters:
         - name: name
           in: path
@@ -4912,16 +5093,17 @@ paths:
                   progressPct: {type: integer}
                   report:
                     type: object
-                    description: framesUsed, framesExpected, coverage {hfovDeg, vfovDeg, vOffsetDeg, centreYawDeg, coveredPct}, timingMs — or {reason} on failure; between finish and done it may carry just the finish body's parked {centreYawDeg}
+                    description: "framesUsed, framesExpected, coverage {hfovDeg (360 — the stored image's extent), vfovDeg (the stored band), vOffsetDeg, centreYawDeg, coveredPct, capturedHfovDeg / capturedVfovDeg (the arc actually photographed)}, timingMs — or {reason} on failure; between finish and done it may carry just the finish body's parked {centreYawDeg}"
                   pano:
                     type: object
                     properties:
                       id: {type: string}
                       url: {type: string, description: The relative /api/wayfind/panoramas/<id>.jpg a node's pano field stores}
-                      width: {type: integer}
-                      height: {type: integer}
-                      hfovDeg: {type: number}
-                      vfovDeg: {type: number}
+                      width: {type: integer, description: 2048}
+                      height: {type: integer, description: The rows of the photographed band — the canvas is cropped to it}
+                      hfovDeg: {type: number, description: 360 — what the image itself spans}
+                      vfovDeg: {type: number, description: The band the image spans}
+                      vOffsetDeg: {type: number, description: The band's vertical centre relative to the horizon; the client writes it into the node's panoGeometry}
                       centreYawDeg: {type: number}
         "404":
           description: not_found
@@ -4952,8 +5134,8 @@ components:
         type building patches name / northDeg / entranceNodeId. The id is
         client-generated and makes the op idempotent WITHIN ITS BUILDING —
         the server logs it under "<building>:<id>", so a fixed id (a seed)
-        can bootstrap a second building. Unknown fields (the client's
-        `fresh` marker) are ignored and logged with the op.
+        can bootstrap a second building. An upsert must carry either
+        baseRevision or `fresh: true` (see the ops route).
       required: [id, type]
       properties:
         id: {type: string}
@@ -4961,7 +5143,8 @@ components:
         kind: {type: string, enum: [level, node, edge, room]}
         entityId: {type: string}
         data: {type: object}
-        baseRevision: {type: integer, description: The revision the phone's copy came from; an entity changed since is a conflict}
+        baseRevision: {type: integer, description: The revision the phone's copy came from; an entity changed since is a conflict. Must be an integer when present}
+        fresh: {type: boolean, description: On an upsert — a create the server has never seen; finding the entity alive is a conflict}
     Error:
       type: object
       description: >

@@ -9,7 +9,12 @@
 #  first run embeds everything, an unchanged second run
 #  embeds nothing but stamps sightings, an edit re-embeds
 #  exactly the touched chunk, a vanished source retires
-#  its rows, and a dead gateway aborts BEFORE any delete.
+#  its rows, a dead gateway aborts BEFORE any delete, and a
+#  run that would retire over a quarter of the corpus — a
+#  source gone silently empty — retires NOTHING unless the
+#  operator allows it (KNF-051). The scraped general_contact
+#  block is titled for humans, never by its code key
+#  (KNF-150).
 #
 #  The gateway client itself: batching, order, the typed
 #  failure — all through the injected `post` seam.
@@ -185,3 +190,63 @@ class IndexerTests(TestCase):
         with self.assertRaises(SystemExit):
             self._run()
         self.assertEqual(SupportChunk.objects.count(), rows_before)
+
+    def test_a_mass_retirement_is_refused_unless_the_operator_allows_it(self):
+        from knfapp.assistant.indexing import run_index
+        for index in range(12):
+            create_post(title=f"Naujiena {index}", content=f"Turinys {index}.")
+        self._run()
+        news_rows = SupportChunk.objects.filter(source="news").count()
+        self.assertEqual(news_rows, 12)
+
+        # The news unit comes back EMPTY without raising — the shape
+        # of a whitelist drift — so no per-unit guard can see it
+        from knfapp.assistant import chunking as chunking_module
+        original = chunking_module.news_chunks
+        chunking_module.news_chunks = lambda failures=None: []
+        self.addCleanup(lambda: setattr(chunking_module, "news_chunks", original))
+
+        with self.assertRaises(SystemExit) as refused:
+            self._run()
+        self.assertEqual(refused.exception.code, 2)
+        self.assertEqual(SupportChunk.objects.filter(source="news").count(), 12)
+
+        counts = run_index()
+        self.assertEqual(counts["retired"], 0)
+        self.assertEqual(counts["retireBlocked"], 12)
+
+        counts = run_index(allow_mass_retire=True)
+        self.assertEqual(counts["retired"], 12)
+        self.assertEqual(SupportChunk.objects.filter(source="news").count(), 0)
+
+    def test_a_few_retirements_still_happen_the_same_night(self):
+        posts = [create_post(title=f"Naujiena {index}") for index in range(3)]
+        self._run()
+        posts[0].delete()
+        self._run()
+        self.assertEqual(SupportChunk.objects.filter(source="news").count(), 2)
+
+
+class HandbookTitleTests(TestCase):
+
+    def test_general_contact_is_titled_for_humans_and_laid_out_as_contacts(self):
+        from knfapp.info.models import FacultyInfo
+        from knfapp.common.timestamps import utc_now_iso
+        import uuid as uuid_module
+        FacultyInfo.objects.create(id=str(uuid_module.uuid4()), lang="lt", section="general_contact",
+                                   data_json={"address": "Muitinės g. 8, LT-44280 Kaunas",
+                                              "phone": "+370 37 422 523", "email": "knf@knf.vu.lt"},
+                                   scraped_at=utc_now_iso())
+        rows = {(chunk["language"], chunk["title"]): chunk for chunk in chunking.handbook_chunks()
+                if chunk["source_id"].endswith("-general_contact")}
+        self.assertIn(("lt", "Fakulteto kontaktai"), rows)
+        self.assertIn(("en", "Faculty contacts"), rows)
+        chunk = rows[("lt", "Fakulteto kontaktai")]
+        self.assertEqual(chunk["section"], "contacts")
+        self.assertEqual(chunk["text"].splitlines(),
+                         ["Muitinės g. 8, LT-44280 Kaunas", "tel. +370 37 422 523", "knf@knf.vu.lt"])
+        self.assertNotIn("general_contact", chunk["title"])
+
+    def test_an_unmapped_section_title_is_its_key_made_readable(self):
+        self.assertEqual(chunking._section_title("lt", "study_offices"), "Study offices")
+        self.assertEqual(chunking._section_title("en", "programs"), "Study programs")

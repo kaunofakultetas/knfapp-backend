@@ -57,6 +57,15 @@ from django.db import models
 # stamp went stale (the site stopped serving them) while
 # past events stay as history until retention.
 #
+# lecture_type holds the event's type as the site names it
+# and, after a "|", the subgroups it names — "Pratybos|1",
+# "Egzaminas", "" for rows stored before the scraper read
+# types. It rides the natural key, yet a slot keeps ONE row:
+# the scraper merges feeds on (date, times, title, room) and
+# relabels in place (schedule_scraper.join_lecture_type /
+# split_lecture_type own the format; the events route splits
+# it into lectureType + subgroups).
+#
 # Table: schedule_events
 ############################################################
 

@@ -46,13 +46,38 @@
 #  semesters leave through retention, not a purge, so last
 #  year's matching term stays browsable.
 #
+#  The event TYPE is the site's own word — the popover's
+#  "Tipas: Egzaminas, Privalomasis" (Paskaita, Pratybos,
+#  Egzaminas, …), else the "(EGZAMINAS)" marker printed
+#  after the subject link, else the feed's colour legend —
+#  and the "Pogrupiai: N" subgroups ride with it. Both live
+#  in schedule_events.lecture_type as "Kind|1,2" (see
+#  join_lecture_type): the column is already the natural
+#  key's fifth part, so no migration was needed, and the
+#  read side splits it back into two wire fields. The type
+#  is an ATTRIBUTE of the session, never its identity: one
+#  physical slot (date, times, title, room) is one event
+#  however the programmes' feeds label it ("Paskaita" in
+#  one, "Paskaitos ir seminarai" in another — _pick_kind
+#  settles it, an exam first). A slot's stored row is
+#  relabelled IN PLACE when its type or subgroups move, and
+#  a superseded copy on a slot the run confirmed is deleted
+#  even in the past, so no typing change can re-create
+#  events (new ids, a spurious "new lectures" push) or leave
+#  the fortnight of history the window re-reads doubled.
+#
 #  Every run is logged in scraper_runs (source
 #  'tvarkarasciai.vu.lt') with the lesson counts in the
 #  articles_found / articles_new columns the news scrapers
-#  named, and prunes run rows older than 30 days. The cron
-#  command runs it every 6 h, api/views.py exposes an admin
-#  trigger, and the rows flow on to the schedule views → the
-#  mobile schedule tab.
+#  named, and prunes run rows older than 30 days. A run
+#  that completed with group feeds it could not read (a
+#  dead feed, a body over the byte cap — refused whole,
+#  since half a JSON document is no timetable) names them
+#  in error_message, so a feed frozen at its last good copy
+#  shows on /api/scraper/status instead of in a log line.
+#  The cron command runs it every 6 h, api/views.py exposes
+#  an admin trigger, and the rows flow on to the schedule
+#  views → the mobile schedule tab.
 ############################################################
 
 
@@ -71,6 +96,7 @@ from bs4 import BeautifulSoup
 from django.db import connection, transaction
 
 from knfapp.common.timestamps import utc_now
+from knfapp.schedule.kinds import is_badge_kind
 from knfapp.schedule.models import (
     ScheduleEvent,
     ScheduleEventGroup,
@@ -133,8 +159,45 @@ _SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 # Retake exams, by the colour the site paints them. Compared
 # after _normalise_colour, so "#FF899D", "#ff899d" and
-# "rgb(255, 137, 157)" are the same value
+# "rgb(255, 137, 157)" are the same value. A feed whose own
+# event_colors legend names a retake colour adds it for that
+# feed (see _read_legend)
 _RETAKE_COLOURS = frozenset({"#ff899d"})
+
+# The largest live feed body is ~1.6 MB (a 22-week window of
+# ~900 events, ~1.9 KB of popover markup each) — the shared
+# 2 MB default left it 21% of headroom, and a JSON body cut
+# at the cap is unparsable anyway. The cap still exists: it
+# stops a runaway body, just not a growing semester
+FEED_MAX_BYTES = 8_000_000
+
+# The event_colors legend labels every feed may carry that
+# mean "an ordinary event" — no type to learn from them.
+# Compared casefolded
+_REGULAR_LEGEND_LABELS = frozenset({"įprastas įvykis"})
+
+# The legend labels the scraper understands — the regular
+# one plus the event types it has seen painted. Anything
+# else is a palette/legend change worth a WARNING, with the
+# colour and the label named (KNF-156: a zero retake count
+# alone carries no information). Compared casefolded
+_KNOWN_LEGEND_LABELS = _REGULAR_LEGEND_LABELS | frozenset({
+    "egzaminas", "perlaikymas", "atsiskaitymas", "konsultacija",
+    "kolokviumas", "koliokviumas", "įskaita",
+})
+
+# The parenthesised type marker the site prints after the
+# subject link — "(EGZAMINAS)", "(PERLAIKYMAS)" — upper-case
+# letters only, so a room like "(knf)" never reads as one
+_KIND_MARKER_RE = re.compile(r"\(\s*([A-ZĄČĘĖĮŠŲŪŽ][A-ZĄČĘĖĮŠŲŪŽ ]{2,}?)\s*\)")
+
+# "Pogrupiai: 1" / "Pogrupiai: 1, 2" — the tokens after the
+# label, up to the line's end
+_SUBGROUPS_RE = re.compile(r"Pogrupi\w*\s*:\s*([^\n<]*)", re.IGNORECASE)
+
+# The one character a type or subgroup never carries — the
+# separator inside lecture_type (see join_lecture_type)
+LECTURE_TYPE_SEPARATOR = "|"
 
 # The programme table, ORDER SIGNIFICANT: the first pattern
 # found in the name wins, so every compound programme has to
@@ -530,27 +593,218 @@ def _labelled_retake(event: dict) -> bool:
 
 
 ############################################################
-# _extract_title_text
+# _parse_title
 ############################################################
 #
-# The course title from the event's "title" field, which is
-# either plain text or the popover markup: with markup the
-# first <a>'s text wins, else the first line of the
-# flattened text. Returns "" for an empty title, which
-# scrape_group_schedule treats as "skip this event".
+# The event's "title" field → (subject, kind, subgroups).
+# The field is either plain text or the site's popover
+# markup:
+#
+#   <a data-showed_type="…Tipas: Egzaminas, Privalomasis…"
+#      data-subgroups="…Pogrupiai: 1…" …>Subject</a>
+#   (EGZAMINAS) Pogrupiai: 1<br>II k. kl. (knf)<br>
+#
+# The SUBJECT is the first <a>'s text (else the first line
+# of the flattened text) — "" means "skip this event". The
+# KIND is the first comma part of data-showed_type ("…,
+# Privalomasis" is the course status, not the type), else
+# the parenthesised marker in the text after the link,
+# capitalised ("EGZAMINAS" → "Egzaminas"). The SUBGROUPS
+# come from data-subgroups, else the "Pogrupiai:" text
+# after the link. Everything after the first <br> is the
+# room line and is never read here — a room "(knf)" must
+# not pass for a marker.
 #
 # Used by:
 #   - scrape_group_schedule (below)
 ############################################################
 
-def _extract_title_text(title_field: str) -> str:
-    if "<" in title_field:
-        soup = BeautifulSoup(title_field, "html.parser")
-        link = soup.find("a")
-        if link:
-            return link.get_text(strip=True)
-        return soup.get_text(strip=True).split("\n")[0].strip()
-    return title_field.strip()
+def _parse_title(title_field: str):
+    if "<" not in title_field:
+        return title_field.strip(), "", []
+
+    soup = BeautifulSoup(title_field, "html.parser")
+    link = soup.find("a")
+    if not link:
+        return soup.get_text(strip=True).split("\n")[0].strip(), "", []
+
+    title = link.get_text(strip=True)
+
+
+    # STEP 1: the structured attributes — BeautifulSoup hands
+    # them back entity-decoded, as markup of their own
+    # =======================================================
+    kind = _labelled_value(link.get("data-showed_type", ""), "Tipas").split(",")[0].strip()
+    subgroups = _split_subgroups(_labelled_value(link.get("data-subgroups", ""), "Pogrupiai"))
+
+
+    # STEP 2: the visible text between the link and the first
+    # <br> — the marker and the "Pogrupiai:" line live there
+    # =======================================================
+    tail = []
+    for node in link.next_siblings:
+        name = getattr(node, "name", None)
+        if name == "br":
+            break
+        # A tag contributes its text, a bare string itself
+        tail.append(node.get_text(" ") if name else str(node))
+    tail_text = " ".join(tail)
+
+    if not kind:
+        marker = _KIND_MARKER_RE.search(tail_text)
+        kind = marker.group(1).strip().capitalize() if marker else ""
+    if not subgroups:
+        found = _SUBGROUPS_RE.search(tail_text)
+        subgroups = _split_subgroups(found.group(1)) if found else []
+
+    return title, _clean_kind(kind), subgroups
+
+
+
+
+
+
+
+
+############################################################
+# _labelled_value / _split_subgroups / _clean_kind
+############################################################
+#
+# The small text shapers behind _parse_title: a popover
+# attribute ("<span><strong>Tipas: </strong>Pratybos,
+# Privalomasis</span>") flattened with its "Label:" prefix
+# stripped; a subgroup list ("1, 2" / "1;2") split into
+# tokens in natural order ("2" before "10"); a kind with
+# whitespace collapsed and the lecture_type separator
+# replaced, so the stored value always splits back cleanly.
+#
+# Used by:
+#   - _parse_title (above), join_lecture_type (below)
+############################################################
+
+def _labelled_value(markup: str, label: str) -> str:
+    if not markup:
+        return ""
+    text = BeautifulSoup(markup, "html.parser").get_text(" ", strip=True) if "<" in markup else markup
+    return re.sub(rf"^\s*{label}\w*\s*:\s*", "", text, flags=re.IGNORECASE).strip()
+
+
+def _split_subgroups(raw) -> list:
+    tokens = raw if isinstance(raw, (list, tuple, set, frozenset)) else re.split(r"[,;]", raw or "")
+    cleaned = {re.sub(r"\s+", " ", str(token)).strip().replace(LECTURE_TYPE_SEPARATOR, "/")
+               for token in tokens}
+    return sorted((token for token in cleaned if token),
+                  key=lambda token: (not token.isdigit(), int(token) if token.isdigit() else 0, token))
+
+
+def _clean_kind(kind: str) -> str:
+    return re.sub(r"\s+", " ", kind or "").strip().replace(LECTURE_TYPE_SEPARATOR, "/")
+
+
+
+
+
+
+
+
+############################################################
+# join_lecture_type / split_lecture_type
+############################################################
+#
+# The one format schedule_events.lecture_type is written in:
+# the event's kind, then — only when the event names its
+# subgroups — "|" and the subgroups comma-joined in natural
+# order: "Pratybos|1", "Egzaminas|1,2", "Paskaita", "" (no
+# type known — every row stored before the scraper read
+# types). split_lecture_type is the exact inverse, and
+# tolerates anything: a value without "|" is all kind.
+#
+# Used by:
+#   - scrape_group_schedule / _sync_schedule / _upsert_event
+#     (below) — writing and merging
+#   - schedule/api/views.py — get_schedule_events splits it
+#     into the lectureType + subgroups wire fields
+############################################################
+
+def join_lecture_type(kind: str, subgroups=()) -> str:
+    kind = _clean_kind(kind)
+    groups = _split_subgroups(list(subgroups))
+    return f"{kind}{LECTURE_TYPE_SEPARATOR}{','.join(groups)}" if groups else kind
+
+
+def split_lecture_type(value: str):
+    kind, separator, rest = (value or "").partition(LECTURE_TYPE_SEPARATOR)
+    return kind.strip(), (_split_subgroups(rest) if separator else [])
+
+
+
+
+
+
+
+
+############################################################
+# _pick_kind
+############################################################
+#
+# The one type a slot is stored under when its feeds disagree
+# — every programme's feed types the SAME session its own way
+# ("Paskaita" for one, "Paskaitos ir seminarai" for another).
+# A badge type (an exam, a retake, an assessment, a
+# consultation — schedule/kinds.py is_badge_kind) wins
+# outright: a student must never see an exam as a lecture
+# because a second feed said so. Otherwise
+# the type most feeds give, and on a tie the first by text —
+# deterministic, so an unchanged timetable never flips its
+# rows between two runs. "" when no feed names one.
+#
+# Used by:
+#   - scrape_group_schedule (below) — one feed's slot
+#   - _sync_schedule (below) — every feed's view of a slot
+############################################################
+
+def _pick_kind(kinds) -> str:
+    counts = {}
+    for kind in kinds:
+        if kind:
+            counts[kind] = counts.get(kind, 0) + 1
+    if not counts:
+        return ""
+    return sorted(counts, key=lambda kind: (not is_badge_kind(kind), -counts[kind], kind.casefold()))[0]
+
+
+
+
+
+
+
+
+############################################################
+# _read_legend
+############################################################
+#
+# The feed's own event_colors legend ({"#FFC2CC":
+# "EGZAMINAS", "#F1F1F1": "Įprastas įvykis"}) with every
+# colour normalised like the events' own — the authority on
+# what a colour MEANS in this feed. A group without exams
+# serves only the regular entry, so the legend is per feed
+# and never a global palette. Anything that is not a plain
+# colour → label mapping reads as an empty legend.
+#
+# Used by:
+#   - scrape_group_schedule (below) — per-feed retake
+#     colours and the kind fallback
+############################################################
+
+def _read_legend(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    legend = {}
+    for colour, label in raw.items():
+        normalised = _normalise_colour(colour)
+        if normalised and isinstance(label, str) and label.strip():
+            legend[normalised] = re.sub(r"\s+", " ", label).strip()
+    return legend
 
 
 
@@ -689,34 +943,44 @@ def scrape_group_list() -> list[dict]:
 #
 # One GET of the group's FullCalendar feed for
 # [start_date, end_date] (ISO dates), flattened to
-# (lessons, stats): the weekly lesson dicts
+# (lessons, stats): the dated lesson dicts
 # scrape_knf_schedule inserts, plus a count of everything
-# dropped on the way and the colour histogram behind it.
-# Dropped: all-day events (no "T" in start — holidays),
-# retake exams, events whose dates don't parse, and events
-# with an empty title. Lecturer and room come from the
-# top-level "instructor"/"location" fields, falling back to
-# the popover markup only when the title carries HTML.
+# dropped on the way, the colour and kind histograms, and
+# the feed's own colour legend. Dropped: all-day events (no
+# "T" in start — holidays), retake exams, events whose dates
+# don't parse, and events with an empty title. Lecturer and
+# room come from the top-level "instructor"/"location"
+# fields, falling back to the popover markup only when the
+# title carries HTML.
 #
 # A retake is recognised by its NORMALISED colour (so
 # "#FF899D", "#ff899d" and "rgb(255,137,157)" are one
-# value), by a structured retake/type field, or by the
-# PERLAIKYMAS label — and a labelled retake wearing an
-# unknown colour logs a WARNING, which is what makes a
-# palette change visible before it imports exams as weekly
-# lessons.
+# value) — _RETAKE_COLOURS plus any colour this feed's
+# legend labels a retake — by a structured retake/type
+# field, or by the PERLAIKYMAS label; a labelled retake
+# wearing an unknown colour logs a WARNING, which is what
+# makes a palette change visible before it imports exams as
+# weekly lessons.
+#
+# Every lesson carries its KIND and SUBGROUPS (_parse_title,
+# the legend label as the kind's last resort) joined into
+# lecture_type. The body is fetched under FEED_MAX_BYTES and
+# REFUSED when it runs past it: a JSON body cut at the cap
+# would only raise a baffling JSONDecodeError further down.
 #
 # The slug is validated against _SLUG_RE and percent-encoded
 # before it is interpolated into the feed URL; a malformed
 # one raises and the caller skips the group.
 #
 # Every event keeps its DATE plus "HH:MM" times — one dict
-# per dated occurrence, deduped only against the feed
-# serving the same instance twice (the natural key, teacher
-# excluded). A one-off room change is simply a different
-# row on that one date, which is the whole point of the
-# dated model. Raises on HTTP/JSON failure — the caller
-# logs and skips the group.
+# per dated occurrence and kind, deduped only against the
+# feed serving the same instance twice (the natural key,
+# teacher excluded) — two subgroups sitting the same slot
+# in the same room are ONE session, their subgroups
+# unioned. A one-off room change is simply a different row
+# on that one date, which is the whole point of the dated
+# model. Raises on HTTP/JSON failure — the caller logs and
+# skips the group.
 #
 # Used by:
 #   - scrape_knf_schedule (below) — once per group
@@ -732,29 +996,43 @@ def scrape_group_schedule(slug: str, group_display_name: str,
 
     url = EVENT_URL_TEMPLATE.format(slug=quote(slug, safe=""))
     # The feed sometimes arrives declared as text/html, so both
-    # content types are accepted; the body is JSON either way
+    # content types are accepted; the body is JSON either way.
+    # A body past the cap comes back as None, never cut short
     result = fetch(url, SCHEDULE_HOSTS,
                    params={"start": start_date, "end": end_date},
-                   content_types=JSON_CONTENT_TYPES + HTML_CONTENT_TYPES)
+                   content_types=JSON_CONTENT_TYPES + HTML_CONTENT_TYPES,
+                   max_bytes=FEED_MAX_BYTES, allow_truncated=False)
     if not result:
-        raise RuntimeError(f"Could not fetch the event feed for {slug}")
+        raise RuntimeError(f"Could not fetch the event feed for {slug} "
+                           f"(refused, unreachable, or over {FEED_MAX_BYTES} bytes)")
 
     data = json.loads(result[0])
     events = data.get("events", [])
 
+    # The feed's own colour legend: a colour it names a retake
+    # joins the retake set for this feed
+    legend = _read_legend(data.get("event_colors"))
+    retake_colours = _RETAKE_COLOURS | {colour for colour, label in legend.items()
+                                        if "PERLAIKYM" in label.upper()}
+
     group_name = _parse_group_display_name(slug, group_display_name)
 
-    lessons_seen = set()  # natural keys — a feed serving one event twice collapses here
-    lessons = []
-    # What the run threw away and why — a filter that silently
-    # stops matching is otherwise indistinguishable from a
-    # semester without retakes
+    # (date, times, title, room) → the lesson dict, its
+    # subgroup set and the types it was served under — a feed
+    # serving one event twice, or two subgroups sitting one
+    # session, collapses here
+    lessons_by_key: dict = {}
+    # What the run threw away and why, what it kept by kind,
+    # and the legend it read — a filter that silently stops
+    # matching is otherwise indistinguishable from a semester
+    # without retakes
     stats = {"events": len(events), "all_day": 0, "retakes": 0,
-             "unparsable": 0, "untitled": 0, "colours": {}}
+             "unparsable": 0, "untitled": 0, "colours": {}, "kinds": {},
+             "legend": legend}
 
 
-    # STEP 2: one weekly lesson dict per distinct event shape
-    # =======================================================
+    # STEP 2: one dated lesson per distinct event and kind
+    # ====================================================
     for event in events:
         # A NULL start is not the same as an absent one: `"T" not
         # in None` raises TypeError, which would escape the whole
@@ -776,11 +1054,11 @@ def scrape_group_schedule(slug: str, group_display_name: str,
             stats["colours"][colour] = stats["colours"].get(colour, 0) + 1
 
         labelled_retake = _labelled_retake(event)
-        if colour in _RETAKE_COLOURS or labelled_retake:
+        if colour in retake_colours or labelled_retake:
             stats["retakes"] += 1
             # The label without the colour is the palette change
             # this filter has to survive
-            if labelled_retake and colour and colour not in _RETAKE_COLOURS:
+            if labelled_retake and colour and colour not in retake_colours:
                 logger.warning("Retake event painted %s, not a known retake colour — "
                                "the palette has probably changed", colour)
             continue
@@ -799,13 +1077,19 @@ def scrape_group_schedule(slug: str, group_display_name: str,
         # Labelled per event, not per run — see _get_semester_label
         semester = _get_semester_label(start_dt)
 
-        # Null-safe for the same reason start is: _extract_title_
-        # text tests `"<" in title_field`, which raises on None
+        # Null-safe for the same reason start is: _parse_title
+        # tests `"<" in title_field`, which raises on None. The
+        # legend names the kind only when the popover and the
+        # marker both stayed silent, and never "Įprastas įvykis"
         raw_title = event.get("title") or ""
-        title = _extract_title_text(raw_title)
+        title, kind, subgroups = _parse_title(raw_title)
         if not title:
             stats["untitled"] += 1
             continue
+        if not kind:
+            label = legend.get(colour, "")
+            if label and label.casefold() not in _REGULAR_LEGEND_LABELS:
+                kind = _clean_kind(label.capitalize())
 
         # Top-level fields first; the popover markup is only
         # consulted when the title actually carries HTML. A null
@@ -826,26 +1110,39 @@ def scrape_group_schedule(slug: str, group_display_name: str,
         if teacher:
             teacher = teacher.strip().rstrip(",").strip()
 
-        # The DATED natural key — teacher is deliberately not in
-        # it, matching idx_schedule_events_natural: a teacher swap
-        # is the same event
-        key = (start_dt.date(), time_start, time_end, title, "", room)
-        if key in lessons_seen:
+        # The physical SLOT — teacher is deliberately not in it
+        # (a teacher swap is the same event), and neither is the
+        # type or the subgroup: a second subgroup in the same
+        # slot and room joins the session instead of becoming a
+        # twin row, and a type is the session's attribute
+        key = (start_dt.date(), time_start, time_end, title, room)
+        held = lessons_by_key.get(key)
+        if held is not None:
+            held[1].update(subgroups)
+            held[2].append(kind)
             continue
-        lessons_seen.add(key)
 
-        lessons.append({
+        lessons_by_key[key] = ({
             "title": title,
             "teacher": teacher,
             "room": room,
-            "lecture_type": "",
             "date": start_dt.date(),
             "time_start": time_start,
             "time_end": time_end,
             "group_name": group_name,
             "slug": slug,
             "semester": semester,
-        })
+        }, set(subgroups), [kind])
+
+
+    # STEP 3: the slot's type and its unioned subgroups into
+    # the one stored lecture_type, in first-seen order
+    # ======================================================
+    lessons = []
+    for lesson, subgroups, kinds in lessons_by_key.values():
+        kind = _pick_kind(kinds)
+        stats["kinds"][kind] = stats["kinds"].get(kind, 0) + 1
+        lessons.append({**lesson, "lecture_type": join_lecture_type(kind, subgroups)})
 
     return lessons, stats
 
@@ -896,7 +1193,18 @@ def scrape_group_schedule(slug: str, group_display_name: str,
 # A group that fails to scrape is logged and skipped, and
 # because only groups in groups_ok may retire anything, its
 # stored schedule is left alone rather than emptied. Only a
-# failed group LIST fails the run.
+# failed group LIST fails the run — but a run that completes
+# without some feeds (failed, or never reached before the
+# deadline) says so in its error_message, naming them: a
+# feed failing every run would otherwise freeze its group's
+# timetable at the last good copy with nothing on /status.
+#
+# The per-run log line carries the drop counts, the colour
+# and kind histograms and the legend vocabulary; a legend
+# label the scraper does not know is a WARNING naming the
+# colour and the label — the palette-change alarm, fed by
+# the site's own legend rather than a retake counter whose
+# healthy value is already zero.
 #
 # Used by:
 #   - management/commands/scrape_schedule.py — every 6 h
@@ -972,9 +1280,15 @@ def _run(run_id, forward_weeks, notify, deadline):
         groups_scraped = 0
         # What every group's feed threw away, summed — the only
         # place a broken retake filter or a dead title selector
-        # becomes visible
+        # becomes visible — plus what it kept by kind and every
+        # legend entry any feed served
         dropped = {"all_day": 0, "retakes": 0, "unparsable": 0, "untitled": 0}
         colours: dict = {}
+        kinds: dict = {}
+        legend: dict = {}
+        # Slugs whose feed raised — named in the run's note
+        failed: list = []
+        attempted = 0
 
         for group in groups:
             if deadline_passed(deadline):
@@ -983,22 +1297,29 @@ def _run(run_id, forward_weeks, notify, deadline):
 
             slug = group["slug"]
             display_name = group["display_name"]
+            attempted += 1
 
             # STEP 4.1: a failing group is logged and skipped, never fatal
             try:
                 lessons, stats = scrape_group_schedule(slug, display_name, start_date, end_date)
             except Exception:
                 logger.warning("Failed to scrape group %s", slug, exc_info=True)
+                failed.append(slug)
                 continue
 
             groups_scraped += 1
             total_lessons += len(lessons)
 
             # STEP 4.1.1: fold this group's drop counts into the run's
+            # (the kind/legend keys are read with .get — a stats dict
+            # from before they existed must still fold)
             for key in dropped:
                 dropped[key] += stats[key]
             for colour, count in stats["colours"].items():
                 colours[colour] = colours.get(colour, 0) + count
+            for kind, count in stats.get("kinds", {}).items():
+                kinds[kind] = kinds.get(kind, 0) + count
+            legend.update(stats.get("legend", {}))
 
             # STEP 4.2: remember the healthy fetch — only feeds in
             # groups_ok may retire events and links in the write
@@ -1025,10 +1346,26 @@ def _run(run_id, forward_weeks, notify, deadline):
             return {"groups_scraped": groups_scraped, "lessons_found": 0, "lessons_new": 0,
                     "error": message, "runId": run_id}
 
-        # One line per run with everything the filters removed and
-        # the colours behind it — a retake filter that stops
-        # matching shows up as retakes dropping to zero
-        logger.info("Schedule scrape filters: dropped=%s, colours=%s", dropped, colours)
+        # One line per run with everything the filters removed,
+        # the colours and kinds behind it and the legend served.
+        # Retakes are 0 on a healthy run too (none published most
+        # of the year), so the ALARM is the legend: a label the
+        # scraper does not know names its colour, and a legend
+        # retake colour missing from _RETAKE_COLOURS says the
+        # constant went stale (the feed's own legend still steers
+        # the filter meanwhile)
+        logger.info("Schedule scrape filters: dropped=%s, colours=%s, kinds=%s, legend=%s",
+                    dropped, colours, kinds, legend)
+        unknown = {colour: label for colour, label in legend.items()
+                   if label.casefold() not in _KNOWN_LEGEND_LABELS}
+        if unknown:
+            logger.warning("Timetable legend carries label(s) the scraper does not know: %s — "
+                           "events painted so import as their popover type", unknown)
+        stale_retake = sorted(colour for colour, label in legend.items()
+                              if "PERLAIKYM" in label.upper() and colour not in _RETAKE_COLOURS)
+        if stale_retake:
+            logger.warning("Timetable legend paints retakes %s, not %s — update _RETAKE_COLOURS",
+                           stale_retake, sorted(_RETAKE_COLOURS))
 
 
         # STEP 5: drop stray semester labels — a handful of
@@ -1060,9 +1397,10 @@ def _run(run_id, forward_weeks, notify, deadline):
 
 
         # STEP 8: close the run row — the lesson counts go into
-        # the articles_found / articles_new columns — and prune
-        # =====================================================
-        close_run(run_id, total_lessons, total_new)
+        # the articles_found / articles_new columns, the feeds it
+        # could not read into the note — and prune
+        # =======================================================
+        close_run(run_id, total_lessons, total_new, _missing_feeds_note(failed, len(groups) - attempted))
 
         # A run that still 'completed' but harvested a tenth of
         # what the last one did gets its own ERROR line
@@ -1120,6 +1458,41 @@ def _run(run_id, forward_weeks, notify, deadline):
 
 
 
+
+
+############################################################
+# _missing_feeds_note
+############################################################
+#
+# The error_message a COMPLETED run carries when it did not
+# read every group feed, or None when it did: how many feeds
+# failed (the first MAX_NAMED slugs named, so the note stays
+# one readable line) and how many the deadline never
+# reached. Both keep their stored schedule untouched — the
+# note is what tells an admin that "untouched" may by now
+# mean "stale".
+#
+# Used by:
+#   - _run (above) — STEP 8
+############################################################
+
+def _missing_feeds_note(failed: list, unattempted: int):
+    max_named = 8
+    parts = []
+    if failed:
+        named = ", ".join(failed[:max_named]) + (", …" if len(failed) > max_named else "")
+        parts.append(f"{len(failed)} group feed(s) failed and kept their last good copy: {named}")
+    if unattempted > 0:
+        parts.append(f"{unattempted} group feed(s) not reached before the run's deadline")
+    return "; ".join(parts) or None
+
+
+
+
+
+
+
+
 ############################################################
 # _upsert_event
 ############################################################
@@ -1132,11 +1505,25 @@ def _run(run_id, forward_weeks, notify, deadline):
 # new or a year old. Answers (event_id, created); the
 # SELECT instead of RETURNING keeps the SQL portable.
 #
+# Before the insert, a slot whose EXACT row is missing but
+# which holds a twin — same date, times, title and room, not
+# already claimed by another event of this run — has that
+# twin RELABELLED in place (the untyped legacy row first):
+# the rows stored before the scraper read types ('') take
+# their type on the first typed run, and a session whose
+# type or subgroup set moved keeps its id, instead of being
+# re-created (a "new lectures" push for nothing) or
+# duplicated (the window's fortnight of past rows is never
+# retired). A run holds ONE event per slot (_sync_schedule
+# merges on it), so any unclaimed row there is this event's
+# own earlier copy. `claimed` holds the ids the run has
+# upserted so far.
+#
 # Used by:
 #   - _sync_schedule (below) — once per merged event
 ############################################################
 
-def _upsert_event(cursor, event: dict, run_stamp):
+def _upsert_event(cursor, event: dict, run_stamp, claimed=frozenset()):
     key = (event["date"], event["time_start"], event["time_end"],
            event["title"], event["lecture_type"], event["room"])
     # Raw SQL must store stamps in the exact form the ORM
@@ -1144,6 +1531,29 @@ def _upsert_event(cursor, event: dict, run_stamp):
     # keeps its "+00:00" suffix and breaks every <=> filter
     run_stamp = connection.ops.adapt_datetimefield_value(run_stamp)
 
+
+    # STEP 1: relabel an unclaimed twin on the slot when the
+    # exact row is missing — the legacy '' row first
+    # ======================================================
+    cursor.execute(
+        """SELECT id, lecture_type FROM schedule_events
+           WHERE date = %s AND time_start = %s AND time_end = %s
+             AND title = %s AND room = %s""",
+        (event["date"], event["time_start"], event["time_end"], event["title"], event["room"]),
+    )
+    slot_rows = cursor.fetchall()
+    if not any(stored == event["lecture_type"] for _id, stored in slot_rows):
+        twins = sorted(
+            ((row_id, stored) for row_id, stored in slot_rows if row_id not in claimed),
+            key=lambda row: (row[1] != "", row[1], row[0]),
+        )
+        if twins:
+            cursor.execute("UPDATE schedule_events SET lecture_type = %s WHERE id = %s",
+                           (event["lecture_type"], twins[0][0]))
+
+
+    # STEP 2: insert-or-confirm on the full natural key
+    # =================================================
     cursor.execute(
         """INSERT INTO schedule_events
            (id, title, lecture_type, teacher, room, date, time_start,
@@ -1179,15 +1589,58 @@ def _upsert_event(cursor, event: dict, run_stamp):
 
 
 ############################################################
+# _superseded_copies
+############################################################
+#
+# The ids of rows sitting on a slot the run confirmed that
+# the run did NOT confirm (last_seen_at before its stamp,
+# not among `claimed`) — a slot is one physical session, so
+# such a row is a superseded copy of the confirmed event.
+# Read by DATE, a couple of hundred days per query, then
+# matched on the full slot in Python — a handful of queries
+# however many slots.
+#
+# Used by:
+#   - _sync_schedule (below) — STEP 3.1
+############################################################
+
+def _superseded_copies(slots, claimed, run_stamp) -> list:
+    wanted = set(slots)
+    dates = sorted({slot[0] for slot in wanted})
+    copies = []
+    for i in range(0, len(dates), 200):
+        rows = ScheduleEvent.objects.filter(
+            date__in=dates[i:i + 200], last_seen_at__lt=run_stamp,
+        ).values_list("id", "date", "time_start", "time_end", "title", "room")
+        for row_id, *slot in rows:
+            if tuple(slot) in wanted and row_id not in claimed:
+                copies.append(row_id)
+    return copies
+
+
+
+
+
+
+
+
+############################################################
 # _sync_schedule
 ############################################################
 #
 # The whole write phase, called inside one
 # transaction.atomic(). Merges the per-group dicts on the
-# natural key (the same lecture reached through two feeds
-# becomes ONE event with two group links), inserts-or-
-# confirms events, teachers and links with the run's stamp,
-# then retires what the healthy feeds stopped serving:
+# physical SLOT (date, times, title, room) — the same
+# lecture reached through two feeds becomes ONE event with
+# two group links, the union of their subgroups and the type
+# _pick_kind settles — inserts-or-confirms events
+# (relabelling the slot's earlier copy in place, see
+# _upsert_event), teachers and links with the run's stamp,
+# deletes a superseded copy left on a slot the run
+# confirmed — past or future, as long as every group that
+# links it answered this run (a failed feed's claim is never
+# judged) — then retires what the healthy feeds stopped
+# serving:
 #
 #   - a stale link whose GROUP answered this run is deleted
 #     alone — the lecture moved out of that feed; a failed
@@ -1223,20 +1676,27 @@ def _sync_schedule(scraped: list, groups_ok: dict, run_stamp):
         )
 
 
-    # STEP 2: merge the per-group dicts on the natural key
-    # ====================================================
+    # STEP 2: merge the per-group dicts on the physical slot,
+    # the subgroups unioned and the feeds' types settled
+    # =======================================================
     merged: dict = {}
     for lesson in scraped:
+        kind, subgroups = split_lecture_type(lesson["lecture_type"])
         key = (lesson["date"], lesson["time_start"], lesson["time_end"],
-               lesson["title"], lesson["lecture_type"], lesson["room"])
+               lesson["title"], lesson["room"])
         entry = merged.get(key)
         if entry is None:
-            entry = merged[key] = {**lesson, "slugs": set()}
+            entry = merged[key] = {**lesson, "slugs": set(), "subgroups": set(), "kinds": []}
         entry["slugs"].add(lesson["slug"])
+        entry["subgroups"].update(subgroups)
+        entry["kinds"].append(kind)
         # The first non-empty teacher wins — feeds rarely disagree,
         # and '' must never overwrite a name
         if not entry["teacher"] and lesson["teacher"]:
             entry["teacher"] = lesson["teacher"]
+
+    for entry in merged.values():
+        entry["lecture_type"] = join_lecture_type(_pick_kind(entry["kinds"]), entry["subgroups"])
 
 
     # STEP 3: insert-or-confirm events, teachers and links
@@ -1244,10 +1704,14 @@ def _sync_schedule(scraped: list, groups_ok: dict, run_stamp):
     added = 0
     teacher_ids: dict = {}
     confirmed_ids: list = []
+    # The same ids as a set — _upsert_event must never relabel
+    # a row an earlier event of this run already claimed
+    claimed: set = set()
     with connection.cursor() as cursor:
         for event in merged.values():
-            event_id, created = _upsert_event(cursor, event, run_stamp)
+            event_id, created = _upsert_event(cursor, event, run_stamp, claimed)
             confirmed_ids.append(event_id)
+            claimed.add(event_id)
             if created:
                 added += 1
 
@@ -1273,6 +1737,22 @@ def _sync_schedule(scraped: list, groups_ok: dict, run_stamp):
                 )
 
 
+    # STEP 3.1: the superseded copies — a row the run did NOT
+    # confirm, on a slot it did, is that slot's older copy (the
+    # split an earlier typing left); gone past or future, once
+    # every group linking it answered this run
+    superseded = _superseded_copies(merged.keys(), claimed, run_stamp)
+    guarded = set()
+    for i in range(0, len(superseded), 500):
+        guarded.update(
+            ScheduleEventGroup.objects.filter(event_id__in=superseded[i:i + 500])
+            .exclude(group_id__in=groups_ok.keys()).values_list("event_id", flat=True)
+        )
+    judged = sorted(set(superseded) - guarded)
+    for i in range(0, len(judged), 500):
+        ScheduleEvent.objects.filter(id__in=judged[i:i + 500]).delete()
+
+
     # STEP 4: retire what the healthy feeds stopped serving —
     # future only; the past is outside every feed's window and
     # its links are history, not staleness. Confirmed ids are
@@ -1292,7 +1772,7 @@ def _sync_schedule(scraped: list, groups_ok: dict, run_stamp):
         date__gte=today, last_seen_at__lt=run_stamp,
         scheduleeventgroup__isnull=True,
     ).delete()
-    removed = by_model.get("schedule.ScheduleEvent", 0)
+    removed = by_model.get("schedule.ScheduleEvent", 0) + len(judged)
 
 
     # STEP 5: retention — the past goes at RETENTION_DAYS, and

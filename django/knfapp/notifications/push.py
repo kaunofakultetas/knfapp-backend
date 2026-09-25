@@ -21,15 +21,23 @@
 #               MessageRateExceeded) that are otherwise
 #               invisible
 #
-#  The receipt queue is IN MEMORY in the process that sent —
-#  a cron tick is a DIFFERENT process whose copy of the
-#  queue would always be empty, so the poll clock lives
-#  beside the queue instead: the first queued ticket
-#  arms one daemon watcher thread in this process, which
-#  wakes every 15 minutes, trades what is due, and exits
-#  once the queue is empty (the next send re-arms it).
-#  Losing the queue on restart is acceptable — receipts are
-#  diagnostics, not state.
+#  The receipt queue is a small JSON file every process in
+#  the container shares — the server AND each cron command
+#  that fans out (scrape_news, scrape_schedule): a queue in
+#  one process's memory died with the command that filled
+#  it, ~899 s before its first poll, so the largest
+#  broadcasts never had a receipt read. Threads serialize on
+#  a lock, processes on an flock beside the file. Two clocks
+#  drain it: the first ticket a process queues arms one
+#  daemon watcher thread there, which wakes every 15
+#  minutes, trades what is due FOR EVERY PROCESS, and exits
+#  once the file is empty; and `manage.py poll_push_receipts`
+#  does the same pass for a cron line. An id Expo has no
+#  verdict for yet, or whose slice failed, goes back for
+#  another round (three at most) instead of being thrown
+#  away. Where the file cannot be written the queue falls
+#  back to this process's memory, as it always was —
+#  receipts are diagnostics, not state.
 #
 #  Transport rules — one module-level requests.Session with
 #  TWO retry policies, mounted by endpoint:
@@ -82,17 +90,27 @@
 
 
 import hashlib
+import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+
+# The cross-process lock on the receipt store — POSIX only; a
+# platform without it keeps the thread lock alone
+try:
+    import fcntl
+except ImportError:  # pragma: no cover — the backend runs on Linux
+    fcntl = None
 
 import requests
 from requests.adapters import HTTPAdapter, Retry
 
+from django.conf import settings
 from django.db import close_old_connections, connection
 from django.db.models import Exists, OuterRef
 
@@ -141,12 +159,34 @@ _SLICE_INTERVAL = 0.2
 _pace_lock = threading.Lock()
 _last_slice_at = 0.0
 
-# Tickets waiting for their receipt: (ticket id, token,
-# monotonic stamp), bounded and in memory only (the module
-# banner tells why)
+# Tickets waiting for their receipt: [ticket id, token,
+# queued-at epoch seconds, tries] rows in a JSON file every
+# process in the container shares (the module banner tells
+# why), bounded — past the cap the oldest go first. A ticket
+# is traded for its receipt once it is this old (s)
 _RECEIPT_DELAY = 900
-_receipt_queue = deque(maxlen=20000)
-_receipt_lock = threading.Lock()
+_RECEIPT_STORE_CAP = 20000
+
+# The store's file name inside the temp dir, unless the
+# PUSH_RECEIPT_STORE setting (or env var) names a path
+_RECEIPT_STORE_NAME = "knfapp-push-receipts.json"
+
+# An id Expo answered nothing for — or whose slice failed —
+# rides again, this many rounds in all; an id older than
+# this (s) is never asked about (Expo keeps receipts ~24 h)
+_RECEIPT_MAX_TRIES = 3
+_RECEIPT_MAX_AGE = 20 * 3600
+
+# Threads of one process serialize the store on this — re-
+# entrant, because the watcher's exit check holds it across
+# a store read; processes serialize on an flock beside it
+_receipt_lock = threading.RLock()
+
+# The queue when the store file cannot be used: this
+# process's memory, the pre-file behaviour; the flag keeps
+# the warning to one line per process
+_receipt_memory: list = []
+_receipt_store_failed = False
 
 # The lazily-armed per-process receipts watcher (see the
 # module banner); the flag lives under _receipt_lock
@@ -294,35 +334,193 @@ def _pace_slice():
 
 
 ############################################################
-# _queue_receipt / _receipt_watcher
+# _receipt_store_path
 ############################################################
 #
-# _queue_receipt parks one accepted ticket for the receipt
-# poll and arms the watcher when none is alive: a daemon
-# thread that sleeps the poll interval, trades what is due,
-# and exits once the queue drains (the flag clears so the
-# next send starts a fresh one). The deque is bounded, so a
-# flood of sends drops the oldest ids instead of growing
-# without limit, and it never touches the database on the
-# way in.
+# Where the shared receipt queue lives: the
+# PUSH_RECEIPT_STORE setting, else the same-named env var,
+# else a file in the temp dir — every process in the
+# container (the server and each `docker exec` cron command)
+# sees the same /tmp. Read per call, so a test can point it
+# at its own file.
 #
 # Used by:
-#   - send_push_notification, _send_slice (below)
+#   - _with_receipt_queue (below)
 ############################################################
 
-def _queue_receipt(ticket_id, token: str):
+def _receipt_store_path() -> str:
+    configured = getattr(settings, "PUSH_RECEIPT_STORE", None) or os.environ.get("PUSH_RECEIPT_STORE")
+    return configured or os.path.join(tempfile.gettempdir(), _RECEIPT_STORE_NAME)
+
+
+
+
+
+
+
+
+############################################################
+# _read_receipt_store
+############################################################
+#
+# The store's rows, or [] for a missing or unreadable file
+# (a torn write, a hand edit): a row that is not the
+# [id, token, queued-at, tries] shape is dropped, never
+# trusted. OSError alone escapes — that is the caller's cue
+# to fall back to memory.
+#
+# Used by:
+#   - _with_receipt_queue (below)
+############################################################
+
+def _read_receipt_store(path: str) -> list:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except ValueError:
+        logger.warning("Push receipt store unreadable — starting it afresh")
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [
+        [row[0], row[1], float(row[2]), int(row[3])]
+        for row in raw
+        if isinstance(row, list) and len(row) == 4
+        and isinstance(row[0], str) and isinstance(row[1], str)
+        and isinstance(row[2], (int, float)) and isinstance(row[3], int)
+    ]
+
+
+
+
+
+
+
+
+############################################################
+# _write_receipt_store
+############################################################
+#
+# Writes the rows through a temp file and an atomic rename,
+# so a process killed mid-write leaves the previous store,
+# never half of one.
+#
+# Used by:
+#   - _with_receipt_queue (below)
+############################################################
+
+def _write_receipt_store(path: str, rows: list) -> None:
+    scratch = f"{path}.tmp"
+    with open(scratch, "w", encoding="utf-8") as fh:
+        json.dump(rows, fh)
+    os.replace(scratch, path)
+
+
+
+
+
+
+
+
+############################################################
+# _with_receipt_queue
+############################################################
+#
+# Runs mutate(rows) on the queue under both locks — the
+# thread lock, then an flock on "<store>.lock" — and writes
+# the rows back, capped to the newest _RECEIPT_STORE_CAP.
+# mutate edits the list in place and returns what the
+# caller needs. When the file cannot be used the same call
+# runs on this process's memory instead, with one warning
+# per process — the queue degrades to what it always was,
+# it never fails a send.
+#
+# Used by:
+#   - _queue_receipts, _receipt_watcher,
+#     pending_push_receipts, poll_push_receipts (below)
+############################################################
+
+def _with_receipt_queue(mutate):
+    global _receipt_store_failed
+
+    with _receipt_lock:
+        path = _receipt_store_path()
+        try:
+            with open(f"{path}.lock", "a", encoding="utf-8") as lock_file:
+                if fcntl is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX)
+                rows = _read_receipt_store(path)
+                result = mutate(rows)
+                _write_receipt_store(path, rows[-_RECEIPT_STORE_CAP:])
+                return result
+        except OSError:
+            if not _receipt_store_failed:
+                _receipt_store_failed = True
+                logger.warning("Push receipt store %s unusable — queueing receipts in memory", path)
+            result = mutate(_receipt_memory)
+            del _receipt_memory[:-_RECEIPT_STORE_CAP]
+            return result
+
+
+
+
+
+
+
+
+############################################################
+# _queue_receipts
+############################################################
+#
+# Parks accepted tickets for the receipt poll — one store
+# write per call, so a slice of 100 is one write, not a
+# hundred — and arms this process's watcher when none is
+# alive. Tickets without an id are skipped (nothing to ask
+# Expo about).
+#
+# Used by:
+#   - _park_receipts (below) — every sender's parking
+############################################################
+
+def _queue_receipts(accepted) -> None:
     global _receipt_watcher_alive
 
-    if not ticket_id:
+    now = time.time()
+    fresh = [[ticket_id, token, now, 0] for ticket_id, token in accepted if ticket_id and token]
+    if not fresh:
         return
 
     with _receipt_lock:
-        _receipt_queue.append((ticket_id, token, time.monotonic()))
+        _with_receipt_queue(lambda rows: rows.extend(fresh))
         if not _receipt_watcher_alive:
             _receipt_watcher_alive = True
             threading.Thread(target=_receipt_watcher, daemon=True,
                              name="expo-receipt-watcher").start()
 
+
+
+
+
+
+
+
+############################################################
+# _receipt_watcher
+############################################################
+#
+# The per-process 15-minute clock: sleeps the poll interval,
+# trades what is due — every process's tickets, the store is
+# shared — and exits once the store is empty, clearing the
+# flag under the same lock hold as the emptiness check, so a
+# ticket queued meanwhile always finds a live watcher or arms
+# a new one. A cron command's watcher dies with its process;
+# its tickets stay in the store for the next clock.
+#
+# Used by:
+#   - _queue_receipts (above) — armed on the first ticket
+############################################################
 
 def _receipt_watcher():
     global _receipt_watcher_alive
@@ -342,13 +540,61 @@ def _receipt_watcher():
                 connection.close()
 
             with _receipt_lock:
-                if not _receipt_queue:
+                if _with_receipt_queue(len) == 0:
                     _receipt_watcher_alive = False
                     return
     except Exception:
         with _receipt_lock:
             _receipt_watcher_alive = False
         raise
+
+
+
+
+
+
+
+
+############################################################
+# pending_push_receipts
+############################################################
+#
+# How many tickets still wait for a receipt, across every
+# process — what the management command reports after its
+# pass.
+#
+# Used by:
+#   - notifications/management/commands/poll_push_receipts.py
+############################################################
+
+def pending_push_receipts() -> int:
+    return _with_receipt_queue(len)
+
+
+
+
+
+
+
+
+############################################################
+# _park_receipts
+############################################################
+#
+# _queue_receipts behind a guard: receipts are diagnostics,
+# so nothing that goes wrong queueing them — a store bug, a
+# full disk the memory fallback did not catch — may fail the
+# send that produced them.
+#
+# Used by:
+#   - send_push_notification, _send_slice (below)
+############################################################
+
+def _park_receipts(accepted) -> None:
+    try:
+        _queue_receipts(accepted)
+    except Exception:
+        logger.exception("Failed to queue push receipts")
 
 
 
@@ -450,7 +696,7 @@ def send_push_notification(
             )
         return False
 
-    _queue_receipt(ticket.get("id"), token)
+    _park_receipts([(ticket.get("id"), token)])
     return True
 
 
@@ -537,6 +783,7 @@ def _send_slice(batch: list[dict], deadline: float):
     # error code logged and tallied
     # ===================================================
     sent = 0
+    accepted = []
     for idx, ticket in enumerate(results):
         if idx >= len(batch):
             logger.warning("Expo returned %d ticket(s) for %d message(s) — ignoring the tail", len(results), len(batch))
@@ -550,7 +797,7 @@ def _send_slice(batch: list[dict], deadline: float):
             token = batch[idx]["to"]
             if ticket.get("status") == "ok":
                 sent += 1
-                _queue_receipt(ticket.get("id"), token)
+                accepted.append((ticket.get("id"), token))
                 continue
 
             detail = ticket.get("details") if isinstance(ticket.get("details"), dict) else {}
@@ -570,6 +817,11 @@ def _send_slice(batch: list[dict], deadline: float):
             logger.exception("Failed to read an Expo ticket")
             errors["Malformed"] = errors.get("Malformed", 0) + 1
 
+
+    # STEP 5: the accepted tickets wait for their receipts —
+    # one store write for the whole slice
+    # ======================================================
+    _park_receipts(accepted)
     return sent, dead, errors
 
 
@@ -757,49 +1009,67 @@ def _deactivate_tokens(tokens) -> int:
 # poll_push_receipts
 ############################################################
 #
-# Stage two of delivery: every ticket parked at least 15
-# minutes ago is traded for its receipt at Expo. A
-# "DeviceNotRegistered" receipt retires the token — the
-# uninstall case the ticket stage cannot see, because a
-# ticket only says Expo took the message. "InvalidCredentials"
-# (the Expo project's APNs/FCM credentials are broken, so
-# NOTHING is arriving on any device) and "MessageRateExceeded"
-# are logged at WARNING: they are operator problems, and
-# without this job they are completely invisible. Entries
-# younger than the delay go back on the queue. Best-effort
-# throughout — the queue is memory-only and a failed slice is
-# simply skipped.
+# Stage two of delivery: every ticket queued at least 15
+# minutes ago — by ANY process, the store is shared — is
+# traded for its receipt at Expo. A "DeviceNotRegistered"
+# receipt retires the token — the uninstall case the ticket
+# stage cannot see, because a ticket only says Expo took the
+# message. "InvalidCredentials" (the Expo project's APNs/FCM
+# credentials are broken, so NOTHING is arriving on any
+# device) and "MessageRateExceeded" are logged at WARNING:
+# they are operator problems, and without this job they are
+# completely invisible.
+#
+# Expo answers only for ids it already has a verdict on — an
+# id still in flight to APNs/FCM is simply absent — and a
+# receipts request can fail outright. Neither is a reason to
+# forget the ticket: both go back to the store for another
+# round, up to _RECEIPT_MAX_TRIES rounds, and a ticket older
+# than Expo's receipt retention is dropped unasked. Returns
+# the number of verdicts read.
 #
 # Used by:
 #   - _receipt_watcher (above) — the per-process 15-minute
 #     clock
+#   - notifications/management/commands/poll_push_receipts.py
+#     — the cron pass
 ############################################################
 
 def poll_push_receipts() -> int:
-    # STEP 1: drain what is old enough, put the young back
-    # ====================================================
-    cutoff = time.monotonic() - _RECEIPT_DELAY
-    due = {}
-    keep = []
-    with _receipt_lock:
-        while _receipt_queue:
-            ticket_id, token, stamped = _receipt_queue.popleft()
-            if stamped <= cutoff:
-                due[ticket_id] = token
-            else:
-                keep.append((ticket_id, token, stamped))
-        _receipt_queue.extend(keep)
+    # STEP 1: take what is due, drop what Expo no longer
+    # keeps, leave the young in the store
+    # ==================================================
+    now = time.time()
+    cutoff = now - _RECEIPT_DELAY
+    too_old = now - _RECEIPT_MAX_AGE
 
+    def take_due(rows):
+        due, keep, expired = [], [], 0
+        for row in rows:
+            if row[2] <= too_old:
+                expired += 1
+            elif row[2] <= cutoff:
+                due.append(row)
+            else:
+                keep.append(row)
+        rows[:] = keep
+        return due, expired
+
+    due, expired = _with_receipt_queue(take_due)
+    if expired:
+        logger.info("Dropped %d push receipt(s) past Expo's retention unasked", expired)
     if not due:
         return 0
 
 
-    # STEP 2: ask Expo in slices; a slice that fails costs
-    # only its own ids
-    # ====================================================
-    ids = list(due.keys())
+    # STEP 2: ask Expo in slices; a slice that fails
+    # goes back to the store whole, for another round
+    # ===============================================
+    by_id = {row[0]: row for row in due}
+    ids = list(by_id)
     checked = 0
     dead: list[str] = []
+    retry: list = []
 
     for i in range(0, len(ids), _RECEIPT_SLICE):
         part = ids[i : i + _RECEIPT_SLICE]
@@ -812,28 +1082,37 @@ def poll_push_receipts() -> int:
             )
             if resp.status_code != 200:
                 logger.warning("Expo receipts HTTP %d: %s", resp.status_code, _sanitize(resp.text))
+                retry.extend(by_id[ticket_id] for ticket_id in part)
                 continue
             receipts = resp.json().get("data")
         except Exception:
             logger.exception("Failed to fetch push receipts")
+            retry.extend(by_id[ticket_id] for ticket_id in part)
             continue
 
         if not isinstance(receipts, dict):
             logger.warning("Expo receipts: unexpected body shape %s", _sanitize(receipts))
+            retry.extend(by_id[ticket_id] for ticket_id in part)
             continue
 
 
         # STEP 3: verdict per ticket — retire dead devices,
-        # shout about the operator-level failures
+        # shout about the operator-level failures; an id
+        # Expo did not answer for is still in flight, and
+        # rides again
         # =================================================
-        for ticket_id, receipt in receipts.items():
+        for ticket_id in part:
+            receipt = receipts.get(ticket_id)
+            if receipt is None:
+                retry.append(by_id[ticket_id])
+                continue
             checked += 1
             if not isinstance(receipt, dict) or receipt.get("status") != "error":
                 continue
 
             detail = receipt.get("details") if isinstance(receipt.get("details"), dict) else {}
             code = detail.get("error") or "Unknown"
-            token = due.get(ticket_id) or ""
+            token = by_id[ticket_id][1]
 
             if code == "DeviceNotRegistered":
                 dead.append(token)
@@ -844,10 +1123,24 @@ def poll_push_receipts() -> int:
                     _sanitize(receipt.get("message", "")),
                 )
 
+
+    # STEP 4: retire the dead in one UPDATE, then hand the
+    # unanswered back — one try more each, the last round
+    # dropped
+    # ====================================================
     if dead:
         _deactivate_tokens(dead)
 
-    logger.info("Push receipts: %d checked, %d device(s) retired", checked, len(dead))
+    again = [[ticket_id, token, stamped, tries + 1]
+             for ticket_id, token, stamped, tries in retry if tries + 1 < _RECEIPT_MAX_TRIES]
+    given_up = len(retry) - len(again)
+    if again:
+        _with_receipt_queue(lambda rows: rows.extend(again))
+
+    logger.info(
+        "Push receipts: %d checked, %d device(s) retired, %d re-queued, %d given up",
+        checked, len(dead), len(again), given_up,
+    )
     return checked
 
 
@@ -908,7 +1201,12 @@ def prune_orphan_push_tokens() -> int:
 # "channel"), split the (token, language) rows by language
 # and make one send_push_batch call per language. Anything
 # that is not 'en' rides the Lithuanian batch — 'lt' is the
-# column default and the app default alike. Delivery hints go
+# column default and the app default alike. A caller that
+# passes NO English copy at all (title_en and body_en both
+# None) gets ONE batch for every device: the split would send
+# the same text twice over, and the single "Push batch" log
+# line makes a forgotten translation visible. Either copy may
+# be given alone — the other falls back to the Lithuanian. Delivery hints go
 # per channel: a chat preview is worth waking a dozing phone
 # for (priority "high", ttl 1 h, otherwise Android Doze can
 # sit on an FCM normal-priority message for many minutes),
@@ -928,6 +1226,12 @@ def _send_by_language(channel, rows, title, body, data, title_en, body_en, stats
 
     priority = "high" if channel == "chat" else None
     ttl = 3600 if channel == "chat" else 86400
+
+    # No English copy supplied: one text for every device, so
+    # one batch — never two byte-identical round-trips
+    if title_en is None and body_en is None:
+        return send_push_batch([token for token, _language in rows], title, body, push_data,
+                               priority=priority, ttl=ttl, stats=stats)
 
     lt_tokens = [token for token, language in rows if language != "en"]
     en_tokens = [token for token, language in rows if language == "en"]

@@ -52,6 +52,7 @@ from knfapp.common.timestamps import utc_now
 from knfapp.uploads.gates import MAX_IMAGE_PIXELS as BOMB_GUARD_PIXELS
 from knfapp.users.auth import require_role
 from knfapp.wayfind.api.views import ENTITY_ID_RE, _body_too_large, _load_building, _multipart
+from knfapp.wayfind.graph import _finite
 from knfapp.wayfind.models import WfCapture, WfCaptureFrame, WfPanorama
 from knfapp.wayfind.store import store_dir, write_replace
 
@@ -158,7 +159,7 @@ def create_capture(request, building_id):
     if mode not in ("full", "walls"):
         return json_error("mode must be 'full' or 'walls'", 400, code="bad_mode")
     hfov = body.get("frameHfovDeg", 60)
-    if not isinstance(hfov, (int, float)) or hfov != hfov or not (10 <= hfov <= 170):
+    if not _finite(hfov) or not (10 <= hfov <= 170):
         return json_error("frameHfovDeg must be a number between 10 and 170", 400, code="bad_hfov")
     node_id = body.get("nodeId")
     if node_id is not None and not (isinstance(node_id, str) and ENTITY_ID_RE.match(node_id)):
@@ -176,7 +177,10 @@ def create_capture(request, building_id):
             return json_error(f"duplicate target id {target['id']}", 400, code="bad_targets")
         yaw = target.get("yawDeg")
         pitch = target.get("pitchDeg")
-        if not isinstance(yaw, (int, float)) or not isinstance(pitch, (int, float)) or yaw != yaw or pitch != pitch or not (-90 <= pitch <= 90):
+        # Finite numbers, never bools: the body parser accepts a
+        # bare Infinity / NaN, and the JSON column refuses them at
+        # insert — a 500 where this 400 belongs (KNF-158)
+        if not (_finite(yaw) and _finite(pitch)) or not (-90 <= pitch <= 90):
             return json_error("every target needs yawDeg and pitchDeg (pitch within ±90)", 400, code="bad_targets")
         seen_ids.add(target["id"])
         clean_targets.append({"id": target["id"], "yawDeg": float(yaw), "pitchDeg": float(pitch)})
@@ -408,10 +412,7 @@ def finish_capture(request, capture_id):
     # ======================================================
     body = get_json_object(request) or {}
     centre_yaw = body.get("centreYawDeg")
-    if centre_yaw is not None and (
-        not isinstance(centre_yaw, (int, float)) or centre_yaw != centre_yaw
-        or centre_yaw in (float("inf"), float("-inf"))
-    ):
+    if centre_yaw is not None and not _finite(centre_yaw):
         return json_error("centreYawDeg must be a finite number", 400, code="bad_centre")
 
 
@@ -456,8 +457,11 @@ def finish_capture(request, capture_id):
 # coverage, timing — or the failure reason; between finish
 # and done it may carry just the parked centreYawDeg), and
 # on 'done' the panorama block the admin screens need to
-# open the alignment tool: id, url, size, coverage and the
-# centre column's yaw.
+# open the alignment tool: id, url, size, the coverage the
+# STORED image spans (a full turn by the band the frames
+# covered — stitch.py crops to it), the centre column's yaw
+# and the band's vertical centre (vOffsetDeg — without it
+# the stage would hang the band on the horizon).
 #
 # Used by:
 #   - the app's guided-capture screen — polled while the
@@ -496,6 +500,7 @@ def get_capture(request, capture_id):
                 "hfovDeg": pano["hfov_deg"],
                 "vfovDeg": pano["vfov_deg"],
                 "centreYawDeg": coverage.get("centreYawDeg"),
+                "vOffsetDeg": coverage.get("vOffsetDeg"),
             }
 
     return json_response(payload)

@@ -2,9 +2,14 @@
 #  [*] Regression tests — the wayfind stitcher
 #
 #  The capture-to-panorama contract: a 12-frame ring at
-#  hfov 60 composes into a 2048x1024 pano whose coverage
-#  says the yaw wraps (hfov 360), whose vfov matches the
-#  frame geometry, and whose CENTRE COLUMN is the finish
+#  hfov 60 composes into a 2048-wide pano CROPPED to the
+#  band the frames covered, so the stored image, the
+#  wf_panoramas row and the capture's pano block all say the
+#  same thing (a full turn by that band, centred where the
+#  band is — KNF-025: the old whole-sphere canvas labelled
+#  with the captured arc rendered squashed by 180/vfov);
+#  the measured arc rides in the report as capturedHfovDeg /
+#  capturedVfovDeg. Its CENTRE COLUMN is the finish
 #  body's centreYawDeg — falling back, without a body, to
 #  the frame with the earliest updated_at, so a re-shot
 #  first target hands the fallback centre to the next
@@ -53,25 +58,35 @@ class StitchEndToEndTests(CaptureTestCase):
 
         coverage = body["report"]["coverage"]
         # 12 frames 30 degrees apart at 60-degree hfov wrap the yaw
-        self.assertEqual(coverage["hfovDeg"], 360.0)
+        self.assertEqual((coverage["hfovDeg"], coverage["capturedHfovDeg"]), (360.0, 360.0))
         # 480x640 portrait at hfov 60 gives vfov 2*atan(tan(30)*4/3) ~ 75
         self.assertTrue(70 <= coverage["vfovDeg"] <= 82, coverage)
+        self.assertEqual(coverage["capturedVfovDeg"], coverage["vfovDeg"])
         self.assertLessEqual(abs(coverage["vOffsetDeg"]), 3)
         # No finish body sent — the centre falls back to the
         # earliest-uploaded frame's yaw, r0-0 here
         self.assertEqual(coverage["centreYawDeg"], 0.0)
 
+        # The stored image IS the band: its rows are exactly the
+        # vfov's share of the 1024-row sphere, and every place
+        # that describes it says the same coverage
         pano = body["pano"]
-        self.assertEqual((pano["width"], pano["height"]), (2048, 1024))
+        band_rows = round(coverage["vfovDeg"] / 180.0 * 1024)
+        self.assertEqual((pano["width"], pano["height"]), (2048, band_rows))
+        self.assertEqual((pano["hfovDeg"], pano["vfovDeg"], pano["vOffsetDeg"]),
+                         (360.0, coverage["vfovDeg"], coverage["vOffsetDeg"]))
         served = self.client.get(pano["url"])
         self.assertEqual(served.status_code, 200)
         image = Image.open(io.BytesIO(b"".join(served.streaming_content)))
-        self.assertEqual(image.size, (2048, 1024))
+        self.assertEqual(image.size, (2048, band_rows))
+        # 360 degrees across 2048 columns and vfov down the rows:
+        # the image's own aspect agrees with its geometry
+        self.assertAlmostEqual(image.width / image.height, 360.0 / coverage["vfovDeg"], delta=0.05)
 
-        # heading_source 'auto' on the stored pano row, and the
-        # frames directory is gone
-        row = q1("SELECT heading_source, hfov_deg FROM wf_panoramas WHERE id = %s", (pano["id"],))
-        self.assertEqual((row["heading_source"], row["hfov_deg"]), ("auto", 360.0))
+        # heading_source 'auto' on the stored pano row, its
+        # geometry the image's, and the frames directory is gone
+        row = q1("SELECT heading_source, hfov_deg, vfov_deg FROM wf_panoramas WHERE id = %s", (pano["id"],))
+        self.assertEqual((row["heading_source"], row["hfov_deg"], row["vfov_deg"]), ("auto", 360.0, coverage["vfovDeg"]))
         frames_path = os.path.join(self.tmp, "wayfind", "captures", "b1_cap-0000-0001")
         self.assertFalse(os.path.isdir(frames_path))
 
@@ -86,7 +101,7 @@ class StitchEndToEndTests(CaptureTestCase):
         # frame (COLORS[3], a yellow), not the first upload's red
         served = self.client.get(body["pano"]["url"])
         image = Image.open(io.BytesIO(b"".join(served.streaming_content)))
-        r, g, b = image.getpixel((1024, 512))
+        r, g, b = image.getpixel((1024, image.height // 2))
         self.assertTrue(r > 170 and g > 130 and b < 110, (r, g, b))
 
     def test_a_reshot_first_target_hands_the_fallback_centre_on(self):
@@ -128,18 +143,37 @@ class ComposeTests(CaptureTestCase):
         ]
         canvas, coverage = compose_panorama(frames, 60.0)
 
-        self.assertEqual(canvas.shape, (1024, 2048, 3))
-        self.assertEqual(canvas.dtype, numpy.uint8)
-        self.assertTrue(100 <= coverage["hfovDeg"] <= 140, coverage)
-        # Square frames at hfov 60 cover a ~60 degree band on the horizon
+        # The arc is REPORTED as captured, while the canvas stays a
+        # full turn (fill beyond the arc) — so hfovDeg, the image's
+        # own extent, is 360. (This test once asserted hfovDeg ~120
+        # for this 2048-column canvas: the very mislabel KNF-025
+        # names, which squashed the photo onto a 120° mesh)
+        self.assertTrue(100 <= coverage["capturedHfovDeg"] <= 140, coverage)
+        self.assertEqual(coverage["hfovDeg"], 360.0)
+        # Square frames at hfov 60 cover a ~60 degree band on the
+        # horizon — and the canvas is cut to exactly that band
         self.assertTrue(50 <= coverage["vfovDeg"] <= 75, coverage)
+        self.assertEqual(canvas.shape, (round(coverage["vfovDeg"] / 180.0 * 1024), 2048, 3))
+        self.assertEqual(canvas.dtype, numpy.uint8)
         self.assertLessEqual(abs(coverage["vOffsetDeg"]), 3)
         self.assertEqual(coverage["centreYawDeg"], 0.0)
 
         # The centre column carries the FIRST frame (red), not
         # the fill and not a later frame
-        r, g, b = canvas[512, 1024]
+        r, g, b = canvas[canvas.shape[0] // 2, 1024]
         self.assertTrue(int(r) > 150 and int(r) > int(g) + 50 and int(r) > int(b) + 50, (r, g, b))
+
+    def test_a_band_above_the_horizon_keeps_its_offset(self):
+        # Frames pitched 30 degrees up: the cropped band sits above
+        # the horizon and says so — vOffsetDeg is what lets the
+        # stage hang it there instead of on the horizon
+        frames = [
+            {"image": Image.new("RGB", (320, 320), COLORS[i]), "yawDeg": i * 30.0, "pitchDeg": 30.0, "rollDeg": 0.0}
+            for i in range(12)
+        ]
+        canvas, coverage = compose_panorama(frames, 60.0)
+        self.assertTrue(25 <= coverage["vOffsetDeg"] <= 35, coverage)
+        self.assertEqual(canvas.shape[0], round(coverage["vfovDeg"] / 180.0 * 1024))
 
     def test_compose_centres_on_the_requested_yaw(self):
         # Same three frames, but the caller asks for yaw 30 — the
@@ -153,5 +187,5 @@ class ComposeTests(CaptureTestCase):
         self.assertEqual(coverage["centreYawDeg"], 30.0)
         # The centre column carries the yaw-30 frame (green), not
         # the first-listed red one
-        r, g, b = canvas[512, 1024]
+        r, g, b = canvas[canvas.shape[0] // 2, 1024]
         self.assertTrue(int(g) > 120 and int(g) > int(r) + 40 and int(g) > int(b) + 40, (r, g, b))

@@ -30,6 +30,7 @@ import uuid
 
 from PIL import Image
 from django.conf import settings
+from django.db import transaction
 from django.http import FileResponse
 
 
@@ -265,11 +266,16 @@ def push_meme(request):
 # messages referencing it lose their picture. The serve
 # route is public and long-cached (a chat bubble renders
 # without a token), gated to the exact names this module
-# writes.
+# writes — and it touches no table, so it opts out of the
+# request-wide transaction ATOMIC_REQUESTS would open around
+# every one of those GETs (the uploads serve does the same).
 #
 # Used by:
-#   - the mobile meme tab (own rows), admin tooling; every
-#     chat bubble whose imageUrl points here
+#   - delete_meme: the mobile meme panel (app/(main)/chat-room
+#     MemeLibrary, the viewer's own tiles) and the Vite
+#     panel's Memes.jsx
+#   - serve_meme: every chat bubble and meme tile whose url
+#     points here
 ############################################################
 
 @require_methods("DELETE")
@@ -290,6 +296,7 @@ def delete_meme(request, meme_id):
     return json_response({"ok": True})
 
 
+@transaction.non_atomic_requests
 @require_methods("GET")
 def serve_meme(request, name):
     if not FILENAME_RE.match(name):

@@ -26,6 +26,12 @@
 #      is only ever probed by exact id on a retry; a stale
 #      replay past the horizon re-applies and its
 #      baseRevision conflicts answer as a stale edit should)
+#    - uploads nothing references any more, a week or older
+#      (uploads/storage.py sweep_orphan_uploads) — COUNTED
+#      and logged only, unless --delete-orphan-uploads is
+#      passed: deleting a student's file is irreversible, so
+#      the owner reads a few days of dry-run counts before
+#      switching deletion on in the crontab
 #
 #  Each pass is guarded on its own — housekeeping never
 #  fails housekeeping.
@@ -58,6 +64,10 @@ WF_OPS_RETENTION_DAYS = 90
 
 class Command(BaseCommand):
     help = "Sweep expired sessions, orphaned push tokens, abandoned scraper runs and stale wayfind rows"
+
+    def add_arguments(self, parser):
+        parser.add_argument("--delete-orphan-uploads", action="store_true",
+                            help="Delete week-old uploads nothing references (default: count them only)")
 
     def handle(self, *args, **options):
         try:
@@ -96,6 +106,11 @@ class Command(BaseCommand):
             self._prune_wayfind_ops()
         except Exception:
             logger.exception("Wayfind op-log prune failed")
+
+        try:
+            self._sweep_orphan_uploads(delete=options.get("delete_orphan_uploads", False))
+        except Exception:
+            logger.exception("Orphan-upload sweep failed")
 
         self.stdout.write("Maintenance done")
 
@@ -172,3 +187,16 @@ class Command(BaseCommand):
         pruned, _ = WfOp.objects.filter(created_at__lt=cutoff).delete()
         if pruned:
             logger.info("Pruned %d old wayfind op(s)", pruned)
+
+    def _sweep_orphan_uploads(self, delete):
+        from knfapp.uploads.storage import sweep_orphan_uploads
+
+        # The count goes to stdout as well as the log, so the
+        # cron container's own output shows what a real run
+        # would free before anyone switches deletion on
+        found, freed = sweep_orphan_uploads(dry_run=not delete)
+        if found:
+            verb = "Removed" if delete else "Would remove (dry run)"
+            line = f"{verb} {found} orphan upload(s), {freed} bytes"
+            logger.info(line)
+            self.stdout.write(line)
