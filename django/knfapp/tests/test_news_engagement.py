@@ -2,14 +2,18 @@
 #  [*] Regression tests — likes, shares, comments
 #
 #  The counter law (recomputed from child rows, never ±1 —
-#  increments drift and lie), the activity
+#  increments drift and lie — and inside the UPDATE itself:
+#  a count read first and bound as an integer is the window
+#  where two racing likes both write 1), the activity
 #  rows that ride the same transaction (a withdrawn like
 #  takes its row back), the guest share, and the comment
 #  thread's deleted-user rendering.
 ############################################################
 
 
+from django.db import connection
 from django.test import Client, TestCase
+from django.test.utils import CaptureQueriesContext
 
 
 from knfapp.common import ratelimit
@@ -17,6 +21,23 @@ from knfapp.news.models import NewsPost
 from knfapp.social.models import Activity
 from knfapp.users import auth
 from .utils import bearer, create_post, create_user
+
+
+def _assert_one_statement_recount(case, queries, column, child_table):
+    # The counter lands in ONE news_posts UPDATE that carries the
+    # correlated COUNT of the child table — and nothing before it is
+    # a standalone COUNT of that table (the .count() that a
+    # two-statement recount would bind as a stale integer)
+    sql = [q["sql"] for q in queries]
+    updates = [i for i, s in enumerate(sql) if s.startswith('UPDATE "news_posts"') and column in s]
+    case.assertEqual(len(updates), 1, sql)
+    recount = sql[updates[0]]
+    case.assertIn("COUNT(*)", recount)
+    case.assertIn(f'"{child_table}"', recount)
+    case.assertIn('"news_posts"."id"', recount[recount.index("COUNT(*)"):])
+    for statement in sql[:updates[0]]:
+        case.assertFalse(statement.startswith("SELECT COUNT(") and f'FROM "{child_table}"' in statement,
+                         f"a standalone count precedes the recount: {statement}")
 
 
 class LikeTests(TestCase):
@@ -47,6 +68,17 @@ class LikeTests(TestCase):
     def test_a_drifted_counter_heals_on_the_next_toggle(self):
         NewsPost.objects.filter(id=self.post.id).update(likes_count=41)
         self.assertEqual(self._toggle()["likes"], 1)
+
+    def test_the_recount_is_one_statement(self):
+        with CaptureQueriesContext(connection) as captured:
+            on = self._toggle()
+        _assert_one_statement_recount(self, captured.captured_queries, "likes_count", "news_likes")
+        self.assertEqual(on["likes"], 1)
+
+        with CaptureQueriesContext(connection) as captured:
+            off = self._toggle()
+        _assert_one_statement_recount(self, captured.captured_queries, "likes_count", "news_likes")
+        self.assertEqual((off["likes"], NewsPost.objects.get(id=self.post.id).likes_count), (0, 0))
 
     def test_a_self_like_writes_no_activity(self):
         own = create_post(author=self.liker)
@@ -91,6 +123,21 @@ class CommentTests(TestCase):
         listed = self.client.get(f"/api/news/{self.post.id}/comments").json()["comments"][0]
         self.assertEqual(listed["time"], body["time"])
         self.assertEqual(Activity.objects.filter(kind="comment").count(), 1)
+
+    def test_add_and_delete_recount_in_one_statement(self):
+        with CaptureQueriesContext(connection) as captured:
+            added = self._add()
+        _assert_one_statement_recount(self, captured.captured_queries, "comments_count", "news_comments")
+        self.assertEqual(added.status_code, 201)
+        second = self._add("Antras").json()["id"]
+        self.assertEqual(NewsPost.objects.get(id=self.post.id).comments_count, 2)
+
+        with CaptureQueriesContext(connection) as captured:
+            response = bearer(self.client.delete, f"/api/news/{self.post.id}/comments/{second}", self.token)
+        _assert_one_statement_recount(self, captured.captured_queries, "comments_count", "news_comments")
+        # The reply carries what the row says after the recount
+        self.assertEqual((response.status_code, response.json()["comments"]), (200, 1))
+        self.assertEqual(NewsPost.objects.get(id=self.post.id).comments_count, 1)
 
     def test_the_delete_rule_author_owner_admin(self):
         comment_id = self._add().json()["id"]

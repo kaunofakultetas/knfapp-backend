@@ -169,5 +169,5 @@ class PollTotalTests(TestCase):
         self.assertEqual(shaped["totalVotes"], 5)
         # There is no stored column to drift from this sum
         with connection.cursor() as cursor:
-            cursor.execute("SELECT name FROM pragma_table_info('polls') WHERE name = 'total_votes'")
-            self.assertIsNone(cursor.fetchone())
+            columns = {col.name for col in connection.introspection.get_table_description(cursor, "polls")}
+        self.assertNotIn("total_votes", columns)

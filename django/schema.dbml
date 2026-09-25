@@ -25,7 +25,10 @@
 //  never ±1; a poll's TOTAL is derived from its options at
 //  shape time and not stored at all. In-room chat search is
 //  one case-insensitive substring match on messages.text —
-//  identical on both engines.
+//  the same query on both engines, but NOT the same case
+//  folding: SQLite's LIKE folds ASCII only, PostgreSQL folds
+//  by collation, so a capitalised Lithuanian diacritic
+//  (Ą, Č, Ė, …) matches on PostgreSQL and misses on SQLite.
 // ============================================================
 
 

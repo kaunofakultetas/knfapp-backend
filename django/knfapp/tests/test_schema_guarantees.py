@@ -6,12 +6,23 @@
 #  the badge counts', the queues' — a dropped index breaks
 #  no test and slows every user), the disappearing-messages
 #  sweep index is PARTIAL (indexing every ordinary message
-#  would tax each send for nothing), and the connection
+#  would tax each send for nothing), the connection
 #  enforces foreign keys (the erasure and unsend paths
-#  depend on that discipline).
+#  depend on that discipline), and models.py and the
+#  hand-kept migrations agree — runTests.sh runs
+#  `makemigrations --check` before the suite, but the
+#  everyday `docker exec … manage.py test` loop skips that
+#  script, so the same check runs HERE as a test.
+#
+#  Runs on both engines (TEST_DATABASE_URL, see settings):
+#  the index/unique facts come from Django's introspection
+#  where it answers, and from the engine's own catalog for
+#  the one thing it does not expose — whether an index is
+#  partial.
 ############################################################
 
 
+from django.core.management import call_command
 from django.db import connection
 from django.test import TestCase
 
@@ -41,9 +52,21 @@ EXPECTED_UNIQUES = {
 class SchemaGuaranteeTests(TestCase):
 
     def _indexes(self, table):
+        # {name: {"unique", "partial"}} — vendor-split on purpose:
+        # the partial flag is not in the introspection API, and
+        # these two engines are the only ones this stack runs on
         with connection.cursor() as cursor:
-            cursor.execute(f'PRAGMA index_list("{table}")')
-            return {row[1]: {"unique": bool(row[2]), "partial": bool(row[4])}
+            if connection.vendor == "sqlite":
+                cursor.execute(f'PRAGMA index_list("{table}")')
+                return {row[1]: {"unique": bool(row[2]), "partial": bool(row[4])}
+                        for row in cursor.fetchall()}
+            cursor.execute(
+                "SELECT c.relname, i.indisunique, i.indpred IS NOT NULL "
+                "FROM pg_index i "
+                "JOIN pg_class c ON c.oid = i.indexrelid "
+                "JOIN pg_class t ON t.oid = i.indrelid "
+                "WHERE t.relname = %s", [table])
+            return {row[0]: {"unique": bool(row[1]), "partial": bool(row[2])}
                     for row in cursor.fetchall()}
 
     def test_the_query_path_indexes_exist(self):
@@ -53,15 +76,9 @@ class SchemaGuaranteeTests(TestCase):
             self.assertFalse(missing, f"{table} is missing {missing}")
 
     def _unique_columns(self, table):
-        found = set()
         with connection.cursor() as cursor:
-            cursor.execute(f'PRAGMA index_list("{table}")')
-            for _seq, name, unique, _origin, _partial in cursor.fetchall():
-                if not unique:
-                    continue
-                cursor.execute(f'PRAGMA index_info("{name}")')
-                found.add(tuple(row[2] for row in cursor.fetchall()))
-        return found
+            constraints = connection.introspection.get_constraints(cursor, table)
+        return {tuple(c["columns"]) for c in constraints.values() if c["unique"]}
 
     def test_the_expiry_index_is_partial_and_the_unique_keys_hold(self):
         messages = self._indexes("messages")
@@ -71,6 +88,22 @@ class SchemaGuaranteeTests(TestCase):
                           f"{table} lost its unique key over {columns}")
 
     def test_foreign_keys_are_enforced_on_this_connection(self):
+        # The relation is DECLARED on both engines; SQLite enforces
+        # it only when the per-connection pragma is on (PostgreSQL
+        # always does — deferred to commit)
         with connection.cursor() as cursor:
-            cursor.execute("PRAGMA foreign_keys")
-            self.assertEqual(cursor.fetchone()[0], 1)
+            constraints = connection.introspection.get_constraints(cursor, "messages")
+            declared = {tuple(c["columns"]): c["foreign_key"]
+                        for c in constraints.values() if c["foreign_key"]}
+            self.assertEqual(declared.get(("conversation_id",)), ("conversations", "id"))
+            if connection.vendor == "sqlite":
+                cursor.execute("PRAGMA foreign_keys")
+                self.assertEqual(cursor.fetchone()[0], 1)
+
+    def test_models_and_migrations_are_in_step(self):
+        # makemigrations --check exits 1 (SystemExit) when a model
+        # change has no migration yet; a clean tree returns quietly
+        try:
+            call_command("makemigrations", check=True, dry_run=True, verbosity=0)
+        except SystemExit:
+            self.fail("models.py and migrations have drifted — run makemigrations")

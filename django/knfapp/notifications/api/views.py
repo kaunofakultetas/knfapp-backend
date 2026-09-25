@@ -21,7 +21,7 @@ import uuid
 
 
 from knfapp.common import ratelimit
-from knfapp.common.http import get_json_object, json_error, json_response
+from knfapp.common.http import get_json_object, json_error, json_response, require_methods
 from knfapp.common.timestamps import utc_now
 from knfapp.notifications.core import VALID_CHANNELS, token_digest
 from knfapp.notifications.models import NotificationChannel, PushToken
@@ -70,6 +70,7 @@ MAX_TOKENS_PER_USER = 10
 #     restore, detach on logout
 ############################################################
 
+@require_methods("POST")
 @require_auth
 @ratelimit.per_user("push_register", max_attempts=20)
 def register_token(request):
@@ -145,6 +146,7 @@ def register_token(request):
     return json_response({"registered": True, "tokenId": row["id"]}, status=200 if own else 201)
 
 
+@require_methods("DELETE")
 @require_auth
 @ratelimit.per_user("push_register", max_attempts=20)
 def unregister_token(request):
@@ -187,6 +189,7 @@ def unregister_token(request):
 #   - the mobile engine's transport — the settings switches
 ############################################################
 
+@require_methods("GET")
 @require_auth
 def get_channels(request):
     rows = NotificationChannel.objects.filter(user_id=request.user["id"]).values("channel", "enabled")
@@ -196,6 +199,7 @@ def get_channels(request):
     return json_response({"channels": channels})
 
 
+@require_methods("PUT")
 @require_auth
 @ratelimit.per_user("push_channels", max_attempts=60)
 def update_channels(request):
@@ -255,12 +259,14 @@ def update_channels(request):
 #   - the mobile engine's transport — the settings toggle
 ############################################################
 
+@require_methods("GET")
 @require_auth
 def get_chat_preview(request):
     row = User.objects.filter(id=request.user["id"]).values("chat_push_preview").first()
     return json_response({"enabled": bool(row["chat_push_preview"]) if row else True})
 
 
+@require_methods("PUT")
 @require_auth
 @ratelimit.per_user("notif_prefs", max_attempts=30)
 def update_chat_preview(request):

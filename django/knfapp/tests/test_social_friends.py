@@ -6,7 +6,12 @@
 #  declines, the two reject meanings (a recipient's decline
 #  feeds the cooldown, a sender's cancel leaves no record),
 #  the blocked-pair 404, and unfriend clearing a
-#  half-present friendship from either side.
+#  half-present friendship from either side. Plus the
+#  crossed mutual send the per-DIRECTION index never stops:
+#  accept and the auto-accept clear the pending row in BOTH
+#  directions, a decline against a current friend writes no
+#  cooldown, and a decline older than a later friendship
+#  does not brake a new send.
 ############################################################
 
 
@@ -17,7 +22,8 @@ from django.test import Client, TestCase
 
 
 from knfapp.common import ratelimit
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now, utc_now_iso
+from knfapp.social.activity import record_activity
 from knfapp.social.models import Activity, FriendRequest, Friendship
 from knfapp.users import auth
 from .utils import bearer, befriend, create_user
@@ -100,6 +106,63 @@ class FriendRequestTests(TestCase):
         bearer(self.client.post, f"/api/social/friends/requests/{req2}/accept", self.token_a,
                content_type="application/json")
         self.assertEqual(FriendRequest.objects.count(), 0)
+
+    def _plant_pending(self, request_id, sender, recipient):
+        # A pending row written directly — the crossed send the
+        # per-direction index admits — with the ask the recipient
+        # would have heard about
+        now = utc_now()
+        FriendRequest.objects.create(id=request_id, from_user=sender, to_user=recipient,
+                                     created_at=now, updated_at=now)
+        record_activity(recipient.id, "connect_request", sender.id, request_id)
+
+    def test_accept_clears_a_crossed_mutual_send_in_both_directions(self):
+        self._plant_pending("0-ab", self.a, self.b)
+        self._plant_pending("1-ba", self.b, self.a)
+        response = bearer(self.client.post, "/api/social/friends/requests/0-ab/accept", self.token_b,
+                          content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Friendship.objects.count(), 2)
+        # No pending row survives in EITHER direction, and neither
+        # side keeps a stale "wants to connect" row
+        self.assertEqual(FriendRequest.objects.filter(status="pending").count(), 0)
+        self.assertEqual(Activity.objects.filter(kind="connect_request").count(), 0)
+
+    def test_the_auto_accept_clears_the_crossed_row_too(self):
+        # Both rows planted; ids sort so the lookup lands on THEIR
+        # row and a's send takes the auto-accept branch — a's own
+        # crossed row must go with it
+        self._plant_pending("0-ba", self.b, self.a)
+        self._plant_pending("1-ab", self.a, self.b)
+        response = self._send(self.token_a, self.b.id)
+        self.assertEqual((response.status_code, response.json()["status"]), (200, "accepted"))
+        self.assertEqual(FriendRequest.objects.filter(status="pending").count(), 0)
+        self.assertEqual(Activity.objects.filter(kind="connect_request").count(), 0)
+
+    def test_reject_after_the_handshake_writes_no_cooldown(self):
+        # The leftover reverse row of a crossed send, declined once
+        # the pair is already friends: dropped, never a decline
+        befriend(self.a, self.b)
+        self._plant_pending("ba", self.b, self.a)
+        response = bearer(self.client.post, "/api/social/friends/requests/ba/reject", self.token_a,
+                          content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(FriendRequest.objects.count(), 0)
+        # ... so after an unfriend b may ask again at once
+        bearer(self.client.delete, f"/api/social/friends/{self.a.id}", self.token_b)
+        self.assertEqual(self._send(self.token_b, self.a.id).status_code, 201)
+
+    def test_a_decline_older_than_a_later_friendship_does_not_brake(self):
+        req_id = self._send(self.token_a, self.b.id).json()["id"]
+        bearer(self.client.post, f"/api/social/friends/requests/{req_id}/reject", self.token_b,
+               content_type="application/json")
+        # The decline is a day old — well inside the cooldown — but a
+        # friendship came after it, of which one direction survives
+        # (a half-present row lets the send through to the brake)
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        FriendRequest.objects.filter(id=req_id).update(updated_at=yesterday, created_at=yesterday)
+        Friendship.objects.create(user=self.b, friend=self.a, created_at=utc_now_iso())
+        self.assertEqual(self._send(self.token_a, self.b.id).status_code, 201)
 
     def test_a_blocked_pair_reads_as_missing(self):
         bearer(self.client.post, "/api/social/blocks", self.token_b,

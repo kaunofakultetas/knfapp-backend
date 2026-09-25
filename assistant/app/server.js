@@ -14,7 +14,10 @@
 //  lines, not from a phone.
 //
 //  Started by: npm run dev (node --watch server.js) in the
-//  dev bind-mount; npm start in the baked image.
+//  dev bind-mount; npm start in the baked image. The app
+//  and the listening server are exported for the boot test
+//  (tests/server.boot.test.mjs), which imports this file
+//  under PORT=0 and closes the server it gets back.
 // -----------------------------------------------------------
 
 import express from "express";
@@ -48,7 +51,7 @@ app.get("/health", (_req, res) => {
 app.use(errorMiddleware);
 
 
-app.listen(PORT, () => {
+export const server = app.listen(PORT, () => {
   console.log(`assistant listening on :${PORT}`);
   if (!isModelConfigured()) {
     console.warn("AI_GATEWAY_KEY is empty — chat will answer 503 until it is set");
@@ -57,3 +60,6 @@ app.listen(PORT, () => {
     console.warn("ASSISTANT_INTERNAL_SECRET is empty — Django will refuse every relay");
   }
 });
+
+
+export default app;

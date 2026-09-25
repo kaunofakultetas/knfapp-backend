@@ -47,11 +47,11 @@ import re
 from PIL import Image, ImageOps
 
 from knfapp.common import ratelimit
-from knfapp.common.http import get_json_object, json_error, json_response
+from knfapp.common.http import clean_param, get_json_object, json_error, json_response, require_methods
 from knfapp.common.timestamps import utc_now
 from knfapp.uploads.gates import MAX_IMAGE_PIXELS as BOMB_GUARD_PIXELS
 from knfapp.users.auth import require_role
-from knfapp.wayfind.api.views import ENTITY_ID_RE, _load_building, _multipart
+from knfapp.wayfind.api.views import ENTITY_ID_RE, _body_too_large, _load_building, _multipart
 from knfapp.wayfind.models import WfCapture, WfCaptureFrame, WfPanorama
 from knfapp.wayfind.store import store_dir, write_replace
 
@@ -139,6 +139,7 @@ def frames_dir(scoped_id):
 #     upload queue
 ############################################################
 
+@require_methods("POST")
 @require_role(*EDITOR_ROLES)
 @ratelimit.per_user("wayfind_captures", max_attempts=60)
 def create_capture(request, building_id):
@@ -228,7 +229,7 @@ def _resolve_capture(request, capture_id, form=None):
     if not CAPTURE_ID_RE.match(capture_id or ""):
         return None, json_error("Unknown capture", 404, code="not_found")
 
-    building_id = (form.get("buildingId") if form else None) or request.GET.get("buildingId")
+    building_id = clean_param((form.get("buildingId") if form else None) or request.GET.get("buildingId"))
     if building_id:
         row = WfCapture.objects.filter(id=f"{building_id}:{capture_id}").values().first()
         if row is None:
@@ -265,16 +266,22 @@ def _resolve_capture(request, capture_id, form=None):
 # capped at 2048 px on the long edge, and the write is
 # atomic (.part + replace) so the stitcher can never read
 # half a frame. A frame past FRAME_MAX_PIXELS (60 MP —
-# Pillow's hard bomb stop) answers 413 too_large. Answers
+# Pillow's hard bomb stop) answers 413 too_large, and so
+# does a body declared past DATA_UPLOAD_MAX_MEMORY_SIZE —
+# on its Content-Length, before it is read. Answers
 # {stored, expected}. 409 once the capture left 'uploading'.
 #
 # Used by:
 #   - the sync upload queue — kind 'frame' uploads
 ############################################################
 
+@require_methods("PUT")
 @require_role(*EDITOR_ROLES)
 @ratelimit.per_user("wayfind_frames", max_attempts=600)
 def upload_capture_frame(request, capture_id, target_id):
+    too_large = _body_too_large(request)
+    if too_large:
+        return too_large
     form, files = _multipart(request)
     capture, error = _resolve_capture(request, capture_id, form)
     if error:
@@ -385,6 +392,7 @@ def upload_capture_frame(request, capture_id, target_id):
 #     upload has drained
 ############################################################
 
+@require_methods("POST")
 @require_role(*EDITOR_ROLES)
 @ratelimit.per_user("wayfind_captures", max_attempts=60)
 def finish_capture(request, capture_id):
@@ -456,6 +464,7 @@ def finish_capture(request, capture_id):
 #     stitch runs, then to jump into alignment
 ############################################################
 
+@require_methods("GET")
 @require_role(*EDITOR_ROLES)
 def get_capture(request, capture_id):
     capture, error = _resolve_capture(request, capture_id)

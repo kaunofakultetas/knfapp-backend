@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 import bcrypt
 
 
-from knfapp.common.timestamps import utc_now_iso
+from knfapp.common.timestamps import utc_now, utc_now_iso
 from knfapp.users.models import InvitationCode, User
 
 
@@ -88,9 +88,12 @@ def befriend(a, b):
 
 
 def naive_now(minutes_ago=0):
-    # Chat stamps are naive-UTC datetimes — the exact kind the
-    # views bind and the encoder turns into the naive wire shape
-    return (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).replace(tzinfo=None)
+    # An AWARE UTC stamp, exactly what the chat views bind —
+    # the naive WIRE shape is chosen by json_response(
+    # naive_stamps=True) at response time, never by storage.
+    # (The name is historical: it once returned a naive
+    # datetime, which Django stored under a RuntimeWarning.)
+    return utc_now() - timedelta(minutes=minutes_ago)
 
 
 def create_room(members, conv_type="direct", title=None, message_ttl_seconds=None):
@@ -116,3 +119,19 @@ def create_message(conv, sender, text="Labas", minutes_ago=0, **overrides):
     )
     fields.update(overrides)
     return Message.objects.create(**fields)
+
+
+def register_upload(directory, owner, ext="jpg", blob=b"bytes"):
+    # A "registered" upload is what the storage sink recognises as
+    # somebody's: the file under a name FILENAME_RE admits PLUS the
+    # ownership row. owner=None writes an ownerless row (what an
+    # erasure's SET_NULL leaves behind). Returns the bare name
+    import os
+    from knfapp.uploads.models import Upload
+    filename = f"{uuid.uuid4().hex}.{ext}"
+    with open(os.path.join(directory, filename), "wb") as handle:
+        handle.write(blob)
+    Upload.objects.create(id=str(uuid.uuid4()), filename=filename,
+                          user_id=owner.id if owner else None,
+                          byte_size=len(blob), created_at=utc_now_iso())
+    return filename

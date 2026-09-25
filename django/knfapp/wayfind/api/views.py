@@ -52,6 +52,7 @@ import logging
 import os
 import re
 
+from django.conf import settings
 from django.db import transaction
 from django.db.models import F
 from django.db.models.functions import Length
@@ -60,7 +61,7 @@ from PIL import Image, ImageOps
 
 from knfapp.common import ratelimit
 from knfapp.common.db import q
-from knfapp.common.http import get_json_object, json_error, json_response
+from knfapp.common.http import get_json_object, json_error, json_response, require_methods
 from knfapp.common.timestamps import as_aware, utc_now
 from knfapp.uploads.gates import MAX_IMAGE_PIXELS as BOMB_GUARD_PIXELS
 from knfapp.users.auth import require_role
@@ -145,6 +146,23 @@ def _multipart(request):
     return {}, {}
 
 
+# The Content-Length gate the upload routes run BEFORE the
+# body is parsed: past DATA_UPLOAD_MAX_MEMORY_SIZE (the
+# ingress carve-out for these routes matches it) the phone
+# gets a JSON 413 it can render instead of the proxy's
+# empty one. A missing or garbage header reads as 0 — the
+# proxy keeps the last word on the real byte count
+def _body_too_large(request):
+    try:
+        declared = int(request.META.get("CONTENT_LENGTH") or 0)
+    except (TypeError, ValueError):
+        declared = 0
+    if declared <= settings.DATA_UPLOAD_MAX_MEMORY_SIZE:
+        return None
+    return json_error(f"Upload too large. Max {settings.DATA_UPLOAD_MAX_MEMORY_SIZE // (1024 * 1024)} MB",
+                      413, code="too_large")
+
+
 
 
 
@@ -168,6 +186,7 @@ def _multipart(request):
 #     admin's first-run setup / the seed import
 ############################################################
 
+@require_methods("GET")
 def list_buildings(request):
     rows = q(
         """
@@ -195,6 +214,7 @@ def list_buildings(request):
     })
 
 
+@require_methods("POST")
 @require_role("admin")
 def create_building(request):
     body = get_json_object(request) or {}
@@ -243,6 +263,7 @@ def create_building(request):
 #     boot, on network restore and on foreground
 ############################################################
 
+@require_methods("GET")
 def get_graph(request, building_id):
     building = _load_building(building_id)
     if building is None or building["published_revision"] is None:
@@ -287,6 +308,7 @@ def get_graph(request, building_id):
 #     every restore
 ############################################################
 
+@require_methods("GET")
 @require_role(*EDITOR_ROLES)
 def get_draft(request, building_id):
     building = _load_building(building_id)
@@ -356,13 +378,19 @@ def get_draft(request, building_id):
 # id was seen before IN THIS BUILDING; the answer says what
 # the original did: `of` is its status, reason its reason,
 # revision the revision it applied at). A conflict is an
-# entity whose revision is past the op's baseRevision. An op
-# without baseRevision is a plain overwrite. "building" ops
-# patch the building row. A delete is a tombstone: the row
-# stays, marked, so a `since` delta can carry it. Batches
-# serialise on the building row's write lock (the no-op
-# touch), so two overlapping batches can never both pass the
-# conflict check on one entity.
+# entity whose revision is past the op's baseRevision. An
+# upsert must say what the phone's copy was — baseRevision,
+# or `fresh: true` for a create the server never heard of:
+# one that says neither is a blind overwrite in the making
+# and refuses the WHOLE batch with 400 no_base before
+# anything is applied, so a client that forgot the stamp
+# learns at once. A delete without baseRevision is a plain
+# overwrite. "building" ops patch the building row. A
+# delete is a tombstone: the row stays, marked, so a `since`
+# delta can carry it. Batches serialise on the building
+# row's write lock (the no-op touch), so two overlapping
+# batches can never both pass the conflict check on one
+# entity.
 #
 # The op log key is "<building>:<op id>", so an op id is
 # idempotent PER BUILDING (a fixed seed id can bootstrap a
@@ -373,6 +401,15 @@ def get_draft(request, building_id):
 #     op log
 ############################################################
 
+# An upsert's licence to write: a real integer baseRevision
+# (a bool is not one — True would read as 1) for the conflict
+# check to anchor on, or the fresh mark of a create
+def _stamped(op):
+    base = op.get("baseRevision")
+    return (isinstance(base, int) and not isinstance(base, bool)) or op.get("fresh") is True
+
+
+@require_methods("POST")
 @require_role(*EDITOR_ROLES)
 @ratelimit.per_user("wayfind_ops", max_attempts=300)
 def post_ops(request, building_id):
@@ -388,7 +425,20 @@ def post_ops(request, building_id):
         return json_error(f"At most {MAX_OPS_PER_BATCH} ops per batch", 400, code="batch_too_large")
 
 
-    # STEP 1: take SQLite's write lock BEFORE reading any
+    # STEP 1: no blind write — an upsert must carry baseRevision
+    # (the conflict check's anchor) or fresh (a create the
+    # server never heard of). One bare op refuses the whole
+    # batch before anything is applied or logged, naming the
+    # op, so a client that forgot the stamp learns at once
+    # instead of quietly replacing rows
+    # ========================================================
+    for op in ops:
+        if isinstance(op, dict) and op.get("type") == "upsert" and not _stamped(op):
+            return json_response({"error": "upsert needs baseRevision or fresh", "code": "no_base", "opId": op.get("id")},
+                                 status=400)
+
+
+    # STEP 2: take SQLite's write lock BEFORE reading any
     # entity row — the F() self-assignment is a no-op touch
     # of the building row that serialises overlapping
     # batches, so the conflict check below only ever sees
@@ -408,7 +458,7 @@ def post_ops(request, building_id):
             revision = building["draft_revision"] + 1
 
 
-            # STEP 2: the whole batch inside the transaction — the
+            # STEP 3: the whole batch inside the transaction — the
             # revision every applied op gets is the next draft
             # revision
             # ====================================================
@@ -418,7 +468,7 @@ def post_ops(request, building_id):
                 applied_any = applied_any or result["status"] == "applied"
 
 
-            # STEP 3: the bump only when something landed — a batch
+            # STEP 4: the bump only when something landed — a batch
             # of duplicates or rejections leaves the revision alone
             # =====================================================
             if applied_any:
@@ -568,6 +618,7 @@ def _apply_op(building_id, op, revision, author, now):
 #   - the admin "Publish" action / publish sheet in the app
 ############################################################
 
+@require_methods("POST")
 @require_role("admin")
 def publish_building(request, building_id):
     building = _load_building(building_id)
@@ -614,6 +665,7 @@ def publish_building(request, building_id):
     return json_response({"revision": revision, "etag": etag, "publishedAt": now, "bytes": len(text.encode("utf-8"))})
 
 
+@require_methods("GET")
 @require_role(*EDITOR_ROLES)
 def list_versions(request, building_id):
     building = _load_building(building_id)
@@ -655,18 +707,24 @@ def list_versions(request, building_id):
 # THOSE bytes is its id. The same picture uploaded twice
 # answers the same id. The coverage defaults to a full turn
 # with the vertical band the aspect gives (a 2:1 photo is a
-# whole sphere).
+# whole sphere). A body declared past
+# DATA_UPLOAD_MAX_MEMORY_SIZE (52 MB, the ingress carve-out)
+# is refused as a JSON 413 too_large before it is read.
 #
 # Used by:
 #   - the admin capture / import screens in the app
 ############################################################
 
+@require_methods("POST")
 @require_role(*EDITOR_ROLES)
 @ratelimit.per_user("wayfind_upload", max_attempts=120)
 def upload_panorama(request, building_id):
     building = _load_building(building_id)
     if building is None:
         return json_error("Unknown building", 404, code="not_found")
+    too_large = _body_too_large(request)
+    if too_large:
+        return too_large
     form, files = _multipart(request)
     upload = files.get("file")
     if upload is None:
@@ -765,6 +823,7 @@ def upload_panorama(request, building_id):
 #   - the app's panorama stage and floor plan
 ############################################################
 
+@require_methods("GET")
 def serve_panorama(request, name):
     if not STORED_NAME_RE.match(name or "") or not name.endswith(".jpg"):
         return json_error("Not found", 404, code="not_found")
@@ -776,6 +835,7 @@ def serve_panorama(request, name):
     return response
 
 
+@require_methods("GET")
 def serve_plan(request, name):
     if not STORED_NAME_RE.match(name or "") or not name.endswith(".svg"):
         return json_error("Not found", 404, code="not_found")
@@ -810,6 +870,7 @@ def serve_plan(request, name):
 #   - the admin level sheet in the app; the seed import
 ############################################################
 
+@require_methods("POST")
 @require_role(*EDITOR_ROLES)
 @ratelimit.per_user("wayfind_upload", max_attempts=120)
 def upload_plan(request, building_id):

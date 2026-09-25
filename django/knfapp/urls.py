@@ -11,11 +11,19 @@
 #  is off).
 #
 #  Who may call what is not decided here — @require_auth /
-#  @require_role on the views own that.
+#  @require_role on the views own that. WHICH VERB a path
+#  takes is decided twice over: the trailing comments below
+#  are the contract, every view wears @require_methods with
+#  its verb, and each shared-path dispatcher names its verbs
+#  explicitly and answers anything else with the JSON 405 —
+#  a verb no branch claims never falls into a handler.
 ############################################################
 
 
 from django.urls import path
+
+
+from knfapp.common.http import method_not_allowed
 
 
 urlpatterns = []
@@ -81,7 +89,9 @@ def _upload_dispatch(request, filename):
     # One path, two verbs — DELETE is owner-or-admin, GET public
     if request.method == "DELETE":
         return delete_file(request, filename)
-    return serve_file(request, filename)
+    if request.method in ("GET", "HEAD"):
+        return serve_file(request, filename)
+    return method_not_allowed(["GET", "DELETE"])
 
 
 urlpatterns += [
@@ -128,15 +138,27 @@ from knfapp.news.api.views import (
 
 
 def _news_dispatch(request):
-    return create_post(request) if request.method == "POST" else get_feed(request)
+    if request.method == "POST":
+        return create_post(request)
+    if request.method in ("GET", "HEAD"):
+        return get_feed(request)
+    return method_not_allowed(["GET", "POST"])
 
 
 def _news_post_dispatch(request, post_id):
-    return delete_post(request, post_id) if request.method == "DELETE" else get_post(request, post_id)
+    if request.method == "DELETE":
+        return delete_post(request, post_id)
+    if request.method in ("GET", "HEAD"):
+        return get_post(request, post_id)
+    return method_not_allowed(["GET", "DELETE"])
 
 
 def _news_comments_dispatch(request, post_id):
-    return add_comment(request, post_id) if request.method == "POST" else get_comments(request, post_id)
+    if request.method == "POST":
+        return add_comment(request, post_id)
+    if request.method in ("GET", "HEAD"):
+        return get_comments(request, post_id)
+    return method_not_allowed(["GET", "POST"])
 
 
 def _news_poll_dispatch(request, post_id):
@@ -144,7 +166,9 @@ def _news_poll_dispatch(request, post_id):
         return create_poll(request, post_id)
     if request.method == "DELETE":
         return delete_poll(request, post_id)
-    return get_poll(request, post_id)
+    if request.method in ("GET", "HEAD"):
+        return get_poll(request, post_id)
+    return method_not_allowed(["GET", "POST", "DELETE"])
 
 
 urlpatterns += [
@@ -204,19 +228,35 @@ from knfapp.social.api.views import (
 
 
 def _social_profile_dispatch(request):
-    return update_profile(request) if request.method == "PUT" else get_own_profile(request)
+    if request.method == "PUT":
+        return update_profile(request)
+    if request.method in ("GET", "HEAD"):
+        return get_own_profile(request)
+    return method_not_allowed(["GET", "PUT"])
 
 
 def _social_posts_dispatch(request):
-    return create_wall_post(request) if request.method == "POST" else get_user_posts(request)
+    if request.method == "POST":
+        return create_wall_post(request)
+    if request.method in ("GET", "HEAD"):
+        return get_user_posts(request)
+    return method_not_allowed(["GET", "POST"])
 
 
 def _social_post_dispatch(request, post_id):
-    return delete_wall_post(request, post_id) if request.method == "DELETE" else update_wall_post(request, post_id)
+    if request.method == "PUT":
+        return update_wall_post(request, post_id)
+    if request.method == "DELETE":
+        return delete_wall_post(request, post_id)
+    return method_not_allowed(["PUT", "DELETE"])
 
 
 def _social_blocks_dispatch(request):
-    return block_user(request) if request.method == "POST" else list_blocks(request)
+    if request.method == "POST":
+        return block_user(request)
+    if request.method in ("GET", "HEAD"):
+        return list_blocks(request)
+    return method_not_allowed(["GET", "POST"])
 
 
 urlpatterns += [
@@ -269,15 +309,27 @@ from knfapp.notifications.api.views import (
 
 
 def _push_register_dispatch(request):
-    return unregister_token(request) if request.method == "DELETE" else register_token(request)
+    if request.method == "POST":
+        return register_token(request)
+    if request.method == "DELETE":
+        return unregister_token(request)
+    return method_not_allowed(["POST", "DELETE"])
 
 
 def _channels_dispatch(request):
-    return update_channels(request) if request.method == "PUT" else get_channels(request)
+    if request.method == "PUT":
+        return update_channels(request)
+    if request.method in ("GET", "HEAD"):
+        return get_channels(request)
+    return method_not_allowed(["GET", "PUT"])
 
 
 def _chat_preview_dispatch(request):
-    return update_chat_preview(request) if request.method == "PUT" else get_chat_preview(request)
+    if request.method == "PUT":
+        return update_chat_preview(request)
+    if request.method in ("GET", "HEAD"):
+        return get_chat_preview(request)
+    return method_not_allowed(["GET", "PUT"])
 
 
 urlpatterns += [
@@ -308,7 +360,11 @@ from knfapp.memes.api.views import delete_meme, list_memes, push_meme, serve_mem
 
 
 def _memes_dispatch(request):
-    return push_meme(request) if request.method == "POST" else list_memes(request)
+    if request.method == "POST":
+        return push_meme(request)
+    if request.method in ("GET", "HEAD"):
+        return list_memes(request)
+    return method_not_allowed(["GET", "POST"])
 
 
 urlpatterns += [
@@ -364,11 +420,19 @@ from knfapp.admin.api.views import (
 
 
 def _admin_invitations_dispatch(request):
-    return create_invitation(request) if request.method == "POST" else list_invitations(request)
+    if request.method == "POST":
+        return create_invitation(request)
+    if request.method in ("GET", "HEAD"):
+        return list_invitations(request)
+    return method_not_allowed(["GET", "POST"])
 
 
 def _admin_user_dispatch(request, user_id):
-    return delete_user(request, user_id) if request.method == "DELETE" else update_user(request, user_id)
+    if request.method == "PATCH":
+        return update_user(request, user_id)
+    if request.method == "DELETE":
+        return delete_user(request, user_id)
+    return method_not_allowed(["PATCH", "DELETE"])
 
 
 urlpatterns += [
@@ -470,22 +534,38 @@ from django.db import transaction as _tx
 
 @_tx.non_atomic_requests
 def _chat_conversations_dispatch(request):
-    return create_conversation(request) if request.method == "POST" else list_conversations(request)
+    if request.method == "POST":
+        return create_conversation(request)
+    if request.method in ("GET", "HEAD"):
+        return list_conversations(request)
+    return method_not_allowed(["GET", "POST"])
 
 
 @_tx.non_atomic_requests
 def _chat_messages_dispatch(request, conv_id):
-    return send_message(request, conv_id) if request.method == "POST" else get_messages(request, conv_id)
+    if request.method == "POST":
+        return send_message(request, conv_id)
+    if request.method in ("GET", "HEAD"):
+        return get_messages(request, conv_id)
+    return method_not_allowed(["GET", "POST"])
 
 
 @_tx.non_atomic_requests
 def _chat_message_dispatch(request, conv_id, msg_id):
-    return delete_message(request, conv_id, msg_id) if request.method == "DELETE" else edit_message(request, conv_id, msg_id)
+    if request.method == "PUT":
+        return edit_message(request, conv_id, msg_id)
+    if request.method == "DELETE":
+        return delete_message(request, conv_id, msg_id)
+    return method_not_allowed(["PUT", "DELETE"])
 
 
 @_tx.non_atomic_requests
 def _chat_react_dispatch(request, conv_id, msg_id):
-    return remove_reaction(request, conv_id, msg_id) if request.method == "DELETE" else react_to_message(request, conv_id, msg_id)
+    if request.method == "POST":
+        return react_to_message(request, conv_id, msg_id)
+    if request.method == "DELETE":
+        return remove_reaction(request, conv_id, msg_id)
+    return method_not_allowed(["POST", "DELETE"])
 
 
 urlpatterns += [
@@ -546,7 +626,11 @@ from knfapp.wayfind.api.captures import (
 
 
 def _wayfind_buildings_dispatch(request):
-    return create_building(request) if request.method == "POST" else list_buildings(request)
+    if request.method == "POST":
+        return create_building(request)
+    if request.method in ("GET", "HEAD"):
+        return list_buildings(request)
+    return method_not_allowed(["GET", "POST"])
 
 
 urlpatterns += [
@@ -613,9 +697,9 @@ urlpatterns += [
 ############################################################
 
 from knfapp.assistant.api.admin_views import (
-    activate_prompt, assistant_overview, create_prompt, deactivate_prompt,
-    knowledge_search, list_prompts, reindex_knowledge, review_thread,
-    review_threads,
+    activate_prompt, assistant_overview, create_curated, create_prompt, deactivate_prompt,
+    delete_curated, knowledge_search, list_curated, list_prompts, reindex_knowledge,
+    review_thread, review_threads, update_curated,
 )
 from knfapp.assistant.api.internal_views import (
     active_prompt, assistant_search, message_feedback, thread_delete,
@@ -626,7 +710,20 @@ from knfapp.assistant.api.internal_views import (
 
 def _admin_prompts_dispatch(request):
     # One path, two verbs — POST saves a new version, GET lists
-    return create_prompt(request) if request.method == "POST" else list_prompts(request)
+    if request.method == "POST":
+        return create_prompt(request)
+    if request.method in ("GET", "HEAD"):
+        return list_prompts(request)
+    return method_not_allowed(["GET", "POST"])
+
+
+def _admin_curated_dispatch(request):
+    # Same shape for the curated answers — POST adds, GET lists
+    if request.method == "POST":
+        return create_curated(request)
+    if request.method in ("GET", "HEAD"):
+        return list_curated(request)
+    return method_not_allowed(["GET", "POST"])
 
 urlpatterns += [
     path("internal/assistant/search", assistant_search),                            # POST — pgvector top-k for searchHandbook
@@ -645,6 +742,37 @@ urlpatterns += [
     path("api/admin/assistant/overview", assistant_overview),                       # GET — KB, turns, ratings, active prompt (admin)
     path("api/admin/assistant/knowledge/reindex", reindex_knowledge),               # POST — cron's sync on demand (admin, audited)
     path("api/admin/assistant/knowledge/search", knowledge_search),                 # POST — retrieval test box (admin)
+    path("api/admin/assistant/knowledge/curated", _admin_curated_dispatch),         # GET list / POST add a hand-written answer (admin)
+    path("api/admin/assistant/knowledge/curated/<uuid:entry_id>/update", update_curated),  # POST — re-embed one answer (admin)
+    path("api/admin/assistant/knowledge/curated/<uuid:entry_id>/delete", delete_curated),  # POST — drop one answer (admin)
     path("api/admin/assistant/threads", review_threads),                            # GET — review list, ?rating=down (admin)
     path("api/admin/assistant/threads/<uuid:thread_id>", review_thread),            # GET — one transcript (admin, audited)
 ]
+
+
+
+
+
+
+
+
+############################################################
+# Error handlers — the envelope for what no view answered
+############################################################
+#
+# Django's four module-level names. An unknown path, a
+# PermissionDenied, a request Django itself refuses (the
+# oversized body among them, answered 413 by handler400)
+# and an exception no view caught all answer {"error",
+# "code"} like every view does, never an HTML page.
+# DEBUG=True still shows the technical pages (see the
+# views' banner). Named AFTER urlpatterns so the table
+# above stays the table of contents.
+#
+# Views live in knfapp/common/http.py.
+############################################################
+
+handler400 = "knfapp.common.http.handler400"
+handler403 = "knfapp.common.http.handler403"
+handler404 = "knfapp.common.http.handler404"
+handler500 = "knfapp.common.http.handler500"

@@ -7,14 +7,16 @@
 #  survives anonymised (bcrypt-shaped unreachable hash, the
 #  Lithuanian marker), authored posts tombstone, fed
 #  counters decrement while the rows still exist, uploads
-#  leave the disk, comments stay (they pick the marker up
-#  at read time). The chat side scrubs the richer media
-#  columns, renames the frozen system narrations, purges
-#  the activity feed both ways, and takes any room the
-#  departure emptied down whole. The export answers every
-#  stored section — devices with a digest instead of the
-#  live push credential, sessions as bare stamps — an empty
-#  one as [] — never a 500.
+#  leave the disk only once the erasure commits (a write
+#  that fails after them rolls the whole account back with
+#  the files still on disk), comments stay (they pick the
+#  marker up at read time). The chat side scrubs the richer
+#  media columns, renames the frozen system narrations,
+#  purges the activity feed both ways, and takes any room
+#  the departure emptied down whole. The export answers
+#  every stored section — devices with a digest instead of
+#  the live push credential, sessions as bare stamps — an
+#  empty one as [] — never a 500.
 ############################################################
 
 
@@ -23,6 +25,7 @@ import os
 import shutil
 import tempfile
 import uuid
+from unittest.mock import patch
 
 
 from django.test import Client, TestCase
@@ -37,7 +40,7 @@ from knfapp.social.activity import record_activity
 from knfapp.social.models import Activity, Friendship
 from knfapp.uploads import storage
 from knfapp.uploads.models import Upload
-from knfapp.users import auth
+from knfapp.users import auth, erasure
 from knfapp.users.models import Session, User
 from .utils import PASSWORD, bearer, befriend, create_message, create_post, create_room, create_user
 
@@ -85,7 +88,10 @@ class DeleteMeTests(TestCase):
                                    text="Sveikinu", created_at=utc_now_iso())
         befriend(self.user, other)
 
-        self.assertEqual(self._delete().status_code, 200)
+        # The file goes in the on-commit sweep — executed here,
+        # since a TestCase never really commits
+        with self.captureOnCommitCallbacks(execute=True):
+            self.assertEqual(self._delete().status_code, 200)
 
         row = User.objects.get(id=self.user.id)
         self.assertEqual(row.display_name, "Ištrintas naudotojas")
@@ -106,6 +112,31 @@ class DeleteMeTests(TestCase):
         self.assertEqual(Friendship.objects.count(), 0)
         self.assertEqual(Session.objects.filter(user_id=self.user.id).count(), 0)
         self.assertEqual(bearer(self.client.get, "/api/auth/me", self.token).status_code, 401)
+
+    def test_a_failed_erasure_keeps_the_files_on_disk(self):
+        tmp = tempfile.mkdtemp(prefix="knfapp-erasure-")
+        storage._upload_dir = tmp
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        self.addCleanup(lambda: setattr(storage, "_upload_dir", None))
+
+        filename = f"{uuid.uuid4().hex}.jpg"
+        open(os.path.join(tmp, filename), "wb").write(b"bytes")
+        Upload.objects.create(id=str(uuid.uuid4()), filename=filename, user_id=self.user.id,
+                              byte_size=5, created_at=utc_now_iso())
+
+        # hashpw is the erasure's STEP 4 — the rows are already
+        # gone when it blows up. The request rolls back to its
+        # savepoint, and Django drops the on-commit sweep that
+        # was registered inside it, so nothing runs here
+        with patch.object(erasure.bcrypt, "hashpw", side_effect=RuntimeError("disk on fire")):
+            with self.assertRaises(RuntimeError):
+                with self.captureOnCommitCallbacks(execute=True):
+                    self._delete()
+
+        # A whole account, not one pointing at 404s
+        self.assertTrue(os.path.exists(os.path.join(tmp, filename)))
+        self.assertEqual(Upload.objects.filter(user_id=self.user.id).count(), 1)
+        self.assertTrue(User.objects.get(id=self.user.id).active)
 
     def test_the_chat_side_scrubs_media_names_activity_and_orphan_rooms(self):
         other = create_user(username="kitas")

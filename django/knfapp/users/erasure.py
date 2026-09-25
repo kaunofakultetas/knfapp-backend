@@ -3,26 +3,28 @@
 #
 #  Shared by the self-service DELETE /api/auth/me and the
 #  admin console's DELETE /api/admin/users/<id>: the
-#  person's uploads leave the disk, the counters their
-#  engagement fed are decremented while the rows still
-#  exist, everything that is theirs alone is hard-deleted
-#  (their sessions, devices, likes, votes, blocks,
-#  handshakes AND their activity feed — plus the actor-side
-#  activity rows advertising gestures this routine just
-#  removed), their authored snapshots are tombstoned, and
-#  the users row survives ANONYMISED (uuid-embedding
-#  placeholders, so the UNIQUE constraints cannot collide;
-#  an unreachable bcrypt hash; active = 0). Runs inside the
-#  caller's transaction (ATOMIC_REQUESTS).
+#  person's upload rows and references go (the FILES leave
+#  the disk only once the erasure commits — an unlink
+#  cannot be rolled back), the counters their engagement
+#  fed are decremented while the rows still exist,
+#  everything that is theirs alone is hard-deleted (their
+#  sessions, devices, likes, votes, blocks, handshakes AND
+#  their activity feed — plus the actor-side activity rows
+#  advertising gestures this routine just removed), their
+#  authored snapshots are tombstoned, and the users row
+#  survives ANONYMISED (uuid-embedding placeholders, so the
+#  UNIQUE constraints cannot collide; an unreachable bcrypt
+#  hash; active = 0). Runs inside the caller's transaction
+#  (ATOMIC_REQUESTS).
 #
 #  The chat-side steps run as guarded raw SQL — a database
 #  without the chat tables (a stripped-down deployment)
 #  skips them with one log line instead of failing the
 #  whole erasure. They cover: every dead media reference in
 #  the person's messages (image, attachment columns,
-#  gallery, link card — the files left the disk in STEP 1),
-#  the display name frozen into system narrations ("X
-#  sukūrė grupę" becomes the tombstone name — names are
+#  gallery, link card — the files go when the erasure
+#  commits), the display name frozen into system narrations
+#  ("X sukūrė grupę" becomes the tombstone name — names are
 #  otherwise always joined live, these strings are the one
 #  stored copy), their read/reaction rows and memberships —
 #  and finally a purge of any conversation the departure
@@ -37,7 +39,7 @@ import uuid
 
 
 import bcrypt
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import F, Q, Value
 from django.db.models.functions import Greatest
 
@@ -48,7 +50,7 @@ from knfapp.news.models import NewsLike, NewsPost, PollOption, PollVote
 from knfapp.notifications.models import NotificationChannel, PushToken
 from knfapp.social.models import Activity, FriendRequest, Friendship, UserBlock
 from knfapp.uploads.models import Upload
-from knfapp.uploads.storage import delete_upload
+from knfapp.uploads.storage import unlink_upload_file
 from knfapp.users.models import Session, User
 
 
@@ -68,8 +70,9 @@ def _chat_side_erasure(user_id, display_name):
     # Each statement carries ITS OWN parameters — the media
     # scrub is user-scoped, the orphan purges take none
     statements = [
-        # Own upload references — the files left the disk in
-        # STEP 1; the LIKE keeps /api/memes/file/ pictures
+        # Own upload references — the files go once the
+        # erasure commits; the LIKE keeps /api/memes/file/
+        # pictures
         (("UPDATE messages SET image_url = NULL"
           " WHERE sender_id = %s AND image_url LIKE '%%/api/uploads/%%'"), (user_id,)),
 
@@ -126,24 +129,40 @@ def _chat_side_erasure(user_id, display_name):
             return
 
 
+def _unlink_erased_files(filenames):
+    # After the commit, outside any transaction: raw unlinks
+    # only — the ownership rows are already gone, and nothing
+    # here may raise (there is no request left to answer)
+    for filename in filenames:
+        try:
+            unlink_upload_file(filename)
+        except Exception:
+            logger.exception("Erasure: upload %s not unlinked", filename)
+
+
 def erase_user_account(user_id):
     # The display name must be read BEFORE the anonymise —
     # the chat narration rewrite matches on it
     display_name = User.objects.filter(id=user_id).values_list("display_name", flat=True).first()
 
 
-    # STEP 1: files first — the uploads off the disk, own
-    # references nulled, the ownership rows dropped
-    # ===================================================
-    for filename in Upload.objects.filter(user_id=user_id).values_list("filename", flat=True):
-        try:
-            delete_upload(f"/api/uploads/{filename}")
-        except Exception:
-            logger.exception("Erasure: upload %s not deleted", filename)
+    # STEP 1: the references nulled and the ownership rows
+    # dropped in the transaction, the FILES unlinked only once
+    # it commits — an unlink cannot be rolled back, so it must
+    # not run ahead of the writes below that can (a deadlock,
+    # a serialization failure, a chat-side statement aborting
+    # the PostgreSQL transaction); until the commit the bytes
+    # stay, so a rolled-back erasure leaves a whole account
+    # rather than one pointing at 404s
+    # ========================================================
+    doomed = list(Upload.objects.filter(user_id=user_id).values_list("filename", flat=True))
 
     NewsPost.objects.filter(author_id=user_id, image_url__contains="/api/uploads/").update(image_url=None)
     _chat_side_erasure(user_id, display_name)
     Upload.objects.filter(user_id=user_id).delete()
+
+    if doomed:
+        transaction.on_commit(lambda: _unlink_erased_files(doomed))
 
 
     # STEP 2: the denormalised counters their engagement fed,

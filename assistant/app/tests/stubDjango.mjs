@@ -30,10 +30,16 @@ export function startStubDjango() {
   const script = {
     // token → the /api/auth/me answer (absent token = 401)
     users: new Map(),
-    // GET /internal/assistant/prompt
+    // GET /internal/assistant/prompt — a `status` other than
+    // 200 plays a Django that cannot answer (worker restart)
     prompt: { version: 7, text: "CORE PROMPT" },
-    // thread id → { user_id } for the lookup route
+    // thread id → { user_id } for the lookup/list/claim routes
+    // and the /:id/ routes (an id missing here is Django's 404)
     threads: new Map(),
+    // the id the next POST /internal/assistant/threads mints
+    nextThreadId: "thread-minted",
+    // thread id → the stored transcript GET .../messages answers
+    transcripts: new Map(),
     // POST /internal/assistant/search → { status, results }
     search: { status: 200, results: [] },
     // GET /api/schedule/filters
@@ -77,7 +83,32 @@ export function startStubDjango() {
         return me ? json(200, me) : json(401, { error: "Invalid session" });
       }
       if (url.pathname === "/internal/assistant/prompt") {
-        return json(200, script.prompt);
+        const { status = 200, ...prompt } = script.prompt;
+        return status === 200 ? json(200, prompt) : json(status, { error: "worker restarting" });
+      }
+      if (url.pathname === "/internal/assistant/threads" && req.method === "POST") {
+        const id = script.nextThreadId;
+        script.threads.set(id, { user_id: body?.user_id || null });
+        return json(201, { id, user_id: body?.user_id || null, language: body?.language || "lt",
+                           title: null, preview: null });
+      }
+      if (url.pathname === "/internal/assistant/threads/list") {
+        const owner = url.searchParams.get("user_id");
+        const threads = [...script.threads.entries()]
+          .filter(([, thread]) => thread.user_id === owner)
+          .map(([id]) => ({ id, title: null, preview: null, language: "lt" }));
+        return json(200, { threads });
+      }
+      if (url.pathname === "/internal/assistant/threads/claim") {
+        let claimed = 0;
+        for (const id of body?.ids || []) {
+          const thread = script.threads.get(id);
+          if (thread && thread.user_id === null) {
+            thread.user_id = body.user_id;
+            claimed += 1;
+          }
+        }
+        return json(200, { claimed });
       }
       if (url.pathname === "/internal/assistant/threads/lookup") {
         const askedBy = body?.user_id || null;
@@ -88,8 +119,26 @@ export function startStubDjango() {
         });
         return json(200, { threads: found });
       }
-      if (/^\/internal\/assistant\/threads\/[^/]+\/messages$/.test(url.pathname)) {
+      const perThread = url.pathname.match(/^\/internal\/assistant\/threads\/([^/]+)\/(messages|feedback|delete)$/);
+      if (perThread && req.method === "POST" && perThread[2] === "messages") {
         return json(200, { stored: (body?.messages || []).length });
+      }
+      if (perThread) {
+        // The access rule Django applies: unknown, or owned by
+        // somebody else, is the same 404
+        const [, id, action] = perThread;
+        const askedBy = (body?.user_id ?? url.searchParams.get("user_id")) || null;
+        const thread = script.threads.get(id);
+        if (!thread || (thread.user_id !== null && thread.user_id !== askedBy)) {
+          return json(404, { error: "Thread not found", code: "not_found" });
+        }
+        if (action === "messages") {
+          return json(200, { messages: script.transcripts.get(id) || [] });
+        }
+        if (action === "feedback") {
+          return json(200, { ok: true, rating: body?.rating ?? null });
+        }
+        return json(200, { ok: true });
       }
       if (url.pathname === "/internal/assistant/turn-log") {
         return json(201, { logged: true });

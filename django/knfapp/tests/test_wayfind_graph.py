@@ -6,12 +6,17 @@
 #  original did — `of`, reason, revision — and a fixed seed
 #  id can still bootstrap a second building), a stale edit
 #  is a per-op conflict carrying the entity as it stands
-#  while the rest of the batch lands, a batch of rejections
-#  bumps no revision, deletions are tombstones a ?since
-#  delta carries, the validator refuses a publish with the
-#  engine's own error codes, an unchanged draft cannot be
-#  re-published, and the published document round-trips
-#  byte-for-byte under its ETag (304 on If-None-Match).
+#  while the rest of the batch lands, an upsert saying
+#  neither baseRevision nor fresh refuses the whole batch
+#  (400 no_base) before anything lands while a fresh create
+#  and a base-0 seed edit take the normal path (the seed
+#  edit conflicting against any row the server holds), a
+#  batch of rejections bumps no revision, deletions are
+#  tombstones a ?since delta carries, the validator refuses
+#  a publish with the engine's own error codes, an unchanged
+#  draft cannot be re-published, and the published document
+#  round-trips byte-for-byte under its ETag (304 on
+#  If-None-Match).
 ############################################################
 
 
@@ -27,10 +32,16 @@ from knfapp.wayfind.graph import compile_document, document_text, validate_docum
 from .utils import bearer, create_user
 
 
-def _op(op_id, entity_kind, entity_id, data, base=None, op_type="upsert"):
+def _op(op_id, entity_kind, entity_id, data, base=None, op_type="upsert", fresh=None):
     op = {"id": op_id, "type": op_type, "kind": entity_kind, "entityId": entity_id, "data": data}
     if base is not None:
         op["baseRevision"] = base
+    # The phone's shape: an upsert with no base is a create and says
+    # so — the server refuses one that says neither
+    if fresh is None:
+        fresh = op_type == "upsert" and base is None
+    if fresh:
+        op["fresh"] = True
     return op
 
 
@@ -104,6 +115,55 @@ class OpLogTests(WayfindTestCase):
         self.assertEqual((conflict["status"], conflict["reason"]), ("rejected", "conflict"))
         self.assertEqual(conflict["current"]["data"]["label"], "Naujas")
         self.assertEqual(applied["status"], "applied")
+
+    def test_a_bare_upsert_refuses_the_whole_batch_before_anything_lands(self):
+        first = self._ops([_op("op-1", "level", "l1", LEVEL)])
+        bare = {"id": "op-2", "type": "upsert", "kind": "node", "entityId": "n1", "data": NODE_A}
+        response = self._post_json("/api/wayfind/buildings/b1/ops",
+                                   {"ops": [_op("op-3", "node", "n2", NODE_B), bare]})
+        self.assertEqual(response.status_code, 400, response.content)
+        answer = json.loads(response.content)
+        self.assertEqual((answer["code"], answer["opId"]), ("no_base", "op-2"))
+
+        # Nothing in the batch landed or was logged: the revision
+        # stands, the row is absent, and the good op is no duplicate
+        draft = json.loads(bearer(self.client.get, "/api/wayfind/buildings/b1/draft", self.token).content)
+        self.assertEqual(draft["revision"], first["revision"])
+        self.assertEqual(sorted(draft["revisions"]), ["level:l1"])
+        self.assertEqual(self._ops([_op("op-3", "node", "n2", NODE_B)])["results"][0]["status"], "applied")
+
+        # A bool is not a base revision either
+        response = self._post_json("/api/wayfind/buildings/b1/ops",
+                                   {"ops": [dict(bare, id="op-4", baseRevision=True)]})
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(json.loads(response.content)["code"], "no_base")
+
+    def test_a_fresh_create_lands_without_a_base(self):
+        # What the phone sends for a NEW entity: fresh: true, no base
+        batch = self._ops([
+            {"id": "op-1", "type": "upsert", "kind": "level", "entityId": "l1", "data": LEVEL, "fresh": True},
+            {"id": "op-2", "type": "upsert", "kind": "node", "entityId": "n1", "data": NODE_A, "fresh": True},
+        ])
+        self.assertEqual([r["status"] for r in batch["results"]], ["applied", "applied"])
+        # A tombstone, deleted without a base, revives under a fresh
+        # create too — deletes are not the guard's business
+        self._ops([{"id": "op-3", "type": "delete", "kind": "node", "entityId": "n1"}])
+        revived = self._ops([{"id": "op-4", "type": "upsert", "kind": "node", "entityId": "n1", "data": NODE_B, "fresh": True}])
+        self.assertEqual(revived["results"][0]["status"], "applied")
+
+    def test_a_seed_edit_stamped_base_0_conflicts_against_any_row_the_server_holds(self):
+        # The offline seed: the phone knows no revision, so every edit
+        # on a seed entity carries base 0 — the server's copy, at any
+        # revision, wins the check and comes back as current
+        self._ops([_op("op-1", "level", "l1", LEVEL)])
+        batch = self._ops([_op("op-2", "level", "l1", dict(LEVEL, label="Pradinis"), base=0)])
+        result = batch["results"][0]
+        self.assertEqual((result["status"], result["reason"]), ("rejected", "conflict"))
+        self.assertEqual(result["current"]["data"]["label"], LEVEL["label"])
+        self.assertFalse(result["current"]["deleted"])
+        # A seed entity the server never had is simply created
+        created = self._ops([_op("op-3", "node", "n1", NODE_A, base=0)])
+        self.assertEqual(created["results"][0]["status"], "applied")
 
     def test_a_batch_of_rejections_bumps_no_revision(self):
         before = self._ops([_op("op-1", "level", "l1", LEVEL)])["revision"]

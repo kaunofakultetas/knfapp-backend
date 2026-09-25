@@ -2,18 +2,24 @@
 #  [*] Regression tests — scraper pure logic
 #
 #  The decisions the parsing layer must not lose: the
-#  canonical URL shape the dedup key hangs on, the image-src
+#  canonical URL shape the dedup key hangs on (vu.lt's
+#  language segment included — the listing key must equal
+#  the stored key or nothing dedups), the image-src
 #  gates that keep an injected src from becoming a beacon,
 #  the published_at clamp that keeps a mis-parsed year off
 #  the top of the feed, the SSRF host gate, the Lithuanian
 #  plural table, the ORDERED programme table with its -EN
-#  trap, and the semester ordering that plain text sorting
-#  gets wrong. No network anywhere — these are pure
-#  functions.
+#  trap, the group-list parse that reads the course label
+#  the page prints beside each anchor (and the whole-slug
+#  fallback that keeps sibling course-years apart when it
+#  cannot), and the semester ordering that plain text
+#  sorting gets wrong. No network anywhere — these are pure
+#  functions, with fetch patched where one is called.
 ############################################################
 
 
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 
 from django.test import SimpleTestCase
@@ -38,6 +44,21 @@ class UrlHygieneTests(SimpleTestCase):
                          "https://knf.vu.lt/a?page=2")
         # Unparsable / relative come back stripped, never dropped
         self.assertEqual(common.normalise_url("  /aktualijos/x  "), "/aktualijos/x")
+
+    def test_a_vu_language_segment_is_not_part_of_the_key(self):
+        # A vu.lt listing card links /lt/visos-naujienos/<slug>; the
+        # article itself — and so the stored row and any tombstone —
+        # lands on /visos-naujienos/<slug>. One article, one key
+        stored = "https://vu.lt/visos-naujienos/nauja-laboratorija"
+        for url in ("https://www.vu.lt/lt/visos-naujienos/nauja-laboratorija",
+                    "https://vu.lt/en/visos-naujienos/nauja-laboratorija/",
+                    "https://vu.lt/LT/visos-naujienos/nauja-laboratorija?utm_source=fb"):
+            self.assertEqual(common.normalise_url(url), stored, url)
+        # Only a whole first segment, and only on vu.lt: a path that
+        # merely starts with "lt" and the faculty site keep theirs
+        self.assertEqual(common.normalise_url("https://vu.lt/ltu-studijos/x"), "https://vu.lt/ltu-studijos/x")
+        self.assertEqual(common.normalise_url("https://knf.vu.lt/lt/aktualijos/x"), "https://knf.vu.lt/lt/aktualijos/x")
+        self.assertEqual(common.normalise_url("https://vu.lt/lt"), "https://vu.lt/")
 
     def test_the_host_gate_refuses_what_a_page_could_inject(self):
         for url in ("https://169.254.169.254/latest/meta-data",
@@ -127,6 +148,99 @@ class GroupNameTests(SimpleTestCase):
         name = schedule_scraper._parse_group_display_name(
             "mv-mag-1k", "Meno vadyba, magistrantūra - 1 kursas")
         self.assertEqual(name, "MV-M-1")
+
+    def test_the_courseless_fallback_is_the_whole_slug(self):
+        # The site's real ISKS slugs differ only past character
+        # 30 — a capped fallback gave four course-years ONE name,
+        # and the schedule API filters on that name
+        programme = "Informacijos sistemos ir kibernetinė sauga (anglų kalba)"
+        first = schedule_scraper._parse_group_display_name(
+            "informacijos-sistemos-ir-kibernetine-sauga-angl-29", programme)
+        second = schedule_scraper._parse_group_display_name(
+            "informacijos-sistemos-ir-kibernetine-sauga-angl-30", programme)
+        self.assertEqual(first, "informacijos-sistemos-ir-kibernetine-sauga-angl-29")
+        self.assertEqual(second, "informacijos-sistemos-ir-kibernetine-sauga-angl-30")
+        self.assertNotEqual(first, second)
+        # …and the no-programme branch keeps the whole slug too
+        slug = "x" * 36 + "-7"
+        self.assertEqual(schedule_scraper._parse_group_display_name(slug, "Nežinoma programa"), slug)
+
+
+class GroupListTests(SimpleTestCase):
+
+    # One programme block in the live page's own shape —
+    # whitespace between every tag, the "N Kursas" label in a
+    # <span> before the anchor's <span>, rows <br>-separated.
+    # Row 2 has a parallel group; rows 3 and 4 print no label,
+    # and only row 3's slug carries the "Nk" token
+    _PAGE = """
+        <div class="flex-row object-column body-box-multiple">
+            <strong>Informacijos sistemos ir kibernetinė sauga (anglų kalba)</strong>
+            <div class="">
+                <span style="white-space: nowrap; margin-right: 5px">
+                    1 Kursas
+                </span>
+                <span style="white-space: nowrap; margin-right: 5px">
+                    <a href="/knf/groups/informacijos-sistemos-ir-kibernetine-sauga-angl-29/">
+                        1 Grupė
+                    </a>
+                </span>
+                <br>
+                <span style="white-space: nowrap; margin-right: 5px">
+                    2 Kursas
+                </span>
+                <span style="white-space: nowrap; margin-right: 5px">
+                    <a href="/knf/groups/informacijos-sistemos-ir-kibernetine-sauga-angl-30/">
+                        1 Grupė
+                    </a>
+                </span>
+                <span style="white-space: nowrap; margin-right: 5px">
+                    <a href="/knf/groups/informacijos-sistemos-ir-kibernetine-sauga-angl-33/">
+                        2 Grupė
+                    </a>
+                </span>
+                <br>
+                <span style="white-space: nowrap; margin-right: 5px">
+                    <a href="/knf/groups/informacijos-sistemos-ir-kibernetine-sauga-angl-3k-1gr-2026/">
+                        1 Grupė
+                    </a>
+                </span>
+                <br>
+                <span style="white-space: nowrap; margin-right: 5px">
+                    <a href="/knf/groups/informacijos-sistemos-ir-kibernetine-sauga-angl-99/">
+                        1 Grupė
+                    </a>
+                </span>
+            </div>
+        </div>
+    """
+
+    def _scrape(self):
+        served = (self._PAGE.encode("utf-8"), schedule_scraper.GROUP_LIST_URL)
+        with mock.patch.object(schedule_scraper, "fetch", return_value=served):
+            return schedule_scraper.scrape_group_list()
+
+    def test_the_course_is_read_from_the_label_beside_the_anchor(self):
+        groups = self._scrape()
+        programme = "Informacijos sistemos ir kibernetinė sauga (anglų kalba)"
+        self.assertEqual([g["display_name"] for g in groups], [
+            programme + " - 1 kursas",
+            programme + " - 2 kursas",
+            programme + " - 2 kursas",   # the parallel group shares its row's label
+            programme + " - 3 kursas",   # no label — the slug's "3k" token
+            programme,                   # no label, no token: nothing to recover
+        ])
+
+    def test_the_names_stay_apart_and_only_parallel_groups_merge(self):
+        names = [schedule_scraper._parse_group_display_name(g["slug"], g["display_name"])
+                 for g in self._scrape()]
+        self.assertEqual(names, [
+            "ISKS-EN-1",
+            "ISKS-EN-2",
+            "ISKS-EN-2",   # parallel groups of one course share a name by design
+            "ISKS-EN-3",
+            "informacijos-sistemos-ir-kibernetine-sauga-angl-99",   # the whole slug, not its prefix
+        ])
 
 
 class SemesterTests(SimpleTestCase):

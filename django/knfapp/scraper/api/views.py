@@ -55,7 +55,7 @@ import logging
 
 from django.db import transaction
 
-from knfapp.common.http import json_response
+from knfapp.common.http import clean_param, json_response, require_methods
 from knfapp.scraper.info_scraper import scrape_faculty_info
 from knfapp.scraper.knf_scraper import scrape_knf_news
 from knfapp.scraper.models import ScraperRun
@@ -121,12 +121,13 @@ _RUN_FIELDS = ("id", "source", "status", "articles_found", "articles_new",
 #   - nothing in the mobile app — Swagger UI / curl
 ############################################################
 
+@require_methods("GET")
 @require_role("admin")
 def scraper_status(request):
     # STEP 1: the optional filters
     # ============================
-    source_filter = (request.GET.get("source") or "").strip()
-    status_filter = (request.GET.get("status") or "").strip().lower()
+    source_filter = (clean_param(request.GET.get("source")) or "").strip()
+    status_filter = (clean_param(request.GET.get("status")) or "").strip().lower()
     if status_filter not in _RUN_STATUSES:
         status_filter = ""
 
@@ -219,6 +220,7 @@ def _latest_run(source: str, status: str = ""):
 #   - nothing in the mobile app — Swagger UI / curl
 ############################################################
 
+@require_methods("POST")
 @transaction.non_atomic_requests
 @require_role("admin")
 def trigger_scrape(request):
@@ -233,6 +235,7 @@ def trigger_scrape(request):
     return json_response(body, status=_trigger_status(knf_result, vu_result))
 
 
+@require_methods("POST")
 @transaction.non_atomic_requests
 @require_role("admin")
 def trigger_schedule_scrape(request):
@@ -242,6 +245,7 @@ def trigger_schedule_scrape(request):
                          status=_trigger_status(result))
 
 
+@require_methods("POST")
 @transaction.non_atomic_requests
 @require_role("admin")
 def trigger_info_scrape(request):

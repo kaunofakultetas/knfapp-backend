@@ -3,13 +3,22 @@
 #
 #  The send gates (the beacon guard on imageUrl in both its
 #  falsy-non-string and foreign-host shapes, cross-room
-#  quotes), the idempotent replay that keeps a retry from
+#  quotes, and the two stable codes the mobile engine
+#  triages on — text_too_long, quote_not_found), the
+#  idempotent replay that keeps a retry from
 #  becoming a duplicate, the unsend's blanking + blob
-#  cleanup + silent repeat, the edit rules, the reaction
+#  cleanup + silent repeat (and the cleanup's owner rule:
+#  a forwarded copy of somebody else's photo never takes
+#  their file, a photo still shown elsewhere waits for its
+#  last message — on unsend and on the expiry sweep alike),
+#  the edit rules, the reaction
 #  allowlist with its replace-not-accumulate write, the
 #  composite paging cursor that equal stamps cannot defeat,
-#  the own-message status ladder, disappearing messages, and
-#  the search escapes.
+#  the own-message status ladder, disappearing messages (the
+#  TTL stamp, the sweep, and the three surfaces that read
+#  WITHOUT a sweep — the preview, the pin banner, the search
+#  — keeping a lapsed row out on their own), and the search
+#  escapes.
 ############################################################
 
 
@@ -29,7 +38,8 @@ from knfapp.uploads import storage
 from knfapp.uploads.models import Upload
 from knfapp.users import auth
 from knfapp.common.timestamps import utc_now_iso
-from .utils import bearer, create_message, create_room, create_user, naive_now
+from knfapp.common.timestamps import as_naive_utc
+from .utils import bearer, create_message, create_room, create_user, naive_now, register_upload
 
 
 class ChatMessageTestCase(TestCase):
@@ -73,7 +83,8 @@ class SendGateTests(ChatMessageTestCase):
     def test_a_quote_must_live_in_this_very_conversation(self):
         other_room = create_room([self.tomas, create_user(username="kitas")])
         foreign = create_message(other_room, self.tomas)
-        self.assertEqual(self._send(text="atsakymas", replyToId=foreign.id).status_code, 400)
+        response = self._send(text="atsakymas", replyToId=foreign.id)
+        self.assertEqual((response.status_code, response.json()["code"]), (400, "quote_not_found"))
         self.assertEqual(self._send(text="x", replyToId="  ").status_code, 400)
 
         own = create_message(self.room, self.ona, text="Klausimas")
@@ -81,6 +92,20 @@ class SendGateTests(ChatMessageTestCase):
         self.assertEqual(response.status_code, 201)
         quote = json.loads(response.content)["message"]["replyTo"]
         self.assertEqual((quote["senderName"], quote["text"]), ("Ona", "Klausimas"))
+
+    def test_the_length_cap_and_the_quote_miss_carry_their_slugs(self):
+        # The mobile engine triages on serverCode: exactly these two
+        # names mean "too long" and "the quoted message is gone"
+        response = self._send(text="a" * 5001)
+        self.assertEqual((response.status_code, response.json()["code"]), (400, "text_too_long"))
+        response = self._send(text="x", replyToId=str(uuid.uuid4()))
+        self.assertEqual((response.status_code, response.json()["code"]), (400, "quote_not_found"))
+        # The same cap, the same name, on an edit
+        own = create_message(self.room, self.tomas)
+        response = bearer(self.client.put, f"/api/chat/conversations/{self.room.id}/messages/{own.id}",
+                          self.tomas_token, data=json.dumps({"text": "a" * 5001}),
+                          content_type="application/json")
+        self.assertEqual((response.status_code, response.json()["code"]), (400, "text_too_long"))
 
     def test_a_gallery_rides_alone(self):
         item = {"url": "/api/uploads/" + "b" * 32 + ".jpg"}
@@ -155,6 +180,59 @@ class UnsendTests(ChatMessageTestCase):
                           f"/api/chat/conversations/{self.room.id}/messages/{msg.id}", self.ona_token)
         self.assertEqual(response.status_code, 403)
 
+    def _unsend(self, msg_id, token=None):
+        return bearer(self.client.delete,
+                      f"/api/chat/conversations/{self.room.id}/messages/{msg_id}",
+                      token or self.tomas_token)
+
+    def test_unsending_someone_elses_photo_keeps_their_file_and_row(self):
+        # Ona's registered photo, sent by Tomas (a member — the send
+        # accepts any local path, a forward would carry exactly
+        # this) and unsent by him: her file and her row survive
+        filename = register_upload(self.tmp, self.ona)
+        sent = self._send(text="Svetima", imageUrl=f"/api/uploads/{filename}")
+        self.assertEqual(sent.status_code, 201)
+        msg_id = json.loads(sent.content)["message"]["id"]
+
+        self.assertEqual(self._unsend(msg_id).status_code, 200)
+        self.assertIsNotNone(Message.objects.get(id=msg_id).deleted_at)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, filename)))
+        self.assertTrue(Upload.objects.filter(filename=filename, user_id=self.ona.id).exists())
+
+    def test_a_photo_sent_twice_goes_with_its_last_message(self):
+        # The forward shape: the same own upload in two messages —
+        # the first unsend keeps the file, the second takes it
+        filename = register_upload(self.tmp, self.tomas)
+        first = json.loads(self._send(text="Pirma", imageUrl=f"/api/uploads/{filename}").content)["message"]["id"]
+        second = json.loads(self._send(text="Antra", imageUrl=f"/api/uploads/{filename}").content)["message"]["id"]
+
+        self.assertEqual(self._unsend(first).status_code, 200)
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, filename)))
+        self.assertTrue(Upload.objects.filter(filename=filename).exists())
+
+        self.assertEqual(self._unsend(second).status_code, 200)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, filename)))
+        self.assertFalse(Upload.objects.filter(filename=filename).exists())
+
+    def test_the_expiry_sweep_takes_the_senders_own_photo_and_keeps_a_foreign_one(self):
+        own = register_upload(self.tmp, self.ona)
+        foreign = register_upload(self.tmp, self.tomas)
+        mine = create_message(self.room, self.ona, text="Nyksta", image_url=f"/api/uploads/{own}",
+                              expires_at=naive_now(minutes_ago=1))
+        theirs = create_message(self.room, self.ona, text="Nyksta svetima", image_url=f"/api/uploads/{foreign}",
+                                expires_at=naive_now(minutes_ago=1))
+
+        # The page read triggers the sweep; the files go on the commit
+        with self.captureOnCommitCallbacks(execute=True):
+            page = bearer(self.client.get, f"/api/chat/conversations/{self.room.id}/messages", self.tomas_token)
+            self.assertEqual(page.status_code, 200)
+
+        self.assertEqual(Message.objects.filter(id__in=[mine.id, theirs.id]).count(), 0)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, own)))
+        self.assertFalse(Upload.objects.filter(filename=own).exists())
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, foreign)))
+        self.assertTrue(Upload.objects.filter(filename=foreign, user_id=self.tomas.id).exists())
+
 
 class EditTests(ChatMessageTestCase):
 
@@ -180,7 +258,9 @@ class EditTests(ChatMessageTestCase):
         self.assertEqual(self._edit(file_row.id, "Pavadinimas").status_code, 400)
 
     def test_the_change_feed_carries_the_edit(self):
-        cursor = naive_now()
+        # The naive wire shape the app sends (no offset — a "+00:00"
+        # in a bare query string would decode as a space anyway)
+        cursor = as_naive_utc(naive_now()).isoformat()
         msg = create_message(self.room, self.tomas, text="Pirmas")
         self._edit(msg.id, "Antras")
         response = bearer(self.client.get,
@@ -288,6 +368,45 @@ class DisappearingTests(ChatMessageTestCase):
         self.assertNotIn("Pradingęs", [m["text"] for m in page["messages"]])
         self.assertEqual(Message.objects.filter(id=expired.id).count(), 0)
 
+    def test_the_preview_falls_back_to_the_previous_live_message(self):
+        # The conversation list never sweeps — its seek must skip
+        # the lapsed row INSIDE the LIMIT 1, so the preview is the
+        # older live message, not the lapsed body and not blank
+        create_message(self.room, self.ona, text="Senas gyvas", minutes_ago=5)
+        create_message(self.room, self.ona, text="Naujas dingęs", minutes_ago=2,
+                       expires_at=naive_now(minutes_ago=1))
+        rows = json.loads(bearer(self.client.get, "/api/chat/conversations",
+                                 self.tomas_token).content)["conversations"]
+        self.assertEqual(rows[0]["lastMessage"]["text"], "Senas gyvas")
+
+    def test_an_expired_pin_leaves_the_banner_at_once(self):
+        # The pin banner is read without a sweep too — the
+        # predicate alone keeps a lapsed pin out
+        create_message(self.room, self.ona, text="Prisegtas gyvas", minutes_ago=3,
+                       pinned_at=naive_now(), pinned_by=self.ona.id)
+        create_message(self.room, self.ona, text="Prisegtas dingęs", minutes_ago=2,
+                       pinned_at=naive_now(), pinned_by=self.ona.id,
+                       expires_at=naive_now(minutes_ago=1))
+        pins = json.loads(bearer(self.client.get, f"/api/chat/conversations/{self.room.id}/pins",
+                                 self.tomas_token).content)["pins"]
+        self.assertEqual([p["text"] for p in pins], ["Prisegtas gyvas"])
+
+    def test_search_never_surfaces_a_lapsed_row_and_a_hit_carries_its_deadline(self):
+        create_message(self.room, self.ona, text="Slaptas gyvas", minutes_ago=3,
+                       expires_at=naive_now(minutes_ago=-60))
+        gone = create_message(self.room, self.ona, text="Slaptas dingęs", minutes_ago=2,
+                              expires_at=naive_now(minutes_ago=1))
+        response = json.loads(bearer(self.client.get,
+                                     f"/api/chat/conversations/{self.room.id}/messages/search?q=Slaptas",
+                                     self.tomas_token).content)
+        self.assertEqual([m["text"] for m in response["messages"]], ["Slaptas gyvas"])
+        self.assertEqual(response["total"], 1)
+        # The hit ships its deadline, so the client can drop it the
+        # moment it lapses on screen
+        self.assertIsNotNone(response["messages"][0]["expiresAt"])
+        # ...and the search swept the room on its way in
+        self.assertEqual(Message.objects.filter(id=gone.id).count(), 0)
+
     def test_the_ttl_bounds(self):
         for seconds in (30, 40_000_000, True):
             response = bearer(self.client.put, f"/api/chat/conversations/{self.room.id}/ttl",
@@ -308,12 +427,15 @@ class SearchTests(ChatMessageTestCase):
                                      self.tomas_token).content)
         self.assertEqual([m["text"] for m in response["messages"]], ["Pasiekta 100% tikslo"])
 
-    def test_a_nul_needle_is_a_miss_never_the_whole_room(self):
+    def test_a_nul_needle_is_never_the_whole_room(self):
+        # clean_param drops the control bytes before the length is
+        # judged: a NUL-only needle is the blank-q 400, never the
+        # bare '%' a NUL-terminated bind would have made of it
         create_message(self.room, self.ona, text="Slaptas tekstas")
-        response = json.loads(bearer(self.client.get,
-                                     f"/api/chat/conversations/{self.room.id}/messages/search?q=%00%00",
-                                     self.tomas_token).content)
-        self.assertEqual(response, {"messages": [], "total": 0})
+        response = bearer(self.client.get,
+                          f"/api/chat/conversations/{self.room.id}/messages/search?q=%00%00",
+                          self.tomas_token)
+        self.assertEqual(response.status_code, 400)
 
     def test_unsent_rows_never_surface(self):
         create_message(self.room, self.ona, text="Randamas")

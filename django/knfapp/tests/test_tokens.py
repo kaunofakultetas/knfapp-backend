@@ -4,8 +4,9 @@
 #  users/auth.py top to bottom: what the sessions table
 #  stores, how a bearer resolves, when it stops resolving,
 #  and what dies with it. These pin the security decisions
-#  a rewrite must not lose — sha256 at rest, lazy expiry
-#  purge taking push tokens with it, the deactivation
+#  a rewrite must not lose — sha256 at rest, a lazy expiry
+#  purge scoped to the one session row (never the push rows
+#  of the account's other devices), the deactivation
 #  backstop, the per-user session cap.
 ############################################################
 
@@ -90,13 +91,29 @@ class ResolveTests(TestCase):
     def test_unknown_token_is_none(self):
         self.assertIsNone(auth.resolve_session_token("no-such-token"))
 
-    def test_expired_token_is_purged_with_the_owners_push_tokens(self):
+    def test_expired_token_purges_its_own_session_row_and_no_push_row(self):
+        # Two devices signed in on different days: the tablet's
+        # 30-day session has lapsed, the phone's is live, and each
+        # holds its own push registration. Presenting the lapsed
+        # token purges THAT session row and nothing else — the
+        # purge used to key the push delete on the USER and took
+        # the phone's registration with it
         user = create_user()
         _session_for(user, "old-token", expires_at=(datetime.now(timezone.utc) - timedelta(days=1)).isoformat())
-        _push_for(user)
+        _session_for(user, "live-token", expires_in_days=20)
+        tablet_push = _push_for(user)
+        phone_push = _push_for(user)
+
         self.assertIsNone(auth.resolve_session_token("old-token"))
-        self.assertEqual(Session.objects.count(), 0)
-        self.assertEqual(PushToken.objects.count(), 0)
+
+        self.assertFalse(Session.objects.filter(token=auth.hash_token("old-token")).exists())
+        self.assertEqual(Session.objects.count(), 1)
+        self.assertEqual(
+            set(PushToken.objects.values_list("id", flat=True)),
+            {tablet_push.id, phone_push.id},
+        )
+        # The other device is untouched — it still answers 200
+        self.assertEqual(bearer(self.client.get, "/api/auth/me", "live-token").status_code, 200)
 
     def test_naive_legacy_expiry_is_read_as_utc(self):
         user = create_user()

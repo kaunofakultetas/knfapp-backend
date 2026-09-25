@@ -280,8 +280,13 @@ def _strip_diacritics(text: str) -> str:
 # digit comes from "N kursas" in the name or "Nk"/"Nc" in the
 # slug; a programme that normally HAS courses and produced
 # none refuses to emit the course-less name (all its courses
-# would merge into one timetable) and falls back to the slug,
-# which is unique, with the slug logged for review.
+# would merge into one timetable) and falls back to the WHOLE
+# slug, which is unique, with the slug logged for review. The
+# fallback used to be capped at 30 characters, and the site's
+# newer slugs ("…-angl-29" … "-32") differ only past that
+# point — the cap merged four course-years' feeds into one
+# name, and group_name is an unconstrained text column, so
+# it bought nothing.
 #
 # Used by:
 #   - scrape_group_schedule (below) — once per group
@@ -312,7 +317,7 @@ def _parse_group_display_name(slug: str, display_name: str) -> str:
             if not course and abbrev not in _COURSELESS_ABBREVS:
                 logger.warning("No course in the %s group '%s' (slug %s) — keeping the slug as its name",
                                abbrev, display_name, slug)
-                return slug[:30]
+                return slug
 
             # An explicit language marker only — plain "angl"
             # also matches the AKUK programme's own name
@@ -322,10 +327,10 @@ def _parse_group_display_name(slug: str, display_name: str) -> str:
 
             return f"{abbrev}{level_suffix}{lang_suffix}-{course}" if course else f"{abbrev}{level_suffix}{lang_suffix}"
 
-    # No programme matched — the raw slug, capped at 30 chars
+    # No programme matched — the raw slug, whole
     logger.info("No programme matched the group '%s' (slug %s) — keeping the slug as its name",
                 display_name, slug)
-    return slug[:30]
+    return slug
 
 
 
@@ -565,9 +570,16 @@ def _extract_title_text(title_field: str) -> str:
 # climb up to five ancestors and take the nearest preceding
 # h2/h3/h4/strong/b sibling, else the link's title
 # attribute, else the de-hyphenated slug. When the name
-# lacks "kursas" the course digit is appended from the
-# slug's "Nk" token. Raises on HTTP failure — the caller
-# marks the whole run failed.
+# lacks "kursas" the course digit is appended — first from
+# the "N Kursas" label the page prints beside the anchor
+# (a <span> just before the anchor's own; the rows of one
+# programme are <br>-separated, so the scan stops at a <br>
+# and never borrows the previous course's label), else from
+# the slug's "Nk" token. The label matters: the site's newer
+# slugs ("…-angl-29") carry no such token, and without the
+# label every course-year of those programmes reached
+# _parse_group_display_name course-less. Raises on HTTP
+# failure — the caller marks the whole run failed.
 #
 # Used by:
 #   - scrape_knf_schedule (below)
@@ -607,7 +619,23 @@ def scrape_group_list() -> list[dict]:
             logger.warning("Skipping the malformed group slug %.80r", slug)
             continue
 
-        # STEP 2.1: nearest preceding heading/bold, up to 5 levels up
+        # STEP 2.1: the course label the page prints beside the
+        # anchor — nearest-first through the previous siblings of
+        # the anchor's own <span>, stopping at the <br> that ends
+        # the row so the label of the course above is never taken.
+        # Strings and tags alike go through get_text, so the blank
+        # whitespace nodes between the tags simply fall through
+        course = ""
+        if link.parent is not None:
+            for sibling in link.parent.previous_siblings:
+                if sibling.name == "br":
+                    break
+                label_match = re.search(r"(\d)\s*kursas", sibling.get_text(strip=True), re.IGNORECASE)
+                if label_match:
+                    course = label_match.group(1)
+                    break
+
+        # STEP 2.2: nearest preceding heading/bold, up to 5 levels up
         display_name = ""
         parent = link.parent
         for _ in range(5):
@@ -624,19 +652,21 @@ def scrape_group_list() -> list[dict]:
                 break
             parent = parent.parent
 
-        # STEP 2.2: no heading found — the link's title attribute
+        # STEP 2.3: no heading found — the link's title attribute
         if not display_name and link.get("title"):
             display_name = link["title"]
 
-        # STEP 2.3: append the course from the slug's "Nk" token
-        # link_text is computed but never read (dead variable)
-        link_text = link.get_text(strip=True)
+        # STEP 2.4: append the course — the page's label first, the
+        # slug's "Nk" token as the fallback for a page without one.
+        # The suffix is the shape _parse_group_display_name reads
         if display_name and "kursas" not in display_name.lower():
-            course_match = re.search(r"(\d)k", slug)
-            if course_match:
-                display_name += f" - {course_match.group(1)} kursas"
+            if not course:
+                course_match = re.search(r"(\d)k", slug)
+                course = course_match.group(1) if course_match else ""
+            if course:
+                display_name += f" - {course} kursas"
 
-        # STEP 2.4: still nothing — the de-hyphenated slug
+        # STEP 2.5: still nothing — the de-hyphenated slug
         # _parse_group_display_name can parse a slug-shaped name
         # too, so this is a usable fallback, not a placeholder
         if not display_name:

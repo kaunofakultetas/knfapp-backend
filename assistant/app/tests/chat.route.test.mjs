@@ -11,7 +11,10 @@
 //  nondeterministically, this suite pins for free: the SSE
 //  out, the exact persistence batch, the telemetry row, the
 //  error envelope the mobile failure taxonomy parses, the
-//  429's Retry-After, the abort path.
+//  429's Retry-After, the abort path, and the gateway
+//  refusing a turn — which must be that envelope too, never
+//  apology text inside a 200, and never the gateway's own
+//  words (they carry the virtual-key identifier).
 //
 //    docker exec knfapp-assistant npm test
 //
@@ -36,6 +39,7 @@ process.env.AI_GATEWAY_KEY = "test-key";
 
 const { default: express } = await import("express");
 const { MockLanguageModelV4, simulateReadableStream } = await import("ai/test");
+const { APICallError } = await import("ai");
 const { default: chatRoutes } = await import("../routes/chat.js");
 const { errorMiddleware } = await import("../middleware/errors.js");
 const { setModelForTests } = await import("../llm/provider.js");
@@ -82,6 +86,34 @@ function scriptTextModel(text, options = {}) {
     doStream: async (call) => {
       seen.calls.push(call);
       return { stream: textStream(text, options) };
+    },
+  }));
+  return seen;
+}
+
+// What the gateway's error body carries in life: the virtual
+// key. It must never reach the phone or the stored thread.
+const SENTINEL = "vk_SECRET";
+
+// The provider error the AI SDK raises on a non-2xx gateway
+// answer — message AND body both quote the upstream text
+const gatewayError = (statusCode, headers = {}) => new APICallError({
+  message: `Insufficient credits for virtual key ${SENTINEL} (org quota exhausted)`,
+  url: "http://gateway.test/v1/chat/completions",
+  requestBodyValues: {},
+  statusCode,
+  responseHeaders: headers,
+  responseBody: `{"error":{"message":"virtual key ${SENTINEL} refused"}}`,
+});
+
+// A gateway refusing the turn: doStream throws before a single
+// chunk, exactly as the SDK does on a non-2xx answer
+function scriptRefusingGateway(statusCode, headers = {}) {
+  const seen = { calls: [] };
+  setModelForTests(new MockLanguageModelV4({
+    doStream: async (call) => {
+      seen.calls.push(call);
+      throw gatewayError(statusCode, headers);
     },
   }));
   return seen;
@@ -366,4 +398,146 @@ test("a mid-stream model error folds into apologetic text WITH the cause, and lo
 
   const log = await waitFor(() => turnLogs().find((r) => r.body.outcome === "error"));
   assert.ok(log, "the failed turn was counted as an error");
+});
+
+
+// ---------------------------------------------------------
+// The gateway refusing the turn — before the head is written
+// ---------------------------------------------------------
+
+test("a gateway 429 is a 429 envelope with the relayed Retry-After — nothing leaked, no blank reply stored", async () => {
+  stub.script.users.set("tok-quota", { id: "u-quota" });
+  stub.script.threads.set("thread-quota", { user_id: "u-quota" });
+  const seen = scriptRefusingGateway(429, { "retry-after": "30" });
+
+  const response = await ask(userTurn("kada egzaminai?", "thread-quota"), { token: "tok-quota" });
+  assert.equal(response.status, 429);
+  assert.match(response.headers.get("content-type") || "", /application\/json/);
+  assert.equal(response.headers.get("retry-after"), "30");
+  const raw = await response.text();
+  const body = JSON.parse(raw);
+  assert.equal(body.error.code, "GATEWAY_RATE_LIMITED");
+  assert.equal(body.message, body.error.message);
+  assert.ok(!raw.includes(SENTINEL), "the gateway's words never reach the phone");
+  assert.equal(seen.calls.length, 1);
+
+  const log = await waitFor(() => turnLogs().find((r) => r.body.thread_id === "thread-quota"));
+  assert.equal(log.body.outcome, "error");
+  // The question is kept, the answerless reply is not — no
+  // permanent blank bubble in the thread
+  const persisted = await waitFor(() => persists().find((r) => /thread-quota/.test(r.path)));
+  assert.ok(!JSON.stringify(persisted.body).includes(SENTINEL));
+  assert.deepEqual(persisted.body.messages.map((message) => message.role), ["user"]);
+});
+
+
+test("a gateway 429 without Retry-After relays none; a wait above the clamp is capped", async () => {
+  scriptRefusingGateway(429);
+  const bare = await ask(userTurn("labas"));
+  assert.equal(bare.status, 429);
+  assert.equal(bare.headers.get("retry-after"), null);
+  await bare.text();
+
+  scriptRefusingGateway(429, { "retry-after": "3600" });
+  const capped = await ask(userTurn("labas"));
+  assert.equal(capped.status, 429);
+  assert.equal(capped.headers.get("retry-after"), "600");
+  await capped.text();
+  await waitFor(() => turnLogs().length >= 2);
+});
+
+
+test("a gateway 401 or 403 is a 503 GATEWAY_AUTH — the container's key, never the student's session", async () => {
+  for (const status of [401, 403]) {
+    scriptRefusingGateway(status);
+    const response = await ask(userTurn("labas"));
+    assert.equal(response.status, 503, `gateway ${status}`);
+    const raw = await response.text();
+    assert.equal(JSON.parse(raw).error.code, "GATEWAY_AUTH");
+    assert.ok(!raw.includes(SENTINEL));
+  }
+  await waitFor(() => turnLogs().length >= 2);
+});
+
+
+test("a gateway 500 is a 502 GATEWAY_ERROR, a refused connection a 502 GATEWAY_UNREACHABLE", async () => {
+  scriptRefusingGateway(500);
+  const failed = await ask(userTurn("labas"));
+  assert.equal(failed.status, 502);
+  assert.equal((await failed.json()).error.code, "GATEWAY_ERROR");
+
+  // The SDK raises the same class with NO status when the
+  // socket is refused or dropped before an answer
+  scriptRefusingGateway(undefined);
+  const down = await ask(userTurn("labas"));
+  assert.equal(down.status, 502);
+  assert.equal((await down.json()).error.code, "GATEWAY_UNREACHABLE");
+  await waitFor(() => turnLogs().length >= 2);
+});
+
+
+test("a healthy stream still opens 200 SSE: the held start frame first, the tokens intact", async () => {
+  scriptTextModel("Sveiki!");
+  const response = await ask(userTurn("labas"));
+  assert.equal(response.status, 200);
+  assert.match(response.headers.get("content-type") || "", /text\/event-stream/);
+  const parsed = await frames(response);
+  assert.equal(parsed[0].type, "start");
+  assert.match(parsed[0].messageId, /^srv-/, "the replayed start frame keeps the minted id");
+  assert.equal(streamedText(parsed), "Sveiki!");
+  assert.equal(parsed.at(-1).type, "finish");
+  await waitFor(() => turnLogs()[0]);
+});
+
+
+test("a gateway error AFTER the first token rides inside the 200 as text naming class and status — never the body", async () => {
+  stub.script.users.set("tok-mid", { id: "u-mid" });
+  stub.script.threads.set("thread-mid", { user_id: "u-mid" });
+  setModelForTests(new MockLanguageModelV4({
+    doStream: async () => ({
+      stream: simulateReadableStream({ chunks: [
+        { type: "text-start", id: "t1" },
+        { type: "text-delta", id: "t1", delta: "Prad" },
+        { type: "error", error: gatewayError(500) },
+      ]}),
+    }),
+  }));
+
+  const response = await ask(userTurn("labas", "thread-mid"), { token: "tok-mid" });
+  assert.equal(response.status, 200, "the head was already out — the failure rides inside the stream");
+  const raw = await response.text();
+  assert.match(raw, /"delta":"Prad"/);
+  assert.match(raw, /Atsiprašau, įvyko klaida/);
+  assert.match(raw, /AI_APICallError: HTTP 500/);
+  assert.ok(!raw.includes(SENTINEL), "the gateway's words never reach the stream");
+
+  const persisted = await waitFor(() => persists().find((r) => /thread-mid/.test(r.path)));
+  assert.ok(!JSON.stringify(persisted.body).includes(SENTINEL), "nor the stored thread");
+  const reply = persisted.body.messages.at(-1);
+  assert.equal(reply.role, "assistant");
+  assert.equal(reply.parts.filter((part) => part.type === "text").map((part) => part.text).join(""), "Prad");
+  await waitFor(() => turnLogs().find((r) => r.body.outcome === "error"));
+});
+
+
+// ---------------------------------------------------------
+// The prompt store failing — distinct from being switched off
+// ---------------------------------------------------------
+
+test("a prompt fetch failure is a 503 PROMPT_UNAVAILABLE that clears on Django's next answer — never PROMPT_NOT_CONFIGURED", async () => {
+  stub.script.prompt = { status: 502 };
+  const seen = scriptTextModel("Labas!");
+  const down = await ask(userTurn("labas"));
+  assert.equal(down.status, 503);
+  assert.equal((await down.json()).error.code, "PROMPT_UNAVAILABLE");
+  assert.equal(seen.calls.length, 0, "no model spend without a prompt");
+
+  // Django is back — the very next turn asks again and answers
+  stub.script.prompt = { version: 7, text: "CORE {TODAY}" };
+  const up = await ask(userTurn("labas"));
+  assert.equal(up.status, 200);
+  assert.equal(streamedText(await frames(up)), "Labas!");
+  assert.equal(stub.requests.filter((r) => r.path === "/internal/assistant/prompt").length, 2,
+               "the recovered store was asked again at once");
+  await waitFor(() => turnLogs()[0]);
 });

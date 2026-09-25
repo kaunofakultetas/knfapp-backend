@@ -4,15 +4,18 @@
 #  uploads/gates.py as tables: the bytes decide, the name
 #  only shapes messages. The re-encode pins are the
 #  security decisions — metadata stripped, transparency to
-#  PNG, animation preserved, the pixel bomb refused — each
-#  proven on a tiny generated image, never a fixture file.
+#  PNG, animation preserved, the pixel bomb refused from its
+#  HEADER before a pixel decodes — each proven on a tiny
+#  generated image, never a fixture file.
 ############################################################
 
 
 import io
+import zlib
+from unittest import mock
 
 
-from PIL import Image
+from PIL import Image, ImageFile
 from django.test import SimpleTestCase
 
 
@@ -29,6 +32,21 @@ def _jpg(size=(4, 4)):
     buf = io.BytesIO()
     Image.new("RGB", size, (10, 20, 30)).save(buf, format="JPEG")
     return buf.getvalue()
+
+
+def _png_declaring(width, height):
+    # A real 4x4 PNG whose IHDR promises another size — the
+    # header-only bomb. Every chunk CRC still checks (the IHDR's
+    # is recomputed), so verify() passes it; only a decode would
+    # find the pixels missing
+    blob = bytearray(_png())
+    assert blob[12:16] == b"IHDR"
+    data = bytearray(blob[16:29])
+    data[0:4] = width.to_bytes(4, "big")
+    data[4:8] = height.to_bytes(4, "big")
+    blob[16:29] = data
+    blob[29:33] = zlib.crc32(b"IHDR" + bytes(data)).to_bytes(4, "big")
+    return bytes(blob)
 
 
 class SniffTests(SimpleTestCase):
@@ -127,3 +145,51 @@ class ReencodeTests(SimpleTestCase):
         frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:])
         _, _, rejection = gates.reencode_image(buf.getvalue())
         self.assertEqual(rejection[1], "image_too_large")
+
+    def _refusing_any_decode(self):
+        # Both load() implementations Pillow could reach — the
+        # generic one and ImageFile's tiled decoder — raise, so a
+        # gate that decodes before it budgets shows up as
+        # bad_file_content (and a recorded reach) instead of the
+        # image_too_large it owes
+        reached = []
+
+        def load(image):
+            reached.append(type(image).__name__)
+            raise AssertionError("a pixel was decoded")
+
+        patches = (mock.patch.object(Image.Image, "load", load),
+                   mock.patch.object(ImageFile.ImageFile, "load", load))
+        return reached, patches
+
+    def test_a_header_bomb_is_refused_before_a_pixel_decodes(self):
+        # 7000x7000 declared on a 200-byte body: 49 MP is over the
+        # gate's 30 MP ceiling but under the 60 MP where Pillow's
+        # guard, when it sat AT the ceiling, first raised — the band
+        # a bomb aims at, where the old gate allocated ~150 MB before
+        # it compared a number
+        bomb = _png_declaring(7000, 7000)
+        reached, (generic, tiled) = self._refusing_any_decode()
+        with generic, tiled:
+            _, _, rejection = gates.reencode_image(bomb)
+        self.assertEqual(rejection[1], "image_too_large")
+        self.assertEqual(reached, [])
+
+    def test_the_frame_budget_is_settled_from_the_header_too(self):
+        # Every frame of a 40 x 1000x1000 GIF passes Pillow's own
+        # per-frame guard; the 40 MP total is the gate's to refuse,
+        # and it must do so from the frame COUNT, not after decoding
+        # a frame
+        frames = [Image.new("P", (1000, 1000), i % 4) for i in range(40)]
+        buf = io.BytesIO()
+        frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:])
+        reached, (generic, tiled) = self._refusing_any_decode()
+        with generic, tiled:
+            _, _, rejection = gates.reencode_image(buf.getvalue())
+        self.assertEqual(rejection[1], "image_too_large")
+        self.assertEqual(reached, [])
+
+    def test_pillows_hard_stop_sits_on_the_advertised_ceiling(self):
+        # Pillow raises only past TWICE its own limit — half the
+        # gate's ceiling is what puts the hard stop exactly on it
+        self.assertEqual(Image.MAX_IMAGE_PIXELS * 2, gates.MAX_IMAGE_PIXELS)

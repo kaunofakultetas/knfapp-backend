@@ -1,15 +1,45 @@
 :80 {
     encode zstd gzip
 
+    # X-Forwarded-For — this ingress sits BEHIND another Caddy
+    # (the host's TLS terminator, sistema-endpoint), which
+    # reaches it over a private docker bridge. With no
+    # trusted_proxies a reverse_proxy OVERWRITES the incoming
+    # X-Forwarded-For with its immediate peer, so the backend
+    # only ever saw that one constant address and every IP-keyed
+    # rate limit collapsed into one bucket. `trusted_proxies
+    # private_ranges` on every backend proxy below keeps the
+    # chain the outer proxy stamped and appends the peer, so the
+    # backend receives "<client>, <outer proxy>" and counts back
+    # TRUSTED_PROXY_HOPS (1) to the client. private_ranges
+    # rather than a pinned address on purpose: the outer proxy's
+    # bridge IP changes when that stack is recreated, and a
+    # direct hit on the published port 80 from a public address
+    # is still untrusted, exactly as it should be.
+
     route {
 
         # Uploads: the one route that may carry a video (50 MB
-        # + the multipart envelope — Flask's MAX_CONTENT_LENGTH)
+        # + the multipart envelope — VIDEO_MAX_SIZE in
+        # uploads/gates.py; DATA_UPLOAD_MAX_MEMORY_SIZE matches).
+        # What comes back is user-supplied bytes served inline on
+        # the same origin as the admin panel, so the ingress adds
+        # the no-sniff / no-frame / no-script set — the backend
+        # sets no security headers of its own (settings.MIDDLEWARE
+        # is CommonMiddleware only)
         handle /api/uploads* {
             request_body {
                 max_size 52MB
             }
+            header {
+                defer
+                X-Content-Type-Options "nosniff"
+                X-Frame-Options "DENY"
+                Referrer-Policy "strict-origin-when-cross-origin"
+                Content-Security-Policy "script-src 'none'; frame-ancestors 'none'"
+            }
             reverse_proxy knfapp-django:8000 {
+                trusted_proxies private_ranges
                 header_up -X-Forwarded-Prefix
             }
         }
@@ -23,14 +53,85 @@
             request_body {
                 max_size 2MB
             }
+            header {
+                defer
+                X-Content-Type-Options "nosniff"
+                X-Frame-Options "DENY"
+                Referrer-Policy "strict-origin-when-cross-origin"
+            }
             reverse_proxy knfapp-assistant:3000 {
+                trusted_proxies private_ranges
                 flush_interval -1
                 header_up -X-Forwarded-Prefix
             }
         }
 
 
-        # API backend
+        # Wayfind media — panoramas and capture frames bypass
+        # /api/uploads on purpose (that path downsizes to 2048 px
+        # and a panorama needs its width), so they need their own
+        # body ceiling: the backend's DATA_UPLOAD_MAX_MEMORY_SIZE
+        # (52 MB), not the 6 MB JSON bucket below, which made the
+        # documented 8192 px / 60 MP panorama design unreachable
+        # and answered the phone with an empty-bodied 413 it
+        # could only show as "rejected"
+        handle /api/wayfind/buildings/*/panoramas {
+            request_body {
+                max_size 52MB
+            }
+            header {
+                defer
+                X-Content-Type-Options "nosniff"
+                X-Frame-Options "DENY"
+                Referrer-Policy "strict-origin-when-cross-origin"
+            }
+            reverse_proxy knfapp-django:8000 {
+                trusted_proxies private_ranges
+                header_up -X-Forwarded-Prefix
+            }
+        }
+        handle /api/wayfind/captures/*/frames/* {
+            request_body {
+                max_size 52MB
+            }
+            header {
+                defer
+                X-Content-Type-Options "nosniff"
+                X-Frame-Options "DENY"
+                Referrer-Policy "strict-origin-when-cross-origin"
+            }
+            reverse_proxy knfapp-django:8000 {
+                trusted_proxies private_ranges
+                header_up -X-Forwarded-Prefix
+            }
+        }
+
+
+        # Meme pushes — the library's GIF ceiling is 8 MiB
+        # (memes/api/views.py GIF_MAX_BYTES); 9 MB leaves room for
+        # the multipart envelope. Same reason as above: the 6 MB
+        # bucket below silently cut the documented cap to 6 MB
+        handle /api/memes {
+            request_body {
+                max_size 9MB
+            }
+            header {
+                defer
+                X-Content-Type-Options "nosniff"
+                X-Frame-Options "DENY"
+                Referrer-Policy "strict-origin-when-cross-origin"
+            }
+            reverse_proxy knfapp-django:8000 {
+                trusted_proxies private_ranges
+                header_up -X-Forwarded-Prefix
+            }
+        }
+
+
+        # API backend. The security headers live here at the
+        # ingress for every JSON and media response: the backend
+        # sets none of its own (settings.MIDDLEWARE is
+        # CommonMiddleware only)
         handle /api/* {
             # Oversized bodies die here instead of filling the
             # backend's /tmp tmpfs; 6 MB is more than any JSON
@@ -38,16 +139,35 @@
             request_body {
                 max_size 6MB
             }
+            header {
+                defer
+                X-Content-Type-Options "nosniff"
+                X-Frame-Options "DENY"
+                Referrer-Policy "strict-origin-when-cross-origin"
+            }
+            # Floor plans are public, immutable SVG — a document
+            # type that runs inline script when navigated to
+            # directly, and the upload sanitiser is a single regex
+            # pass. The ingress denies script and sandboxes the
+            # document; <img> and fetch consumers are unaffected
+            # (a CSP governs documents only)
+            @plans path /api/wayfind/plans/*
+            header @plans {
+                defer
+                Content-Security-Policy "default-src 'none'; sandbox; frame-ancestors 'none'"
+            }
             reverse_proxy knfapp-django:8000 {
+                trusted_proxies private_ranges
                 header_up -X-Forwarded-Prefix
             }
         }
 
 
-        # Socket.IO realtime chat (same Flask backend; Caddy
+        # Socket.IO realtime chat (same Django backend; Caddy
         # passes WebSocket upgrades through automatically)
         handle /socket.io/* {
             reverse_proxy knfapp-django:8000 {
+                trusted_proxies private_ranges
                 header_up -X-Forwarded-Prefix
             }
         }
@@ -64,18 +184,23 @@
         }
 
 
-        # DbGate — an admin DB console on the public origin, so
-        # the ingress asks for credentials before DbGate's own
-        # single shared login is even reachable. The hash comes
-        # from the environment (compose passes
-        # DBGATE_BASIC_AUTH_HASH to knfapp-caddy, generated with
-        # `caddy hash-password`); the baked-in default is the
-        # bcrypt of a random password nobody holds, so an
-        # unconfigured deploy fails CLOSED rather than open.
+        # DbGate — the admin DB console on the public origin, with
+        # NO ingress credential in front of it: DbGate's own single
+        # shared login (DBGATE_PASSWORD) is the whole boundary, and
+        # nothing rate-limits it. Owner's decision, 2026-09-21 — an
+        # extra HTTP Basic prompt was tried and rolled back so a
+        # signed-in DbGate session is not asked to log in twice;
+        # the exposure is accepted. The gate below is left ready:
+        # uncomment it and the ingress asks for user "dbgate" with
+        # DBGATE_PASSWORD. Its bcrypt already reaches this container
+        # as DBGATE_BASIC_AUTH_HASH (compose passes it,
+        # runUpdateThisStack.sh generates it), and the baked-in
+        # default is the bcrypt of a random password nobody holds,
+        # so an unset value would lock DbGate out, never open it.
         redir /dbgate /dbgate/
         handle /dbgate/* {
             # basic_auth {
-            #     dbgate {$DBGATE_BASIC_AUTH_HASH:$2b$12$VXRCKp5Z4FWsJSAmbpjcXejgiRZoPoDT8GB3zqQdWaSsJeAinxJ5y}
+            #     dbgate {$DBGATE_BASIC_AUTH_HASH:$2b$12$hkeOB9nneCNR5BqxL0a/Y.fA6Qz6aN4bXmsZ7JZKGwf.9gTQZC3C6}
             # }
             reverse_proxy knfapp-dbgate:3000
         }
@@ -85,25 +210,49 @@
         # SPA, static files only). The files themselves are
         # public; every data call the panel makes goes through
         # /api/* above, where the backend checks the bearer
-        # token and the admin/curator role per endpoint.
+        # token and the admin/curator role per endpoint. The
+        # CSP mirrors the Expo one below minus eval: the Vite
+        # dev server (Dockerfile.dev) injects inline script and
+        # style and needs a same-origin websocket for HMR
         redir /adminpanel /adminpanel/
         handle /adminpanel/* {
             header {
+                defer
                 X-Frame-Options "DENY"
                 X-Content-Type-Options "nosniff"
                 Referrer-Policy "strict-origin-when-cross-origin"
+                Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
             }
             reverse_proxy knfapp-vite:80
         }
 
 
-        # Expo web app — CSP is per-handle rather than site-wide
-        # so /api/* keeps the headers Flask sets itself
-        # (add_security_headers) with no duplication. Metro's
-        # bundle needs inline+eval script and a same-origin
-        # websocket for HMR
+        # Expo — the Metro development server, on the public
+        # origin on purpose: the phones load the bundle from here
+        # (EXPO_PACKAGER_PROXY_URL in compose). Metro
+        # authenticates nothing, so what the phones need stays
+        # open — the bundle, assets, the manifest,
+        # /inspector/device, /hot, /message, /status,
+        # /symbolicate, /logs — and what only a developer's
+        # DevTools would use is denied: the debugger attach
+        # channel and the CDP discovery pages would let anyone
+        # holding a device id run code on a connected phone, and
+        # POST /reload would restart every connected phone at
+        # will. The in-container `POST 127.0.0.1:8081/reload`
+        # used during development is unaffected — this is the
+        # ingress only. The bundle itself is the app's full
+        # unminified source, and no ingress rule can hide it
+        # while Metro is what serves the phones; a static
+        # `expo export` would.
+        #
+        # Metro's bundle needs inline+eval script and a
+        # same-origin websocket for HMR, hence the permissive
+        # CSP; it is per-handle so /api/* keeps its own set above
         handle {
+            @devtools path /inspector/debug* /json* /debugger-ui* /_expo/debugger* /open-debugger* /reload
+            respond @devtools 404
             header {
+                defer
                 X-Frame-Options "DENY"
                 X-Content-Type-Options "nosniff"
                 Referrer-Policy "strict-origin-when-cross-origin"

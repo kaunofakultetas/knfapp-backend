@@ -4,10 +4,14 @@
 #  The ranked unified feed with its weak-ETag 304 path,
 #  post create/read/delete, the like toggle and share
 #  counter, the comment thread, and the poll lifecycle —
-#  behind the frozen wire contract, plus the two
+#  behind the frozen wire contract, plus the three
 #  invariants every write here honours: counters are
-#  RECOMPUTED from child rows (never ±1), and a hidden post
-#  answers the same 404 as a missing one.
+#  RECOMPUTED from child rows inside the UPDATE itself
+#  (never ±1, never a count carried through Python), a
+#  hidden post
+#  answers the same 404 as a missing one, and every write
+#  that changes a feed page bumps the post's updated_at —
+#  the feed fingerprint's moving term (core.feed_version).
 #
 #  Split into:
 #
@@ -21,19 +25,21 @@
 
 import hashlib
 import logging
+import threading
 import uuid
 from datetime import datetime, timezone
 
 
-from django.db import IntegrityError, models, transaction
+from django.db import IntegrityError, connection, models, transaction
 from django.db.models.functions import Coalesce, Greatest, Least
 from django.http import HttpResponse
-from django.views.decorators.http import require_POST
 
 
 from knfapp.common import ratelimit
 from knfapp.common.expressions import JulianDay, JulianDayNow
-from knfapp.common.http import client_ip, get_json_object, json_error, json_response, parse_pagination
+from knfapp.common.http import (
+    clean_param, client_ip, get_json_object, json_error, json_response, parse_pagination, require_methods,
+)
 from knfapp.common.timestamps import utc_now
 from knfapp.news import core
 from knfapp.news.models import (
@@ -49,7 +55,7 @@ from knfapp.news.models import (
 )
 from knfapp.social.activity import drop_activity, record_activity
 from knfapp.social.models import Friendship
-from knfapp.uploads.storage import delete_upload
+from knfapp.uploads.storage import delete_upload, owns_upload
 from knfapp.users.auth import get_current_user, require_auth
 from knfapp.users.models import User
 
@@ -91,6 +97,11 @@ def _gate_row(post_id):
     return NewsPost.objects.filter(id=post_id).values(*core.GATE_FIELDS).first()
 
 
+def _set_token(ids):
+    # A set of ids as one short, order-free seed token
+    return hashlib.sha256(",".join(sorted(ids)).encode("utf-8")).hexdigest()[:16]
+
+
 def _post_row(post_id):
     # POST_FIELDS plus the live author name, LEFT-JOINed so a
     # post whose author was erased still answers
@@ -102,9 +113,53 @@ def _post_row(post_id):
     )
 
 
+def _can_engage(post, user):
+    # The write gate for a like or a comment: the read gate (which
+    # already hides a blocked pair's WALL posts), plus — on a
+    # non-wall row, where the block never hides the post itself —
+    # the pair test. Reading a teacher's announcement stays open to
+    # the student they blocked; liking or commenting on it is the
+    # harassment channel, and answers the same 404. An admin keeps
+    # their bypass, as on the read gate
+    if not core.can_view_post(post, user):
+        return False
+    if post["source"] == "user" or not post["author_id"] or user["role"] == "admin":
+        return True
+    return not core.blocked_pair(user["id"], post["author_id"])
+
+
+def _child_count(model):
+    # The counter recount as ONE statement: the expression a
+    # news_posts UPDATE binds to likes_count/comments_count — a
+    # correlated COUNT(*) of the child rows pointing at the row being
+    # updated, COALESCEd to 0 when there are none. Counting first
+    # (.count()) and binding the integer is TWO statements, and the
+    # gap between them is where two racing likes both read 1 and both
+    # write 1; here the database evaluates the count and the write
+    # together, so a drifted counter heals and a race cannot slip a
+    # stale integer in. The same shape as vote_poll's option recount
+    return Coalesce(
+        models.Subquery(
+            model.objects.filter(post_id=models.OuterRef("id"))
+            .values("post_id").annotate(c=models.Count("*")).values("c")[:1],
+            output_field=models.IntegerField(),
+        ),
+        models.Value(0),
+    )
+
+
 def _cacheable(response, tag, shared):
+    # The body is the CALLER's (their friends' private rows, their
+    # liked flags, their block set): Vary on Authorization keys
+    # every cache on the credential, and the signed-in arm is
+    # no-cache so the seeded ETag is revalidated on every request
+    # — a shared device must never replay one member's page to the
+    # next. Accept-Encoding stays in the list because Caddy's
+    # encode layer emits it. A guest's page is everybody's, and
+    # may sit in a shared cache for FEED_CACHE_MAX_AGE
     response["ETag"] = f'W/"{tag}"'
-    response["Cache-Control"] = f"{'public' if shared else 'private'}, max-age={core.FEED_CACHE_MAX_AGE}"
+    response["Vary"] = "Authorization, Accept-Encoding"
+    response["Cache-Control"] = f"public, max-age={core.FEED_CACHE_MAX_AGE}" if shared else "private, no-cache"
     return response
 
 
@@ -124,12 +179,16 @@ def _cacheable(response, tag, shared):
 # it stay out of every page of the run, so a scraper insert
 # mid-paging cannot shift the OFFSET window). Guests see
 # public non-wall rows; members add their own rows and
-# their friends' wall posts, and non-staff never see a
-# private faculty draft. The ranking runs on a NARROW
-# id-only query; only the page of ids is joined out to
-# full rows. Every answer carries a weak ETag over the
-# feed fingerprint plus the caller, their friend set and
-# the query — a 304 is decided before any ranking work.
+# their friends' wall posts, non-staff never see a private
+# faculty draft, and a wall post by an account on either
+# side of a block with the viewer is never listed (official
+# rows are — see core.can_view_post). The ranking runs on a
+# NARROW id-only query; only the page of ids is joined out
+# to full rows. Every answer carries a weak ETag over the
+# feed fingerprint plus every input the visibility filter
+# took — the caller, their role, their friend set, their
+# block set — and the query; a 304 is decided before any
+# ranking work.
 #
 # Used by:
 #   - services/api/news.ts fetchNewsFeed — the news tab's
@@ -143,11 +202,11 @@ def get_feed(request):
     if err:
         return err
 
-    source_filter = request.GET.get("source")
+    source_filter = clean_param(request.GET.get("source"))
     if source_filter is not None and source_filter not in SOURCES:
         return json_error(f"source must be one of: {', '.join(SOURCES)}", 400)
 
-    before = request.GET.get("before")
+    before = clean_param(request.GET.get("before"))
     if before is not None:
         pinned = core.as_utc(core.parse_iso(before))
         if pinned is None:
@@ -162,8 +221,9 @@ def get_feed(request):
     # the inflected tail (Lithuanian endings — "stipendijos" /
     # "stipendija" / "stipendijai" share a stem) and matched
     # with icontains over title and content; tokens combine
-    # with AND. Empty q filters nothing.
-    q_filter = (request.GET.get("q") or "").strip()[:100]
+    # with AND. Empty q filters nothing; a control byte is
+    # stripped before the LIKE ever sees it
+    q_filter = (clean_param(request.GET.get("q")) or "").strip()[:100]
 
     # STEP 2: the visibility filter, as composable Q objects
     # ======================================================
@@ -178,6 +238,7 @@ def get_feed(request):
         visibility &= models.Q(published_at__lte=before)
 
     friend_ids = []
+    blocked = set()
     if not user:
         visibility &= models.Q(is_public=1) & ~models.Q(source="user")
     else:
@@ -190,15 +251,26 @@ def get_feed(request):
         if user["role"] not in core.STAFF_ROLES:
             visibility &= (models.Q(is_public=1) | models.Q(source="user")
                            | models.Q(author_id=user["id"]))
+        # The block hides WALL rows only — a faculty announcement
+        # by an author who blocked the viewer stays in the feed
+        blocked = core.block_set(user["id"])
+        if blocked:
+            visibility &= ~(models.Q(source="user") & models.Q(author_id__in=blocked))
 
 
-    # STEP 3: the ETag seed — fingerprint + caller + friend set +
-    # query; a matching If-None-Match ends the request here
-    # ===========================================================
+    # STEP 3: the ETag seed — fingerprint + caller + query, and
+    # the mechanical rule that keeps a 304 honest: EVERY input the
+    # visibility filter above took is an input here (the role
+    # decides the draft slice, the friend set and the block set
+    # decide the wall slice — each hashed to a short token); a
+    # matching If-None-Match ends the request here
+    # ============================================================
     seed = "|".join((
         core.feed_version(),
         user["id"] if user else "guest",
-        hashlib.sha256(",".join(sorted(friend_ids)).encode("utf-8")).hexdigest()[:16] if user else "-",
+        user["role"] if user else "-",
+        _set_token(friend_ids) if user else "-",
+        _set_token(blocked) if user else "-",
         str(page), str(per_page), source_filter or "-", q_filter or "-", core.feed_stamp(before),
     ))
     tag = core.etag_for(seed)
@@ -270,6 +342,58 @@ def get_feed(request):
 
 
 ############################################################
+# _push_news_post / _spawn_news_push
+############################################################
+#
+# The 'news' push fan-out for a public faculty post, run OFF
+# the request thread the way the chat send and the admin
+# broadcast run theirs. create_post arms it from
+# transaction.on_commit, so it starts only for a post that
+# is really in the database, and it never holds the worker
+# or its transaction on Expo's round-trips (a 10 s timeout
+# per call, retries, one call per slice of 100 devices).
+# Under ATOMIC_REQUESTS the commit callback itself still
+# runs on the request thread — which is why it hands the
+# work to a daemon thread instead of calling notify_channel
+# there. The import rides inside the try, so the route
+# stands without the push module; every failure is logged
+# and swallowed (push never owes anybody an error); the
+# thread's DB connection is closed on the way out.
+#
+# _spawn_news_push is the seam the tests patch — the suite
+# observes the hand-off, it does not race a real thread.
+#
+# Used by:
+#   - create_post (below) — STEP 4, from the commit hook
+############################################################
+
+def _push_news_post(title, summary, data, exclude_user_id):
+    try:
+        from knfapp.notifications.push import notify_channel
+        notify_channel("news", title, summary, data=data, exclude_user_id=exclude_user_id)
+    except Exception:
+        logger.exception("Failed to push the new faculty post %s on the 'news' channel",
+                         data.get("postId"))
+    finally:
+        connection.close()
+
+
+def _spawn_news_push(title, summary, data, exclude_user_id):
+    threading.Thread(
+        target=_push_news_post,
+        args=(title, summary, data, exclude_user_id),
+        daemon=True,
+        name="news-push-fanout",
+    ).start()
+
+
+
+
+
+
+
+
+############################################################
 # create_post
 ############################################################
 #
@@ -280,17 +404,21 @@ def get_feed(request):
 # typed before SQL; post_type is whitelisted with 'poll'
 # excluded; is_public must be a real boolean; image_url must
 # be a relative /api/uploads/ path (a foreign host would
-# beacon every reader to an attacker-chosen server). The 201
+# beacon every reader to an attacker-chosen server) AND one
+# of the caller's own registered uploads (400
+# upload_not_owned) — filenames are public, and the delete
+# below would otherwise take somebody else's file. The 201
 # re-reads the row through post_to_dict + liked=False, and a
-# public faculty post rings the 'news' push channel (import-
-# guarded; a push failure never fails the 201).
+# public faculty post rings the 'news' push channel from a
+# daemon thread armed on the commit (_spawn_news_push above
+# — a push failure never fails the 201).
 #
 # Used by:
 #   - services/api/news.ts createPost — the create-post
 #     screen; a poll follows via create_poll
 ############################################################
 
-@require_POST
+@require_methods("POST")
 @require_auth
 @ratelimit.per_user("news_post", max_attempts=20)
 def create_post(request):
@@ -334,6 +462,11 @@ def create_post(request):
         return json_error("image_url must be a relative /api/uploads/ path", 400)
     if image_url and not image_url.startswith("/api/uploads/"):
         return json_error("image_url must be a relative /api/uploads/ path", 400)
+    # The prefix is public knowledge (every cover shows one) — the
+    # file must also be a registered upload of the caller's own,
+    # or deleting the post would take somebody else's file with it
+    if image_url and not owns_upload(request.user["id"], image_url):
+        return json_error("image_url must be one of your own uploads", 400, code="upload_not_owned")
 
     if role in core.STAFF_ROLES:
         source = "faculty"
@@ -360,21 +493,17 @@ def create_post(request):
 
 
     # STEP 4: a public faculty announcement rings the 'news'
-    # channel — the import is guarded so the route stands even
-    # without the push module; a failure is logged, never a 500
-    # =========================================================
+    # channel — armed on the commit and handed to a daemon
+    # thread, so Expo's round-trips never hold this worker or
+    # its transaction, and a post the transaction discards is
+    # never announced
+    # =======================================================
     if source == "faculty" and is_public:
-        try:
-            from knfapp.notifications.push import notify_channel
-        except ImportError:
-            notify_channel = None
-        if notify_channel:
-            try:
-                notify_channel("news", title, content[:core.SUMMARY_LENGTH],
-                               data={"type": "news", "source": "faculty", "postId": post_id},
-                               exclude_user_id=request.user["id"])
-            except Exception:
-                logger.exception("Failed to push the new faculty post %s on the 'news' channel", post_id)
+        transaction.on_commit(lambda: _spawn_news_push(
+            title, content[:core.SUMMARY_LENGTH],
+            {"type": "news", "source": "faculty", "postId": post_id},
+            request.user["id"],
+        ))
 
     return json_response(body, status=201)
 
@@ -395,7 +524,9 @@ def create_post(request):
 # scraped articles get their source_url tombstoned first so
 # the scrapers cannot resurrect them, dependants go before
 # the row (belt and braces beside the FK cascade), and the
-# cover upload is deleted only after the commit.
+# cover upload is handed to the uploads sink after the
+# commit AS THE AUTHOR'S — also when an admin deletes the
+# post: the sink refuses a file the author never owned.
 #
 # Used by:
 #   - services/api/news.ts fetchNewsPost (the detail screen);
@@ -458,11 +589,14 @@ def delete_post(request, post_id):
 
 
     # STEP 4: the cover file, after the delete is definitely in —
-    # only our own uploads; a failure never fails the response
-    # ==========================================================
+    # as the author (the cover is theirs, whoever deletes the
+    # post; a foreign file planted in the column stays); a failure
+    # never fails the response
+    # ============================================================
     image_url = post["image_url"]
+    author_id = post["author_id"]
     if isinstance(image_url, str) and image_url.startswith("/api/uploads/"):
-        transaction.on_commit(lambda: delete_upload(image_url))
+        transaction.on_commit(lambda: delete_upload(image_url, author_id))
 
     if post["author_id"] == user["id"]:
         logger.info("News post %s deleted by its author %s", post_id, user["id"])
@@ -484,27 +618,33 @@ def delete_post(request, post_id):
 ############################################################
 #
 # The like flips the caller's news_likes row on a post they
-# may SEE (get_or_create absorbs the concurrent-toggle PK
-# race) and RECOMPUTES likes_count from the rows; the
+# may ENGAGE with (_can_engage: the read gate plus the
+# block's pair test on official rows; get_or_create absorbs
+# the concurrent-toggle PK race) and RECOMPUTES likes_count
+# from the rows inside the UPDATE (_child_count — one
+# statement, never a count carried through Python); the
 # author's activity row rides the same
 # transaction — a like lands one, an unlike takes it back.
 # The share bumps shares_count with no auth (guests share
-# too) but the same visibility gate — a 200-vs-404 split on
-# a private post would leak its existence. Both re-read the
-# counter after the write so the reply carries the real
-# number, and a post deleted in that window answers the
-# same 404, never a crash.
+# too), so its budget keys on the client IP — the only
+# identity a guest has — under the plain visibility gate: a
+# 200-vs-404 split on a private post would leak its
+# existence. Both stamp updated_at in the same UPDATE (the
+# feed fingerprint's moving term) and re-read the counter
+# after the write so the reply carries the real number, and
+# a post deleted in that window answers the same 404, never
+# a crash.
 #
 # Used by:
 #   - services/api/news.ts toggleLikeApi / sharePostApi
 ############################################################
 
-@require_POST
+@require_methods("POST")
 @require_auth
 @ratelimit.per_user("news_like", max_attempts=300)
 def toggle_like(request, post_id):
     post = _gate_row(post_id)
-    if not post or not core.can_view_post(post, request.user):
+    if not post or not _can_engage(post, request.user):
         return json_error("Post not found", 404)
 
     _, created = NewsLike.objects.get_or_create(
@@ -517,9 +657,14 @@ def toggle_like(request, post_id):
         NewsLike.objects.filter(user_id=request.user["id"], post_id=post_id).delete()
         liked = False
 
-    # Recomputed from the rows, not ±1 — a drifted counter heals
+    # Recomputed from the rows in ONE statement, not ±1 and not a
+    # count read first — the correlated subquery is evaluated by
+    # the database inside the UPDATE (a .count() bound as an integer
+    # would be a second statement, and two racing likes would both
+    # read 1 and both write 1); a drifted counter heals the same way
     NewsPost.objects.filter(id=post_id).update(
-        likes_count=NewsLike.objects.filter(post_id=post_id).count(),
+        likes_count=_child_count(NewsLike),
+        updated_at=utc_now(),
     )
 
     author = NewsPost.objects.filter(id=post_id).values("author_id", "title").first()
@@ -536,7 +681,8 @@ def toggle_like(request, post_id):
     return json_response({"liked": liked, "likes": fresh["likes_count"]})
 
 
-@require_POST
+@require_methods("POST")
+@ratelimit.per_user("news_share", max_attempts=60)
 def share_post(request, post_id):
     # Optional caller — what the gate needs to tell a friend's
     # private wall post from a stranger's
@@ -546,7 +692,8 @@ def share_post(request, post_id):
     if not post or not core.can_view_post(post, user):
         return json_error("Post not found", 404)
 
-    NewsPost.objects.filter(id=post_id).update(shares_count=models.F("shares_count") + 1)
+    NewsPost.objects.filter(id=post_id).update(shares_count=models.F("shares_count") + 1,
+                                               updated_at=utc_now())
 
     fresh = NewsPost.objects.filter(id=post_id).values("shares_count").first()
     if not fresh:
@@ -566,14 +713,21 @@ def share_post(request, post_id):
 #
 # The thread under one visible post (the parent gates
 # every route — the thread is exactly as private as its
-# post). Pages are newest-first with id breaking
+# post), minus the comments of anyone on either side of a
+# block with the reader (the count follows, so the pages
+# stay consistent). Pages are newest-first with id breaking
 # created_at ties, the users JOIN is LEFT so an orphaned
 # comment still counts AND renders ('Deleted user'), and
-# stamps go out through to_utc_iso. add_comment
-# recomputes comments_count in its transaction and answers
-# the row it wrote with ONE clock read; delete_comment is
-# comment-author / post-author / admin, and the comment
-# must belong to the post in the path.
+# stamps go out through to_utc_iso. add_comment sits
+# behind _can_engage (a blocked pair cannot comment on each
+# other's official posts either), recomputes comments_count
+# inside its UPDATE (_child_count — one statement, never a
+# count carried through Python) and answers the row it
+# wrote with ONE clock read; delete_comment is
+# comment-author /
+# post-author / admin, and the comment must belong to the
+# post in the path. Both writes stamp updated_at — the feed
+# fingerprint's moving term.
 #
 # Used by:
 #   - services/api/news.ts fetchComments / addCommentApi;
@@ -587,12 +741,17 @@ def get_comments(request, post_id):
     offset = (page - 1) * per_page
 
     user = get_current_user(request)
+    blocked = core.block_set(user["id"]) if user else set()
     post = _gate_row(post_id)
-    if not post or not core.can_view_post(post, user):
+    if not post or not core.can_view_post(post, user, blocked):
         return json_error("Post not found", 404)
 
+    thread = NewsComment.objects.filter(post_id=post_id)
+    if blocked:
+        thread = thread.exclude(user_id__in=blocked)
+
     rows = (
-        NewsComment.objects.filter(post_id=post_id)
+        thread
         .annotate(display_name=models.F("user__display_name"), avatar_url=models.F("user__avatar_url"))
         .order_by("-created_at", "-id")
         .values("id", "text", "created_at", "user_id", "display_name", "avatar_url")[offset:offset + per_page]
@@ -609,7 +768,7 @@ def get_comments(request, post_id):
         }
         for r in rows
     ]
-    total = NewsComment.objects.filter(post_id=post_id).count()
+    total = thread.count()
 
     return json_response({"comments": comments, "total": total, "page": page, "perPage": per_page})
 
@@ -625,15 +784,20 @@ def add_comment(request, post_id):
         return json_error(f"Comment must be at most {core.MAX_COMMENT_LENGTH} characters", 400)
 
     post = _gate_row(post_id)
-    if not post or not core.can_view_post(post, request.user):
+    if not post or not _can_engage(post, request.user):
         return json_error("Post not found", 404)
 
     comment_id = str(uuid.uuid4())
     now = utc_now()
     NewsComment.objects.create(id=comment_id, post_id=post_id, user_id=request.user["id"],
                                text=comment_text, created_at=now)
+    # Recomputed from the rows in ONE statement — the count is a
+    # correlated subquery the database evaluates inside the UPDATE,
+    # never a .count() read first and bound as an integer (two
+    # racing comments would both read 1 and both write 1)
     NewsPost.objects.filter(id=post_id).update(
-        comments_count=NewsComment.objects.filter(post_id=post_id).count(),
+        comments_count=_child_count(NewsComment),
+        updated_at=now,
     )
     # The author hears about it; the POST id keys the row, so
     # repeat comments refresh one row with the newest excerpt
@@ -671,14 +835,18 @@ def delete_comment(request, post_id, comment_id):
         return json_error("Only the comment author, the post author or an admin can delete this comment", 403)
 
 
-    # STEP 3: delete and recompute from the rows
-    # ==========================================
+    # STEP 3: delete and recompute from the rows in ONE statement —
+    # the count is a correlated subquery evaluated inside the
+    # UPDATE, never read first and bound (two racing deletes would
+    # both read N-1 and both write N-1); the reply re-reads the
+    # stored number afterwards so it carries what the row says
+    # =============================================================
     NewsComment.objects.filter(id=comment_id).delete()
-    count = NewsComment.objects.filter(post_id=post_id).count()
-    NewsPost.objects.filter(id=post_id).update(comments_count=count)
+    NewsPost.objects.filter(id=post_id).update(comments_count=_child_count(NewsComment), updated_at=utc_now())
+    fresh = NewsPost.objects.filter(id=post_id).values("comments_count").first()
 
     logger.info("Comment %s on post %s deleted by %s", comment_id, post_id, user["id"])
-    return json_response({"status": "deleted", "comments": count})
+    return json_response({"status": "deleted", "comments": fresh["comments_count"] if fresh else 0})
 
 
 
@@ -701,7 +869,10 @@ def delete_comment(request, post_id, comment_id):
 # an ON CONFLICT upsert; re-voting the held option is the
 # 409 the client treats as a no-op; the option counters are
 # RECOMPUTED from the rows (the poll total is derived from
-# them at shape time, never stored).
+# them at shape time, never stored). Attach, detach and
+# vote all stamp the post's updated_at: none of them moves
+# a news_posts counter, and the feed's poll cards would
+# otherwise sit behind a stale 304.
 #
 # Used by:
 #   - services/api/news.ts fetchPoll / createPollApi /
@@ -722,7 +893,7 @@ def get_poll(request, post_id):
     return json_response(core.poll_to_dict(poll, user["id"] if user else None))
 
 
-@require_POST
+@require_methods("POST")
 @require_auth
 @ratelimit.per_user("news_poll", max_attempts=20)
 def create_poll(request, post_id):
@@ -800,10 +971,11 @@ def create_poll(request, post_id):
         PollOption.objects.create(id=str(uuid.uuid4()), poll_id=poll_id, text=opt_text, position=position)
 
 
-    # STEP 6: the post becomes a 'poll' post, and the 201 carries
-    # the fresh poll (userVote None)
+    # STEP 6: the post becomes a 'poll' post (stamped — the feed
+    # fingerprint must see the new card), and the 201 carries the
+    # fresh poll (userVote None)
     # ===========================================================
-    NewsPost.objects.filter(id=post_id).update(post_type="poll")
+    NewsPost.objects.filter(id=post_id).update(post_type="poll", updated_at=now)
     logger.info("Poll %s (%d options) attached to post %s by %s", poll_id, len(options), post_id, user["id"])
 
     poll = Poll.objects.filter(id=poll_id).values(
@@ -843,13 +1015,13 @@ def delete_poll(request, post_id):
         restored = "article"
     else:
         restored = "announcement"
-    NewsPost.objects.filter(id=post_id).update(post_type=restored)
+    NewsPost.objects.filter(id=post_id).update(post_type=restored, updated_at=utc_now())
 
     logger.info("Poll on post %s deleted by %s, post_type restored to %s", post_id, user["id"], restored)
     return json_response({"status": "deleted", "postType": restored})
 
 
-@require_POST
+@require_methods("POST")
 @require_auth
 @ratelimit.per_user("news_vote", max_attempts=120)
 def vote_poll(request, post_id):
@@ -915,8 +1087,9 @@ def vote_poll(request, post_id):
 
 
     # STEP 6: counters recomputed from the rows, never ±1 —
-    # COALESCE lands a zero-vote option on 0, not NULL
-    # =====================================================
+    # COALESCE lands a zero-vote option on 0, not NULL; the post
+    # is stamped so the feed's card cannot hide behind a 304
+    # ==========================================================
     PollOption.objects.filter(poll_id=poll_id).update(
         votes=Coalesce(
             models.Subquery(
@@ -927,6 +1100,7 @@ def vote_poll(request, post_id):
             models.Value(0),
         ),
     )
+    NewsPost.objects.filter(id=post_id).update(updated_at=utc_now())
 
 
     # STEP 7: the fresh poll state

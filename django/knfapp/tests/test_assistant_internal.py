@@ -72,6 +72,16 @@ class AssistantInternalTests(TestCase):
 
     # ----- threads -----
 
+    def test_an_unknown_user_id_is_a_400_before_the_insert(self):
+        # A guest thread needs no user; an id the users table does
+        # not know is refused by a lookup — NOT by the FK, which
+        # PostgreSQL checks only at commit, after the view returned
+        response = self._post("/internal/assistant/threads",
+                              {"user_id": str(uuid.uuid4()), "language": "lt"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "unknown user_id")
+        self.assertEqual(AssistantThread.objects.count(), 0)
+
     def test_created_thread_lists_for_its_owner_only(self):
         owner = create_user(username="ona")
         stranger = create_user(username="petras")
@@ -142,6 +152,16 @@ class AssistantInternalTests(TestCase):
         listed = self._post("/internal/assistant/threads/lookup", {"ids": [thread_id]}).json()
         self.assertEqual(listed["threads"][0]["preview"],
                          "Stipendijos skiriamos pagal rezultatus.")
+
+    def test_a_nul_byte_in_a_turn_is_stripped_before_storage(self):
+        # PostgreSQL's text type refuses NUL (DataError → 500) and
+        # SQLite would store it into the title — the body parser
+        # strips it before the view, so both engines store the text
+        thread_id = self._create_thread()
+        response = self._post(f"/internal/assistant/threads/{thread_id}/messages",
+                              {"messages": [_user_message(text="Kaip\x00 gauti?")]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(AssistantThread.objects.get(id=thread_id).title, "Kaip gauti?")
 
     def test_turn_upsert_is_idempotent_and_title_sticks(self):
         thread_id = self._create_thread()

@@ -96,7 +96,42 @@ log's idempotency, the stitcher's centre-column contract, …). Run
 them with `./runTests.sh` — it builds the image and runs the suite
 in a throwaway container on in-memory SQLite, with
 `makemigrations --check` guarding the migrations against model
-drift.
+drift (the suite itself repeats that check as a test, so the
+everyday `docker exec knfapp-django python3 manage.py test
+knfapp.tests --settings=knfapp.tests.settings` loop runs it too).
+
+### The PostgreSQL pass
+
+Production runs on PostgreSQL and SQLite is not it: foreign keys
+there are checked at COMMIT (an `except IntegrityError` around an
+insert never sees one), the text type refuses NUL bytes, `LIKE`
+folds case by collation, and the vendor-split SQL in
+`common/expressions.py` takes its other branch. The same suite
+runs on PostgreSQL with `TEST_DATABASE_URL` set — the test
+settings read it with the parser `settings.py` uses for
+`DATABASE_URL`, and Django creates and drops `test_<db>` beside
+the database it names. It must name a THROWAWAY cluster: the
+stack's own `knfapp-postgres` image (it carries pgvector, which
+the assistant models need) started once, disposably:
+
+```
+sudo docker run -d --rm --name knfapp-pgtest \
+    -e POSTGRES_DB=knfapp_test -e POSTGRES_USER=knfapp -e POSTGRES_PASSWORD=knfapp \
+    --tmpfs /var/lib/postgresql/data --tmpfs /var/run/postgresql knfapp-postgres
+until sudo docker exec knfapp-pgtest pg_isready -U knfapp -d knfapp_test; do sleep 1; done
+
+TEST_DOCKER_NETWORK=container:knfapp-pgtest \
+TEST_DATABASE_URL=postgres://knfapp:knfapp@127.0.0.1:5432/knfapp_test \
+    ./runTests.sh
+
+sudo docker stop knfapp-pgtest
+```
+
+Never point `TEST_DATABASE_URL` at the live cluster: `settings.py`
+refuses a test run whose target is the production database name
+(`KNFAPP_ALLOW_TEST_ON_PROD_DB=1` is the operator override) —
+that guard exists because runs without `--settings` once left
+eighteen orphaned `test_knfapp_*` databases behind.
 
 ## Data
 

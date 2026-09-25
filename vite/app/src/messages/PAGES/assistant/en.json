@@ -21,6 +21,20 @@
     "run": "Search",
     "empty": "Nothing found — this question has no grounding in the knowledge base."
   },
+  "curated": {
+    "title": "Hand-written answers",
+    "hint": "Knowledge no page carries: exam sessions, retakes, certificates, fees… A saved entry is embedded at once and counts from the next conversation.",
+    "questionPlaceholder": "The question as a student would ask it (one line)",
+    "answerPlaceholder": "The answer — short, factual, self-contained; the assistant quotes it rather than paraphrasing",
+    "add": "Add",
+    "update": "Save changes",
+    "cancel": "Cancel",
+    "edit": "Edit",
+    "delete": "Delete",
+    "deleteConfirm": "Delete this answer from the knowledge base?",
+    "saved": "Answer saved and embedded",
+    "empty": "No hand-written answers yet."
+  },
   "prompts": {
     "title": "System prompt versions",
     "activeLine": "Active version: v{version} — this is the assistant's ENTIRE system prompt.",

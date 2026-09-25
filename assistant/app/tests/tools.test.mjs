@@ -16,7 +16,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { normalizeName, resolveRosterName, vilniusToday, weekBounds } from "../llm/tools.js";
+import { normalizeName, resolveRosterName, toolsPayload, vilniusToday, weekBounds } from "../llm/tools.js";
 
 
 const GROUPS = ["ISKS-1", "ISKS-2", "ISKS-3", "EV-1", "EV-2", "EV-3", "AV-1", "FT-1"];
@@ -90,4 +90,27 @@ test("weekBounds brackets any date Monday..Sunday", () => {
   assert.deepEqual(weekBounds(new Date("2026-09-15T00:00:00Z")), ["2026-09-14", "2026-09-20"]);
   assert.deepEqual(weekBounds(new Date("2026-09-14T00:00:00Z")), ["2026-09-14", "2026-09-20"]);
   assert.deepEqual(weekBounds(new Date("2026-09-20T00:00:00Z")), ["2026-09-14", "2026-09-20"]);
+});
+
+
+// ---------------------------------------------------------
+// toolsPayload — the served half of the frozen contract
+// ---------------------------------------------------------
+
+test("toolsPayload serves the contract envelope: the three tools, name/input/output, description riding along", () => {
+  const payload = toolsPayload();
+  assert.deepEqual(payload.tools.map((tool) => tool.name), ["lookupSchedule", "searchNews", "searchHandbook"]);
+  for (const tool of payload.tools) {
+    assert.equal(typeof tool.description, "string");
+    assert.equal(tool.input.type, "object");
+    assert.equal(tool.output.type, "object");
+    assert.ok(Array.isArray(tool.output.required), `${tool.name} output lists its required keys`);
+  }
+});
+
+
+test("searchNews's output schema declares the optional note its execute sets on an empty answer", () => {
+  const searchNews = toolsPayload().tools.find((tool) => tool.name === "searchNews");
+  assert.deepEqual(searchNews.output.properties.note, { type: "string" });
+  assert.ok(!searchNews.output.required.includes("note"), "note is optional");
 });

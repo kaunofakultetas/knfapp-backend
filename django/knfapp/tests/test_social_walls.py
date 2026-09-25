@@ -2,12 +2,17 @@
 #  [*] Regression tests — walls, blocks, reports, activity
 #
 #  The wall CRUD's ownership-404 rule and the faculty pair,
+#  the cover rule (a registered upload of the caller's own
+#  on create and on a changed edit — 400 upload_not_owned
+#  otherwise, the stored cover sent back unchanged a no-op),
 #  blocking's severing side effects and idempotent taps,
 #  the report whitelist, and the activity list's keyset
 #  paging with its read/unread pair.
 ############################################################
 
 
+import shutil
+import tempfile
 import uuid
 
 
@@ -18,8 +23,10 @@ from knfapp.common import ratelimit
 from knfapp.common.timestamps import utc_now_iso
 from knfapp.social.activity import record_activity
 from knfapp.social.models import Activity, FriendRequest, Friendship, UserBlock
+from knfapp.uploads import storage
+from knfapp.uploads.models import Upload
 from knfapp.users import auth
-from .utils import bearer, befriend, create_post, create_user
+from .utils import bearer, befriend, create_post, create_user, register_upload
 
 
 class WallCrudTests(TestCase):
@@ -52,6 +59,39 @@ class WallCrudTests(TestCase):
                data={"content": "naujas turinys"}, content_type="application/json")
         post.refresh_from_db()
         self.assertEqual(post.published_at.isoformat(), "2026-01-01T10:00:00+00:00")
+
+    def test_a_cover_must_be_the_callers_own_registered_upload_on_create_and_edit(self):
+        tmp = tempfile.mkdtemp(prefix="knfapp-wall-")
+        storage._upload_dir = tmp
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        self.addCleanup(lambda: setattr(storage, "_upload_dir", None))
+        other = create_user(username="kitas", email="k@knf.vu.lt")
+        foreign = register_upload(tmp, other)
+        own = register_upload(tmp, self.author)
+
+        def create(image_url):
+            return bearer(self.client.post, "/api/social/posts", self.token,
+                          data={"content": "Įrašas", "image_url": image_url},
+                          content_type="application/json")
+
+        refused = create(f"/api/uploads/{foreign}")
+        self.assertEqual((refused.status_code, refused.json()["code"]), (400, "upload_not_owned"))
+        created = create(f"/api/uploads/{own}")
+        self.assertEqual(created.status_code, 201)
+        post_id = created.json()["id"]
+
+        def edit(image_url):
+            return bearer(self.client.put, f"/api/social/posts/{post_id}", self.token,
+                          data={"image_url": image_url}, content_type="application/json")
+
+        refused = edit(f"/api/uploads/{foreign}")
+        self.assertEqual((refused.status_code, refused.json()["code"]), (400, "upload_not_owned"))
+        # The stored cover sent back unchanged is a no-op — even
+        # once its ledger row is gone
+        Upload.objects.filter(filename=own).delete()
+        self.assertEqual(edit(f"/api/uploads/{own}").status_code, 200)
+        # A NEW own upload passes
+        self.assertEqual(edit(f"/api/uploads/{register_upload(tmp, self.author)}").status_code, 200)
 
     def test_own_posts_list_shows_private_only_to_self_and_friends(self):
         create_post(author=self.author, title="Privati", is_public=0)

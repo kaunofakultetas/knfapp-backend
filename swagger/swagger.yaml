@@ -4,27 +4,41 @@ info:
   description: |
     Backend API for VU Kaunas Faculty mobile app.
 
-    **Every string in every JSON response is HTML-escaped.** The backend stores
-    raw text and escapes on output only: `html.escape(quote=True)` runs over
-    every string value of every JSON body — success and error alike — so `&`,
-    `<`, `>`, `"` and `'` arrive as `&amp;`, `&lt;`, `&gt;`, `&quot;` and
-    `&#x27;`. Dict keys are untouched. This applies to URLs and timestamps too,
-    not just display text: a `nextUrl` containing `?a=1&b=2` arrives as
-    `?a=1&amp;b=2`. Clients must entity-decode whole responses before use — the
-    mobile app does this centrally in `services/api/client.ts`.
+    **Responses are raw JSON — nothing is escaped on output.** The backend
+    stores text exactly as submitted and returns it exactly as stored: `&`,
+    `<`, `>`, `"` and `'` arrive as themselves in every string of every JSON
+    body, success and error alike, URLs and timestamps included, and the plan
+    SVGs under `/wayfind/plans/` are served byte for byte. Clients must NOT
+    entity-decode responses: a literal `&amp;` in a body is content the user
+    typed (decoding it and saving the result back rewrites their text), and
+    inside an SVG it is the only legal spelling of `&`. Escaping for display
+    is the rendering layer's job — React and React Native Text escape on
+    render. Socket.IO payloads (namespace `/socket.io/`, chat events) follow
+    the same rule, so the same message text arrives identically over REST and
+    over the socket.
 
-    Socket.IO payloads (namespace `/socket.io/`, chat events) are NOT escaped:
-    they never pass through the HTTP response cycle, so the same message text
-    arrives escaped over REST and raw over the socket.
-
-    Responses under `/api/` also carry `Cache-Control: no-store`; uploaded
-    images keep their own `public, max-age=86400`.
+    **Caching**: responses under `/api/` set no `Cache-Control` unless the
+    route says so. The routes that do: the news feed answers
+    `private, no-cache` to a signed-in caller and `public, max-age=60` to a
+    guest; the schedule routes and the handbook are `public` for hours;
+    uploaded files are `private, max-age=86400`; meme and wayfind media are
+    `public` for a week or a year. Every route that emits a weak `ETag`
+    also emits `Vary: Authorization, Accept-Encoding`, so a cache never
+    serves one caller's body to another.
 
     **Errors** all use one envelope, the `Error` schema:
     `{"error": "...", "code": "..."}`. `code` is the stable slug to branch on;
-    `error` is prose and may be reworded at any time. The app factory answers
-    400/404/405/413/415/500 in that shape for anything the routes do not
-    handle themselves, so an undocumented failure still parses.
+    `error` is prose and may be reworded at any time. Django's error handlers
+    answer 400, 403, 404 and 500 in that shape for anything the routes do not
+    handle themselves (an unknown path, a request Django refuses, a permission
+    denial, an uncaught exception), and 413 `too_large` for a body over
+    Django's DATA_UPLOAD_MAX_MEMORY_SIZE — so an undocumented failure still
+    parses. A wrong verb answers 405 in the same shape with an `Allow` header
+    from each route's method guard (HEAD is admitted wherever GET is). A body
+    over the ingress cap (6 MB on /api/*, 52 MB on uploads and wayfind media,
+    9 MB on memes, 2 MB on the assistant) is refused by Caddy with an empty
+    413 that cannot carry the envelope. There is no 415: a non-JSON or
+    unparseable body is each route's own 400.
 
     **Realtime**: the Socket.IO contract — transport, handshake, and every
     event and payload in both directions — is the `x-socketio` section of this
@@ -570,12 +584,20 @@ paths:
         staff.
 
 
+        A wall post by an account on either side of a block with the caller
+        is never listed; faculty and scraped rows are unaffected by blocks.
+
+
         Answers carry a weak `ETag` over the data watermark plus the caller,
-        their friend set and the query, and a matching `If-None-Match` gets a
-        304. `Cache-Control` is `private, max-age=60` for an authenticated
-        caller — the page carries their friends' private posts and their own
-        liked flags, so a shared cache must never store it — and
-        `public, max-age=60` for a guest.
+        their role, their friend set, their block set and the query, and a
+        matching `If-None-Match` gets a 304. Every answer carries
+        `Vary: Authorization, Accept-Encoding`, so no cache keys the page on
+        the bare URL. `Cache-Control` is `private, no-cache` for an
+        authenticated caller — the page carries their friends' private posts
+        and their own liked flags, so a browser or device cache must
+        revalidate it (the ETag) on every request and a shared cache must
+        never store it — and `public, max-age=60` for a guest, whose page is
+        everybody's.
       parameters:
         - name: page
           in: query

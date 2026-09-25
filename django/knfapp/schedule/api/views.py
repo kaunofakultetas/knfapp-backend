@@ -35,7 +35,9 @@ from django.db.models import Count, Max
 from django.http import HttpResponse
 
 
-from knfapp.common.http import etag_for, if_none_match_contains, json_error, json_response
+from knfapp.common.http import (
+    clean_param, etag_for, if_none_match_contains, json_error, json_response, require_methods,
+)
 from knfapp.schedule.models import ScheduleEvent, ScheduleEventGroup, ScheduleTeacher
 from knfapp.scraper.schedule_scraper import _get_semester_label, _semester_key
 
@@ -84,9 +86,12 @@ ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 # SEASONAL order (the scraper's _semester_key — text order
 # would rank an autumn label above its own spring), the
 # cheap table fingerprint behind the ETags, the public
-# conditional response, and the one query both read routes
-# share: (event × group) rows through the link table,
-# filtered and ordered.
+# conditional response (Vary on Authorization all the same
+# — the body is nobody's, but every API answer keys a
+# cache on the credential so the rule has no exception to
+# remember), and the one query both read routes share:
+# (event × group) rows through the link table, filtered
+# and ordered.
 #
 # Used by:
 #   - get_schedule, get_schedule_events,
@@ -128,6 +133,7 @@ def _conditional_json(request, payload, seed):
     else:
         response = json_response(payload)
     response["ETag"] = f'W/"{tag}"'
+    response["Vary"] = "Authorization, Accept-Encoding"
     response["Cache-Control"] = f"public, max-age={CACHE_MAX_AGE}"
     return response
 
@@ -179,12 +185,13 @@ def _rows_for(group=None, semester=None, teacher=None, date_from=None, date_to=N
 #     wire contract)
 ############################################################
 
+@require_methods("GET")
 def get_schedule(request):
     # STEP 1: validate every filter before any DB work
     # ================================================
-    day_raw = request.GET.get("day")
-    group = request.GET.get("group")
-    semester = request.GET.get("semester")
+    day_raw = clean_param(request.GET.get("day"))
+    group = clean_param(request.GET.get("group"))
+    semester = clean_param(request.GET.get("semester"))
 
     day = None
     if day_raw is not None:
@@ -285,17 +292,18 @@ def get_schedule(request):
 #     schedule tab's dated feed
 ############################################################
 
+@require_methods("GET")
 def get_schedule_events(request):
     # STEP 1: validate filters — dates strictly YYYY-MM-DD
     # ====================================================
-    group = request.GET.get("group")
-    teacher = request.GET.get("teacher")
-    semester = request.GET.get("semester")
+    group = clean_param(request.GET.get("group"))
+    teacher = clean_param(request.GET.get("teacher"))
+    semester = clean_param(request.GET.get("semester"))
 
     bounds = {}
     for name, fallback in (("from", date_type.today() - timedelta(days=7)),
                            ("to", date_type.today() + timedelta(days=28))):
-        raw = request.GET.get(name)
+        raw = clean_param(request.GET.get(name))
         if raw is None:
             bounds[name] = fallback
             continue
@@ -381,8 +389,9 @@ def get_schedule_events(request):
 #     group/semester pickers
 ############################################################
 
+@require_methods("GET")
 def get_schedule_filters(request):
-    semester = request.GET.get("semester") or None
+    semester = clean_param(request.GET.get("semester")) or None
 
     # STEP 1: the semester options past the stray-label threshold
     # ===========================================================

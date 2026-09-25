@@ -9,16 +9,29 @@
 #  refusal that would otherwise ignore every opt-out, the
 #  language split routing the English copy, the distinct-
 #  owner count behind stats["users"], the orphan-token
-#  prune, and the token redaction that keeps a bearer
-#  credential out of log lines.
+#  prune, the dead-device retirement that must never
+#  recycle the connection from inside a transaction (an
+#  ATOMIC_REQUESTS view would roll back behind its 201),
+#  the token redaction that keeps a bearer credential out
+#  of log lines, and the two retry policies of the Expo
+#  transport — a send that timed out reading is never
+#  replayed (Expo may have enqueued it; a replay is a
+#  duplicate on every phone), a receipt query still is.
 ############################################################
 
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 
-from django.test import TestCase
+import requests
+from urllib3.connectionpool import HTTPConnectionPool
+from urllib3.exceptions import ReadTimeoutError
+from urllib3.util.retry import Retry
+
+from django.db import connection
+from django.test import SimpleTestCase, TestCase
 
 
 from knfapp.notifications import push
@@ -121,6 +134,16 @@ class FanoutTargetingTests(TestCase):
 
 class TokenHygieneTests(TestCase):
 
+    def _record_connection_recycling(self):
+        # The in-memory SQLite connection ignores close(), so the
+        # proof is the CALL itself — a recorder stands in for
+        # close_old_connections
+        calls = []
+        real = push.close_old_connections
+        push.close_old_connections = lambda *args, **kwargs: calls.append((args, kwargs))
+        self.addCleanup(lambda: setattr(push, "close_old_connections", real))
+        return calls
+
     def test_the_orphan_prune_spares_owners_with_a_live_session(self):
         held = create_user(username="prisijunges")
         auth.mint_session(held.id)
@@ -148,3 +171,86 @@ class TokenHygieneTests(TestCase):
         self.assertNotIn("abc123", excerpt)
         self.assertIn("token:", excerpt)
         self.assertNotIn("\n", excerpt)  # a body cannot forge extra log lines
+
+    def test_retiring_inside_a_transaction_never_touches_the_connection(self):
+        calls = self._record_connection_recycling()
+        user = create_user(username="istrynes")
+        _token(user, "uninstalled")
+        # A TestCase method runs inside an atomic block — the
+        # same footing as an ATOMIC_REQUESTS view
+        self.assertTrue(connection.in_atomic_block)
+
+        self.assertEqual(push._deactivate_tokens(["ExponentPushToken[uninstalled]"]), 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(PushToken.objects.get().active, 0)
+
+    def test_the_whole_route_survives_a_dead_device_inside_a_transaction(self):
+        calls = self._record_connection_recycling()
+        # Expo's verdict for the slice: nothing accepted, every
+        # device gone — the transport is the seam, nothing here
+        # touches the network
+        real_slice = push._send_slice
+        push._send_slice = lambda part, deadline: (0, [m["to"] for m in part],
+                                                   {"DeviceNotRegistered": len(part)})
+        self.addCleanup(lambda: setattr(push, "_send_slice", real_slice))
+
+        reader = create_user(username="skaitytojas")
+        _token(reader, "dead")
+
+        self.assertEqual(push.notify_channel("news", "T", "B"), 0)
+        self.assertEqual(PushToken.objects.get().active, 0)
+        self.assertEqual(calls, [])
+
+
+class ExpoTransportTests(SimpleTestCase):
+
+    def _attempts_reading(self, url):
+        # Every attempt urllib3 makes lands in _make_request — the
+        # one seam below its retry loop and above the socket. It
+        # raises a read timeout each time (the bytes went out, no
+        # answer came back), the sleeps between retries are patched
+        # out, and no connection is ever opened
+        attempts = []
+
+        def timed_out(pool, conn, method, path, *args, **kwargs):
+            attempts.append(path)
+            raise ReadTimeoutError(pool, path, "Read timed out.")
+
+        with mock.patch.object(HTTPConnectionPool, "_make_request", autospec=True, side_effect=timed_out), \
+                mock.patch.object(Retry, "sleep"):
+            with self.assertRaises(requests.exceptions.RequestException):
+                push._SESSION.post(url, json=[], headers=push._EXPO_HEADERS, timeout=1)
+        return len(attempts)
+
+    def test_a_send_that_timed_out_reading_is_never_replayed(self):
+        # One shared policy used to replay the slice up to four
+        # times and then report it as failed — four deliveries per
+        # phone, counted as none
+        self.assertEqual(self._attempts_reading(push.EXPO_PUSH_URL), 1)
+
+    def test_a_receipt_query_still_retries(self):
+        # Idempotent: the first try plus the policy's three retries
+        self.assertEqual(self._attempts_reading(push.EXPO_RECEIPTS_URL), 4)
+
+    def test_the_two_policies_are_what_the_banner_claims(self):
+        send = push._SESSION.get_adapter(push.EXPO_PUSH_URL).max_retries
+        receipts = push._SESSION.get_adapter(push.EXPO_RECEIPTS_URL).max_retries
+        self.assertIsNot(send, receipts)
+
+        # send: connection errors only — no read, status or other
+        # retry, and a 429/5xx is answered as it came
+        self.assertEqual((send.connect, send.read, send.status, send.other), (2, 0, 0, 0))
+        self.assertFalse(send.is_retry("POST", 503, has_retry_after=False))
+        self.assertFalse(send.is_retry("POST", 429, has_retry_after=True))
+
+        # receipts: the full policy, Retry-After honoured but bounded
+        self.assertEqual(receipts.total, 3)
+        self.assertTrue(receipts.is_retry("POST", 503, has_retry_after=False))
+        self.assertTrue(receipts.is_retry("POST", 429, has_retry_after=True))
+        self.assertLessEqual(receipts.parse_retry_after("3600"), push._RETRY_AFTER_MAX)
+        self.assertLessEqual(push._RETRY_AFTER_MAX, 10)
+
+        # The send may read for the 30 s the admin broadcast banner
+        # promises; the receipt query folds sooner
+        self.assertEqual(push._SEND_TIMEOUT, (5, 30))
+        self.assertEqual(push._RECEIPT_TIMEOUT[1], 10)

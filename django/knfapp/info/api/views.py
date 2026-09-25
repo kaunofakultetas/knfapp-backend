@@ -17,6 +17,7 @@
 #    warn_once / parse_timestamp — process-lifetime helpers
 #    get_scraped_info            — the surviving overlay rows
 #    apply_scraped_overlay       — the floors and the swap
+#    effective_handbook          — THE merge, one per language
 #    get_faculty_info            — GET /api/info
 ############################################################
 
@@ -31,7 +32,9 @@ from django.db import Error as DatabaseError
 from django.http import HttpResponse
 
 
-from knfapp.common.http import etag_for, if_none_match_contains, json_error, json_response
+from knfapp.common.http import (
+    clean_param, etag_for, if_none_match_contains, json_error, json_response, require_methods,
+)
 from knfapp.info.handbook import FACULTY_INFO
 from knfapp.info.models import FacultyInfo
 
@@ -125,7 +128,7 @@ def parse_timestamp(value):
 # to the curated handbook instead of 500ing it.
 #
 # Used by:
-#   - get_faculty_info (below)
+#   - effective_handbook (below)
 ############################################################
 
 def get_scraped_info(lang):
@@ -188,7 +191,7 @@ def get_scraped_info(lang):
 # and a non-list blob would crash the Info screen.
 #
 # Used by:
-#   - get_faculty_info (below)
+#   - effective_handbook (below)
 ############################################################
 
 def apply_scraped_overlay(data, scraped):
@@ -238,6 +241,70 @@ def apply_scraped_overlay(data, scraped):
 
 
 ############################################################
+# effective_handbook
+############################################################
+#
+#   effective_handbook("en") → ({section: blob, ...}, updatedAt)
+#
+# THE effective handbook for one language, and the ONLY
+# place it is assembled: the curated base from
+# info/handbook.py, then whatever survives of the scrape
+# laid over it through apply_scraped_overlay — the shape
+# checks and the size floors, so a partial page load never
+# hides a full curated list. A language with no scraped
+# rows of its own borrows the 'lt' overlay (the scraper
+# writes 'lt' only), its curated sections staying in their
+# own language. The second value is the newest surviving
+# scrape's stamp, or None when the curated base stands
+# alone.
+#
+# Every consumer of "the handbook" — the Info screen's
+# route and the assistant's knowledge base — calls this,
+# so the two can never disagree: the English knowledge
+# base therefore carries the LITHUANIAN programme names
+# and contact rows, exactly as /api/info?lang=en already
+# serves them. That parity is intended (the module banner
+# declares names, rooms and numbers language-neutral), not
+# a regression to "fix" by dropping the fallback here; the
+# naming policy itself is filed separately and, if it
+# changes, changes on both surfaces through this one
+# function.
+#
+# Used by:
+#   - get_faculty_info (below)
+#   - assistant/chunking.py — handbook_chunks, the
+#     knowledge-base rows
+############################################################
+
+def effective_handbook(lang):
+    # STEP 1: the curated base — a copy, the module constant
+    # is never overlaid in place
+    # =====================================================
+    data = dict(FACULTY_INFO[lang])
+
+
+    # STEP 2: the overlay rows — this language's, else the
+    # 'lt' ones the scraper actually writes
+    # ====================================================
+    scraped, updated_at = get_scraped_info(lang)
+    if not scraped and lang != "lt":
+        scraped, updated_at = get_scraped_info("lt")
+
+
+    # STEP 3: the floors and the swap — never a bare update
+    # =====================================================
+    if scraped:
+        apply_scraped_overlay(data, scraped)
+    return data, updated_at
+
+
+
+
+
+
+
+
+############################################################
 # get_faculty_info
 ############################################################
 #
@@ -253,26 +320,22 @@ def apply_scraped_overlay(data, scraped):
 #     screen (sends lang only)
 ############################################################
 
+@require_methods("GET")
 def get_faculty_info(request):
     # STEP 1: normalise ?lang — case and region subtag off
     # before the whitelist decides
     # ====================================================
-    lang = (request.GET.get("lang") or "lt").strip().lower().replace("_", "-").split("-")[0]
+    lang = (clean_param(request.GET.get("lang")) or "lt").strip().lower().replace("_", "-").split("-")[0]
     if lang not in FACULTY_INFO:
         lang = "lt"
 
-    section = request.GET.get("section") or None
+    section = clean_param(request.GET.get("section")) or None
 
 
-    # STEP 2: the curated base plus whatever survives of the
-    # scrape; a language with no rows borrows the 'lt' overlay
-    # ========================================================
-    data = dict(FACULTY_INFO[lang])
-    scraped, updated_at = get_scraped_info(lang)
-    if not scraped and lang != "lt":
-        scraped, updated_at = get_scraped_info("lt")
-    if scraped:
-        apply_scraped_overlay(data, scraped)
+    # STEP 2: the effective handbook — the one merge the
+    # assistant's knowledge base is built from too
+    # ==================================================
+    data, updated_at = effective_handbook(lang)
 
 
     # STEP 3: one section or the whole handbook — an unknown
@@ -289,8 +352,10 @@ def get_faculty_info(request):
         payload["updatedAt"] = updated_at
 
 
-    # STEP 4: the ETag — same handbook between two daily scrapes
-    # ==========================================================
+    # STEP 4: the ETag — same handbook between two daily scrapes;
+    # public, yet Vary on Authorization like every API answer, so
+    # no cache anywhere keys an API body on the bare URL
+    # ============================================================
     seed = f"info|{lang}|{section}|{updated_at or '-'}|{FALLBACK_VERSION}"
     tag = etag_for(seed)
     if if_none_match_contains(request.headers.get("If-None-Match"), tag):
@@ -298,5 +363,6 @@ def get_faculty_info(request):
     else:
         response = json_response(payload, naive_stamps=True)
     response["ETag"] = f'W/"{tag}"'
+    response["Vary"] = "Authorization, Accept-Encoding"
     response["Cache-Control"] = f"public, max-age={CACHE_MAX_AGE}"
     return response

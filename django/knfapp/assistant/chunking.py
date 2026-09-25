@@ -2,10 +2,13 @@
 #  [*] assistant chunking — corpus rows out of live tables
 #
 #  Turns the app's existing content into the flat chunk
-#  list the indexer embeds: the EFFECTIVE handbook (curated
-#  FACULTY_INFO overlaid with fresh faculty_info rows, the
-#  same merge the info API serves) and the public news
-#  posts. Existing tables stay the truth — a chunk carries
+#  list the indexer embeds: the EFFECTIVE handbook (info
+#  views' effective_handbook — curated FACULTY_INFO with
+#  the surviving faculty_info rows laid over it through the
+#  same floors and the same 'lt' fallback the info API
+#  serves, so the knowledge base and the Info screen can
+#  never disagree) and the public news posts. Existing
+#  tables stay the truth — a chunk carries
 #  source/source_id pointing back, and its id is CONTENT-
 #  derived ("<source>:<source_id>:<hash12>", the chunk
 #  hash's prefix): reordering entries in a document never
@@ -31,7 +34,9 @@
 #    _handbook_*       — one renderer per known section
 #    handbook_chunks   — the merged handbook, chunked
 #    news_chunks       — public news posts, chunked
-#    curated_chunks    — the repo-owned extras
+#    admin_entry_chunk — one console-authored entry → chunk
+#    admin_curated_rows — the console's stored rows, re-read
+#    curated_chunks    — the repo-owned extras + the console's
 #    build_corpus      — everything, one list
 ############################################################
 
@@ -43,11 +48,18 @@ import re
 from bs4 import BeautifulSoup
 
 from knfapp.assistant.curated_faq import CURATED_FAQ
-from knfapp.info.api.views import get_scraped_info
+from knfapp.assistant.models import SupportChunk
+from knfapp.info.api.views import effective_handbook
 from knfapp.info.handbook import FACULTY_INFO
 
 
 logger = logging.getLogger(__name__)
+
+
+# What marks a curated row as console-authored: its source_id
+# is this prefix plus the entry's uuid (the repo-owned
+# CURATED_FAQ rows carry the bare language instead)
+ADMIN_SOURCE_PREFIX = "admin:"
 
 
 # Texts longer than this split into overlapping windows —
@@ -286,12 +298,22 @@ _SECTION_RENDERERS = {
 # handbook_chunks
 ############################################################
 #
-# The EFFECTIVE handbook per language — curated base with
-# fresh scraped rows laid over it, the same merge the info
-# API serves — rendered section by section into chunk
-# dicts. FAQ entries chunk one per question with the
-# question as the title; other sections carry a section
-# title and split only if oversized.
+# The EFFECTIVE handbook per language — info views'
+# effective_handbook, the very merge GET /api/info serves:
+# the curated base, the scraped rows laid over it through
+# apply_scraped_overlay's shape checks and size floors (a
+# one-entry partial scrape keeps the full curated list, so
+# a full chunk is never replaced by a stub and then
+# retired under its content-derived id), and the 'lt'
+# overlay borrowed for a language the scraper never
+# writes. The English rows therefore carry the Lithuanian
+# programme names exactly as ?lang=en does — intended
+# parity, see effective_handbook's banner. Rendered
+# section by section into chunk dicts: FAQ entries chunk
+# one per question with the question as the title; other
+# sections carry a section title and split only if
+# oversized; a section without a renderer (the scraped
+# general_contact block) takes the generic key/value walk.
 #
 # Used by:
 #   - build_corpus (below)
@@ -309,11 +331,8 @@ _SECTION_TITLES = {
 
 def handbook_chunks(failures=None):
     chunks = []
-    for lang, curated in FACULTY_INFO.items():
-        merged = dict(curated)
-        scraped, _ = get_scraped_info(lang)
-        if scraped:
-            merged.update(scraped)
+    for lang in FACULTY_INFO:
+        merged, _ = effective_handbook(lang)
 
         for section, blob in merged.items():
             # One malformed scraped section (a shape the
@@ -407,13 +426,74 @@ def news_chunks(failures=None):
 
 
 ############################################################
+# admin_entry_chunk
+############################################################
+#
+#   admin_entry_chunk(entry_id, question, answer, lang)
+#     → chunk dict
+#
+# ONE console-authored entry as a chunk, shaped exactly like
+# a repo-owned FAQ entry (question on top, the question as
+# the cited title) — the one builder both the console's
+# save and the indexer's re-read go through, so the id and
+# hash always agree. Never split: the console caps the
+# answer under the splitter's window, so an entry is always
+# exactly one row.
+#
+# Used by:
+#   - curated.py — save_entry
+############################################################
+
+def admin_entry_chunk(entry_id, question, answer, language):
+    return _make_chunk("curated", f"{ADMIN_SOURCE_PREFIX}{entry_id}", question, "faq",
+                       language, f"{question}\n{answer}")
+
+
+
+
+
+
+
+
+############################################################
+# admin_curated_rows
+############################################################
+#
+# The console's stored entries, re-emitted as chunk dicts
+# from their own stored fields — so a nightly run finds
+# each one in the corpus under the id it already carries
+# (unchanged: stamped, never re-embedded, never retired).
+# Their source of truth is the row itself; there is no
+# document to re-render.
+#
+# Used by:
+#   - curated_chunks (below)
+############################################################
+
+def admin_curated_rows():
+    rows = (SupportChunk.objects
+            .filter(source="curated", source_id__startswith=ADMIN_SOURCE_PREFIX)
+            .values("source_id", "title", "section", "language", "text"))
+    return [_make_chunk("curated", row["source_id"], row["title"], row["section"],
+                        row["language"], row["text"])
+            for row in rows]
+
+
+
+
+
+
+
+
+############################################################
 # curated_chunks
 ############################################################
 #
 # The repo-owned extras (curated_faq.py), chunked exactly
 # like the handbook FAQ: one chunk per entry, the question
 # as the title — question-shaped passages retrieve best for
-# question-shaped queries.
+# question-shaped queries — plus the console-authored rows
+# read back from support_chunks (admin_curated_rows).
 #
 # Used by:
 #   - build_corpus (below)
@@ -429,6 +509,7 @@ def curated_chunks():
                 continue
             for piece in split_text(f"{question}\n{answer}"):
                 chunks.append(_make_chunk("curated", lang, question, "faq", lang, piece))
+    chunks.extend(admin_curated_rows())
     return chunks
 
 

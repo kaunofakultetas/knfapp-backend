@@ -19,6 +19,9 @@
 #                        driver in the image), so
 #                        postgres://... is a real env-only
 #                        switch
+#    TRUSTED_PROXY_HOPS — how many rightmost X-Forwarded-For
+#                        entries are the deployment's own
+#                        proxies (default 1 — see Hosting)
 #
 #  Deliberately NO admin site, NO django.contrib.auth and
 #  NO sessions: the API authenticates with opaque bearer
@@ -29,9 +32,12 @@
 ############################################################
 
 
+import os
+import sys
 from pathlib import Path
 
 import environ
+from django.core.exceptions import ImproperlyConfigured
 
 
 ROOT_DIR = Path(__file__).resolve(strict=True).parent.parent
@@ -79,13 +85,27 @@ USE_TZ = True
 # which forwards whatever Host the client sent. Every host
 # is accepted because nothing derives facts from it: no
 # absolute URLs, no redirects, no host-dependent cookies.
-# The client IP for rate limiting comes from the LAST hop
-# of X-Forwarded-For, which Caddy APPENDS itself (the
-# ingress strips nothing else) — knfapp/common/http.py
+#
+# TRUSTED_PROXY_HOPS — how many RIGHTMOST X-Forwarded-For
+# entries are this deployment's own infrastructure. The
+# topology is two proxies deep: the host's TLS terminator
+# (the outer Caddy) stamps the client's address and hands
+# the request to this stack's ingress (endpoint/Caddyfile),
+# whose `trusted_proxies private_ranges` keeps that chain
+# and APPENDS its own peer, the outer proxy. Django then
+# reads "<client>, <outer proxy>": hop 1 from the right is
+# the outer proxy, the client sits one further left — so
+# the default is 1. This is per-deployment configuration,
+# not a constant: a stack put behind a third proxy sets 2,
+# a bare runserver with no proxy at all can set 0. The
+# value only means something because the ingress refuses
+# to trust a chain a PUBLIC peer sent — that half lives in
+# the Caddyfile, not here. knfapp/common/http.py
 # client_ip() is the one reader.
 ############################################################
 
 ALLOWED_HOSTS = ["*"]
+TRUSTED_PROXY_HOPS = env.int("TRUSTED_PROXY_HOPS", default=1)
 
 
 
@@ -137,6 +157,70 @@ if DATABASES["default"]["ENGINE"] == "django.db.backends.sqlite3":
     )
 
 DEFAULT_AUTO_FIELD = "django.db.models.AutoField"
+
+
+############################################################
+# Test-run guard — never build test_<name> on the live cluster
+############################################################
+#
+# `manage.py test` creates test_<NAME> beside the configured
+# database and drops it when the run ends — a run killed
+# half-way leaves it behind. The live cluster once collected
+# eighteen orphaned test_knfapp_* databases from
+# `docker exec knfapp-django python3 manage.py test` runs
+# that forgot --settings=knfapp.tests.settings and so ran
+# against DATABASE_URL. THE RULE: a test run may target
+# SQLite, or a database whose NAME differs from the
+# production database's — anything else is refused here,
+# at import, before the runner opens a connection.
+#
+# knfapp.tests.settings is the sanctioned entry: it swaps
+# DATABASES for TEST_DATABASE_URL (in-memory SQLite unless
+# set), so when Django reports it as the settings module in
+# charge (--settings sets DJANGO_SETTINGS_MODULE before this
+# file loads) the guard judges THAT target — which is how
+# the PostgreSQL pass (TEST_DATABASE_URL naming a throwaway
+# database, README "Tests") passes while the same URL
+# naming the live database is still refused.
+# KNFAPP_ALLOW_TEST_ON_PROD_DB=1 is the operator override.
+############################################################
+
+def _refuse_test_on_production_db():
+    # STEP 1: only a test run is judged, and only unless
+    # the operator has said otherwise
+    # ===============================================
+    if "test" not in sys.argv or env.bool("KNFAPP_ALLOW_TEST_ON_PROD_DB", False):
+        return
+
+
+    # STEP 2: what the runner will actually open — the test
+    # settings' own choice when they are in charge, else
+    # DATABASE_URL itself
+    # =====================================================
+    production = DATABASES["default"]
+    if os.environ.get("DJANGO_SETTINGS_MODULE") == "knfapp.tests.settings":
+        target = env.db("TEST_DATABASE_URL", default="sqlite:///:memory:")
+    else:
+        target = production
+
+
+    # STEP 3: SQLite is always fine; a different database
+    # name is fine; the production name is not
+    # ===================================================
+    if target["ENGINE"] == "django.db.backends.sqlite3":
+        return
+    if target.get("NAME") != production.get("NAME"):
+        return
+    raise ImproperlyConfigured(
+        f"Refusing to run the test suite against the production database "
+        f"{target.get('NAME')!r} ({target['ENGINE']}): Django would create "
+        f"test_{target.get('NAME')} on the live cluster. Run with "
+        f"--settings=knfapp.tests.settings (in-memory SQLite), or point "
+        f"TEST_DATABASE_URL at a throwaway database — see django/README.md. "
+        f"KNFAPP_ALLOW_TEST_ON_PROD_DB=1 overrides this guard."
+    )
+
+_refuse_test_on_production_db()
 
 
 

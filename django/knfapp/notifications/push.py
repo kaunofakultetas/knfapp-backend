@@ -31,16 +31,28 @@
 #  Losing the queue on restart is acceptable — receipts are
 #  diagnostics, not state.
 #
-#  Transport rules, all in one module-level requests.Session:
-#  3 retries with backoff on 429/5xx honouring Retry-After,
-#  a 10 s timeout per call so the server always gives up
-#  before the app's own 15 s, slices of 100 (Expo's cap) sent
-#  from a bounded thread pool under a 120 s fan-out deadline,
-#  and a paced gate that keeps the process under Expo's
-#  ~600 messages/s ceiling. No Expo access token header (the
-#  Expo project has to keep enhanced push security off).
-#  Failures are logged and swallowed: push is best-effort
-#  everywhere and never fails a request.
+#  Transport rules — one module-level requests.Session with
+#  TWO retry policies, mounted by endpoint:
+#    send     — connection errors only (a connection that
+#               never opened reached nobody), NEVER a read
+#               timeout or a 429/5xx: once the bytes are on
+#               the wire Expo may already have enqueued the
+#               slice, and a replay is a duplicate on every
+#               phone in it. 5 s to connect, 30 s to read
+#    receipts — idempotent, so the full policy: 3 retries
+#               with backoff on 429/5xx and read errors,
+#               Retry-After honoured but clamped to a few
+#               seconds. 5 s to connect, 10 s to read
+#  Nothing here runs on a request thread (chat, news and
+#  admin hand the fan-out to a daemon thread; the scrapers
+#  run under cron), which is what lets a send wait 30 s.
+#  Slices of 100 (Expo's cap) go out from a bounded thread
+#  pool under a 120 s fan-out deadline, behind a paced gate
+#  that keeps the process under Expo's ~600 messages/s
+#  ceiling. No Expo access token header (the Expo project
+#  has to keep enhanced push security off). Failures are
+#  logged and swallowed: push is best-effort everywhere and
+#  never fails a request.
 #
 #  Nothing here logs a raw token. Every upstream excerpt goes
 #  through _sanitize, which folds newlines away and redacts
@@ -105,9 +117,17 @@ _SEND_SLICE = 100
 _RECEIPT_SLICE = 300
 _ID_CHUNK = 400
 
-# Short on purpose: the mobile client gives up at 15 s, so
-# the server must always fold first
-_HTTP_TIMEOUT = 10
+# (connect, read) per endpoint. A send may read for 30 s —
+# Expo answers a 100-message slice slowly under load, and no
+# send runs on a request thread (module banner); the receipt
+# query is cheap and retried, so it folds sooner
+_SEND_TIMEOUT = (5, 30)
+_RECEIPT_TIMEOUT = (5, 10)
+
+# The receipts policy honours Retry-After — clamped to this
+# many seconds, so an upstream "come back in an hour" cannot
+# park the watcher thread
+_RETRY_AFTER_MAX = 5
 
 # Broadcast fan-out: a few workers and a hard deadline, after
 # which the remaining slices are logged and abandoned rather
@@ -148,12 +168,30 @@ _TOKEN_PATTERN = re.compile(r"Expo(?:nent)?PushToken\[[^\]\r\n]*\]")
 # _build_session
 ############################################################
 #
-# The one requests.Session every Expo call shares:
-# connection reuse plus urllib3 retries — 3 attempts, a
-# growing backoff, 429 and 5xx retried, Retry-After honoured,
-# and POST listed explicitly because urllib3 never retries a
-# non-idempotent method on its own. Without this a
-# rate-limited slice would simply be dropped.
+# The one requests.Session every Expo call shares —
+# connection reuse — carrying a retry policy PER ENDPOINT,
+# mounted on the two URL prefixes (requests picks the
+# longest matching mount):
+#
+#   send     — Retry(connect=2, read=0, status=0, other=0):
+#              a connection that never opened is tried
+#              again (nothing reached Expo); a read timeout
+#              or a 429/5xx is answered as it came. A POST
+#              that timed out READING may already have
+#              enqueued its slice — replaying it, as one
+#              shared policy once did, delivered every
+#              message of the slice up to four times and
+#              then reported the slice as failed
+#   receipts — a receipt query is idempotent, so the full
+#              policy: total=3 (read, connect and status
+#              retries alike), a growing backoff, 429 and
+#              5xx retried, Retry-After honoured but clamped
+#              to _RETRY_AFTER_MAX seconds
+#
+# POST is listed explicitly on both because urllib3 never
+# retries a non-idempotent method on its own — on the send
+# policy that keeps the counts, not the method rule, as the
+# one thing deciding.
 #
 # Used by:
 #   - _SESSION (below) — built once at import
@@ -161,14 +199,23 @@ _TOKEN_PATTERN = re.compile(r"Expo(?:nent)?PushToken\[[^\]\r\n]*\]")
 
 def _build_session() -> requests.Session:
     session = requests.Session()
-    retry = Retry(
+
+    send_policy = Retry(
+        total=2, connect=2, read=0, status=0, other=0,
+        backoff_factor=0.5,
+        allowed_methods=["POST"],
+        respect_retry_after_header=False,
+    )
+    receipts_policy = Retry(
         total=3,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
-        respect_retry_after_header=True,
         allowed_methods=["POST"],
+        respect_retry_after_header=True,
+        retry_after_max=_RETRY_AFTER_MAX,
     )
-    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount(EXPO_PUSH_URL, HTTPAdapter(max_retries=send_policy))
+    session.mount(EXPO_RECEIPTS_URL, HTTPAdapter(max_retries=receipts_policy))
     return session
 
 
@@ -352,14 +399,15 @@ def send_push_notification(
         message["badge"] = badge
 
 
-    # STEP 2: POST through the retrying session, status first
-    # =======================================================
+    # STEP 2: POST under the send policy (connect retries only —
+    # a replay is a duplicate, see _build_session), status first
+    # ==========================================================
     try:
         resp = _SESSION.post(
             EXPO_PUSH_URL,
             json=message,
             headers=_EXPO_HEADERS,
-            timeout=_HTTP_TIMEOUT,
+            timeout=_SEND_TIMEOUT,
         )
     except Exception:
         logger.exception("Failed to send push notification")
@@ -445,16 +493,17 @@ def _send_slice(batch: list[dict], deadline: float):
         return 0, dead, errors
 
 
-    # STEP 2: paced POST through the retrying session; a
+    # STEP 2: paced POST under the send policy (connect retries
+    # only — a replay is a duplicate, see _build_session); a
     # non-200 or an exception costs this slice only
-    # ==================================================
+    # =========================================================
     try:
         _pace_slice()
         resp = _SESSION.post(
             EXPO_PUSH_URL,
             json=batch,
             headers=_EXPO_HEADERS,
-            timeout=_HTTP_TIMEOUT,
+            timeout=_SEND_TIMEOUT,
         )
         if resp.status_code != 200:
             logger.warning("Expo batch push HTTP %d: %s", resp.status_code, _sanitize(resp.text))
@@ -652,9 +701,22 @@ def send_push_batch(
 # so each name moves at most one row. Rows are kept, not
 # deleted: the next POST /api/notifications/register from
 # that device sets active=1 again. updated_at is refreshed
-# so the row's age means something. Never raises;
-# close_old_connections first, because this can run on a
-# fan-out thread whose connection has been sitting idle.
+# so the row's age means something. Never raises.
+#
+# Two kinds of caller reach this helper, and they need the
+# connection handled in opposite ways. A thread outside any
+# transaction (a spawned push job, the receipt watcher)
+# arrives with a connection that may have sat idle for
+# minutes, so it recycles a stale one first and lets the
+# ORM reconnect. A request thread arrives INSIDE its
+# ATOMIC_REQUESTS transaction, where that same
+# close_old_connections is fatal: it sees autocommit off
+# against AUTOCOMMIT=True, drops the live connection, and
+# the request's atomic block then rolls back silently while
+# the view still answers 201 — a faculty announcement gone
+# because one reader's Expo token was stale. The
+# in_atomic_block check tells the two apart, so the helper
+# is safe from whichever thread reaches it.
 #
 # Used by:
 #   - send_push_notification, send_push_batch,
@@ -667,7 +729,10 @@ def _deactivate_tokens(tokens) -> int:
         return 0
 
     try:
-        close_old_connections()
+        # Only an idle thread may recycle its connection — in
+        # a transaction the close would abort it (the banner)
+        if not connection.in_atomic_block:
+            close_old_connections()
         changed = PushToken.objects.filter(token__in=unique).update(active=0, updated_at=utc_now())
     except Exception:
         logger.exception("Failed to deactivate tokens")
@@ -743,7 +808,7 @@ def poll_push_receipts() -> int:
                 EXPO_RECEIPTS_URL,
                 json={"ids": part},
                 headers=_EXPO_HEADERS,
-                timeout=_HTTP_TIMEOUT,
+                timeout=_RECEIPT_TIMEOUT,
             )
             if resp.status_code != 200:
                 logger.warning("Expo receipts HTTP %d: %s", resp.status_code, _sanitize(resp.text))
@@ -997,7 +1062,8 @@ def notify_channel_user(channel: str, user_id: str, title: str, body: str, data:
 #   - scraper/vu_scraper.py — scrape_vu_news, "news"
 #   - scraper/schedule_scraper.py — scrape_knf_schedule,
 #     "schedule"
-#   - news/api/views.py — a public faculty post, "news"
+#   - news/api/views.py — _push_news_post, a public faculty
+#     post, "news"
 #   - admin/api/views.py — _run_broadcast, "admin"
 ############################################################
 

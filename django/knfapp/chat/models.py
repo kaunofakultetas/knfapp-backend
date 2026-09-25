@@ -5,7 +5,10 @@
 #  the encoder opted into by api/views.py decides that (see
 #  common/http.py), not these columns. In-room search is one
 #  case-insensitive substring match — the same query on
-#  either engine. Shape policy as in users/models.py.
+#  either engine, NOT the same case folding: SQLite's LIKE
+#  folds ASCII only, PostgreSQL folds by collation, so a
+#  capitalised Lithuanian diacritic misses only on SQLite.
+#  Shape policy as in users/models.py.
 #
 #  Models:
 #    - Conversation            — direct/group rooms + the TTL

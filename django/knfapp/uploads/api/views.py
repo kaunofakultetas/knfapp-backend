@@ -28,11 +28,10 @@ import uuid
 from PIL import Image
 from django.db import models
 from django.http import FileResponse
-from django.views.decorators.http import require_POST
 
 
 from knfapp.common import ratelimit
-from knfapp.common.http import json_error, json_response
+from knfapp.common.http import clean_param, json_error, json_response, require_methods
 from knfapp.common.timestamps import utc_now
 from knfapp.uploads import gates
 from knfapp.uploads.models import Upload
@@ -45,6 +44,7 @@ from knfapp.uploads.storage import (
     upload_dir,
 )
 from knfapp.users.auth import require_auth
+from knfapp.users.models import User
 
 
 logger = logging.getLogger(__name__)
@@ -73,14 +73,18 @@ logger = logging.getLogger(__name__)
 # real bytes download).
 #
 # Twenty uploads per user per 5 minutes and 100 MB stored
-# per account bound what one account can do to the volume.
+# per account bound what one account can do to the volume;
+# the quota check holds the account's users row (SELECT …
+# FOR UPDATE) for the rest of the request, so overlapping
+# uploads queue per account instead of each seeing the
+# whole remaining budget.
 #
 # Used by:
 #   - services/api/uploads.ts uploadImageApi (avatar, post
 #     image, chat photo/video/voice/file)
 ############################################################
 
-@require_POST
+@require_methods("POST")
 @require_auth
 @ratelimit.per_user("upload", max_attempts=UPLOAD_RATE_MAX)
 def upload_file(request):
@@ -90,7 +94,11 @@ def upload_file(request):
     if file is None or not file.name:
         return json_error("No file provided", 400, code="no_file")
 
-    upload_kind = request.POST.get("kind") or request.GET.get("kind") or "image"
+    upload_kind = (
+        clean_param(request.POST.get("kind"))
+        or clean_param(request.GET.get("kind"))
+        or "image"
+    )
     size_cap = gates.VIDEO_MAX_SIZE if upload_kind == "video" else gates.MAX_FILE_SIZE
     if file.size > size_cap:
         return json_error(f"File too large. Max {size_cap // (1024 * 1024)} MB", 400, code="file_too_large")
@@ -146,8 +154,21 @@ def upload_file(request):
 
 
     # STEP 3: the per-account storage quota, counted from the rows
-    # ============================================================
+    # under the account's own row lock. SELECT … FOR UPDATE on the
+    # users row (a row that always exists — no table of its own)
+    # serialises overlapping uploads per account: on PostgreSQL the
+    # lock is held until the request's transaction commits
+    # (ATOMIC_REQUESTS), which is exactly the sum + compare + write
+    # + INSERT below, so a sibling upload waits at this line and
+    # then counts the row this one inserted. Without it each of two
+    # overlapping uploads sees the whole remaining budget — a
+    # sibling's uncommitted row is invisible under READ COMMITTED
+    # (which is also why a conditional INSERT would not close it).
+    # SQLite has no row locks: Django drops the FOR UPDATE and the
+    # statement is a plain one-column read
+    # =============================================================
     user_id = request.user["id"]
+    User.objects.select_for_update().filter(id=user_id).values_list("id", flat=True).first()
     used = Upload.objects.filter(user_id=user_id).aggregate(total=models.Sum("byte_size"))["total"] or 0
     if used + len(blob) > UPLOAD_QUOTA_BYTES:
         logger.warning("Upload quota reached by user %s (%d bytes stored)", user_id, used)
@@ -196,11 +217,18 @@ def upload_file(request):
 # DELETE /api/uploads/<filename> — the uploader or an admin
 # drops a stored file. A name with no ownership row is a
 # 404 for everyone but an admin — an unknown name and an
-# orphaned file look the same from outside. An already-
-# missing file is still a 200 — the row goes and the
-# caller got what it asked for — but a file that SURVIVES
-# the unlink answers 500 delete_failed rather than lying:
-# this is the erasure and moderation path.
+# orphaned file look the same from outside. The 403/404
+# checks stay HERE (they are the wire contract), and the
+# same rule runs again inside storage.delete_upload, which
+# also refuses a file another live record still shows — a
+# post cover, an avatar, a chat photo — with 409
+# still_referenced; an admin's delete skips that guard, so
+# moderation can pull an abusive file from under its
+# records. An already-missing file is still a 200 — the
+# row goes and the caller got what it asked for — but a
+# file that SURVIVES the unlink answers 500 delete_failed
+# rather than lying: this is the erasure and moderation
+# path.
 #
 # Used by:
 #   - admin/moderation tooling and manual erasure requests
@@ -220,15 +248,23 @@ def delete_file(request, filename):
     if row is not None and not is_admin and row["user_id"] != request.user["id"]:
         return json_error("Only the owner can delete this file", 403)
 
-    delete_upload(safe_name)
+    outcome = delete_upload(safe_name, request.user["id"], admin=is_admin)
+    if outcome == "referenced":
+        return json_error("The file is still used by a post, an avatar or a message", 409,
+                          code="still_referenced")
+    if outcome == "forbidden":
+        # Unreachable after the checks above — kept so the sink's
+        # verdict can never be answered as a success
+        return json_error("Only the owner can delete this file", 403)
 
-    try:
-        survived = os.path.lexists(os.path.join(upload_dir(), safe_name))
-    except OSError:
-        survived = True
-    if survived:
-        logger.error("Delete left %s on disk — there is no sweep, collect it by hand", safe_name)
-        return json_error("The file could not be removed, try again later", 500, code="delete_failed")
+    if outcome == "removed":
+        try:
+            survived = os.path.lexists(os.path.join(upload_dir(), safe_name))
+        except OSError:
+            survived = True
+        if survived:
+            logger.error("Delete left %s on disk — there is no sweep, collect it by hand", safe_name)
+            return json_error("The file could not be removed, try again later", 500, code="delete_failed")
 
     return json_response({"ok": True})
 
@@ -306,7 +342,12 @@ def serve_file(request, filename):
         logger.warning("Refused %s: it resolves outside the upload directory", safe_name)
         return json_error("File not found", 404)
 
-    content_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+    # The gates' own mime table first — mimetypes knows no .m4a
+    # or .m4v, and a voice note served as application/octet-stream
+    # is one the mobile player will not open
+    ext = safe_name.rsplit(".", 1)[1]
+    content_type = (gates.MIME_BY_EXT.get(ext) or mimetypes.guess_type(safe_name)[0]
+                    or "application/octet-stream")
     size = os.path.getsize(file_path)
 
 

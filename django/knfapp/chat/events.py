@@ -18,14 +18,18 @@
 #      Everything that revokes access afterwards (logout,
 #      logout-all, password change, admin deactivation,
 #      erasure) calls disconnect_user_sockets below — the
-#      target of the guarded lazy imports elsewhere.
+#      target of the guarded lazy imports elsewhere. The
+#      cut is scoped like the revocation: logout takes the
+#      presented SESSION's sockets, a password change every
+#      other session's, the account-wide paths every sid.
 #    - Presence is _connected_users, a plain dict in this
 #      process (sid → user id). Gunicorn runs ONE gthread
 #      worker (see socket.py), which is the only reason a
 #      process-local dict is right. api/views.py reads it
 #      for create_conversation, the send_message push skip
 #      and /online-status; the display name lives in the
-#      sid-keyed _connected_names beside it.
+#      sid-keyed _connected_names beside it, the handshake's
+#      session hash in _connected_sessions.
 #    - Connections are capped per user and per process; an
 #      excess handshake is rejected, live sockets are left
 #      alone.
@@ -42,7 +46,11 @@
 #    - Database access runs in whatever engineio thread the
 #      event arrived on — connections are closed after each
 #      handler that opened one, so a quiet socket never
-#      parks an idle connection.
+#      parks an idle connection. The close is skipped inside
+#      an atomic block (_release_connection): there it would
+#      not recycle an idle connection but kill a live
+#      transaction — on PostgreSQL the caller's next query
+#      answers "the connection is closed".
 #
 #  Events, client → server:
 #    connect            — token handshake, presence, auto-join
@@ -70,7 +78,7 @@ import time
 from collections import OrderedDict
 from urllib.parse import parse_qs
 
-from django.db import close_old_connections
+from django.db import close_old_connections, connection
 
 # Refusals must carry a REASON the client can triage: only an
 # auth refusal may show "session expired" — a capacity or
@@ -82,8 +90,11 @@ from knfapp.chat.models import ConversationParticipant, Message
 
 # The one token → user lookup in the backend: REST reaches it
 # through get_current_user, the handshake below calls it
-# directly (there is no Authorization header on a socket)
-from knfapp.users.auth import resolve_session_token
+# directly (there is no Authorization header on a socket).
+# hash_token is what the sessions table stores — the handshake
+# keeps the same digest beside the sid so a revocation can
+# name the session it is cutting
+from knfapp.users.auth import hash_token, resolve_session_token
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +112,14 @@ _connected_users: dict = {}
 # set(_connected_users.values()) as user ids, so those
 # values must stay bare ids.
 _connected_names: dict = {}
+
+# The sha256 of the session token the handshake presented —
+# the sessions.token digest — sid-keyed beside the two above.
+# It is what lets a logout cut the sockets of the ONE session
+# it revoked and a password change cut every session's but
+# the caller's, instead of every socket of the account. Kept
+# SEPARATE for the same reason as _connected_names.
+_connected_sessions: dict = {}
 
 # Connection caps. Per user: NEWEST WINS — a fresh handshake
 # past the cap evicts the user's oldest socket instead of
@@ -203,11 +222,51 @@ def _socket_rate_check(user_id, event) -> bool:
 
 
 def reset_socket_state():
-    # The test seam: presence, names and the rate windows
+    # The test seam: presence, names, sessions and the rate windows
     with _socket_rate_lock:
         _socket_rate.clear()
     _connected_users.clear()
     _connected_names.clear()
+    _connected_sessions.clear()
+
+
+
+
+
+
+
+
+############################################################
+# _release_connection
+############################################################
+#
+# The connection hygiene every handler runs on its way out.
+# An engineio packet thread lives as long as its socket and
+# runs on autocommit outside any transaction, so after a
+# handler that touched the database the thread's connection
+# is closed — a quiet socket never parks an idle one, and
+# the next event reconnects. Inside an atomic block the same
+# close_old_connections is the wrong tool: it sees
+# autocommit off against AUTOCOMMIT=True and drops the LIVE
+# connection under the open transaction — harmless on the
+# in-memory SQLite the suite runs on (its close() is a
+# no-op), fatal on PostgreSQL, where the caller's next query
+# answers "the connection is closed". The TestCase harness
+# wraps every test in one such block, and so would any
+# future in-request caller of a handler; the in_atomic_block
+# check tells the two apart, the same way
+# notifications/push.py _deactivate_tokens does.
+#
+# Used by:
+#   - register_socket_events (below) — _guarded, the
+#     handshake's finally arm and handle_disconnect
+############################################################
+
+def _release_connection():
+    # Only a thread outside any transaction may recycle its
+    # connection — inside one the close would abort it
+    if not connection.in_atomic_block:
+        close_old_connections()
 
 
 
@@ -254,11 +313,15 @@ def _stamp_last_active(user_id):
 #
 # Resolves the handshake token — the `auth: { token }`
 # payload, or the ?token= query-parameter fallback older
-# clients send, off the WSGI environ — to the caller's
-# user dict, or None for a missing, unknown, unencodable,
-# expired or deactivated one. Only the token
+# clients send, off the WSGI environ — to a (user dict,
+# session hash) pair, or None for a missing, unknown,
+# unencodable, expired or deactivated one. Only the token
 # EXTRACTION lives here: the lookup is auth's
 # resolve_session_token, byte for byte the one REST uses.
+# The second element is hash_token(token), the digest the
+# sessions row stores — handle_connect files it beside the
+# sid so a logout can later cut exactly this session's
+# sockets; the raw token itself never leaves this frame.
 #
 # The one thing the lookup cannot be handed is a string with
 # no utf-8 encoding: the sha256 hashing inside it does
@@ -283,7 +346,10 @@ def _authenticate_socket(environ, auth):
     except UnicodeEncodeError:
         return None
 
-    return resolve_session_token(token)
+    user = resolve_session_token(token)
+    if not user:
+        return None
+    return user, hash_token(token)
 
 
 
@@ -296,16 +362,40 @@ def _authenticate_socket(environ, auth):
 # disconnect_user_sockets
 ############################################################
 #
-# Cuts every live socket of one user, best effort. A socket
-# authenticates once at the handshake and is never
-# re-checked, so without this a logout, a password change,
-# an admin deactivation or an erasure would leave the
-# revoked session reading the room in realtime until the
-# client felt like reconnecting. Iterates a list() snapshot
-# (other threads mutate the dict) and asks python-socketio
-# to close each sid; the presence rows go too, so
-# /online-status cannot keep showing a user whose
-# disconnect handler never ran. Returns the number of
+# Cuts the live sockets of one user, best effort, scoped to
+# the SESSION the caller revoked. A socket authenticates
+# once at the handshake and is never re-checked, so without
+# this a logout, a password change, an admin deactivation or
+# an erasure would leave the revoked session reading the
+# room in realtime until the client felt like reconnecting.
+# The scope keyword picks the sids, matched on the handshake
+# hash filed in _connected_sessions:
+#
+#   only_session=<hash>    just that session's sockets — a
+#                          single-device logout, so the
+#                          account's OTHER devices keep their
+#                          realtime along with their sessions
+#   except_session=<hash>  every socket of the user but that
+#                          session's — a password change,
+#                          which keeps the rotating device
+#                          signed in and must not cut it
+#   neither                every socket of the user — logout-
+#                          all, admin deactivation, erasure
+#
+# A sid whose handshake hash was never recorded proves
+# nothing: only_session cuts what is KNOWN to be that
+# session, except_session keeps what is KNOWN to be the
+# caller's — so an unrecorded sid survives the first scope
+# and falls to the second (the single-device cut errs toward
+# keeping, the revocation toward cutting). Before the hash
+# was filed every scope was the account-wide one, and one
+# phone signing out silenced the tablet's chat until it was
+# backgrounded or the network blinked.
+#
+# Iterates a list() snapshot (other threads mutate the dict)
+# and asks python-socketio to close each sid; the presence
+# rows go too, so /online-status cannot keep showing a user
+# whose disconnect handler never ran. Returns the number of
 # sockets closed. A socket layer that is not up, or a sid
 # that died between the snapshot and the call, is not an
 # error — the caller's own route must not fail over it.
@@ -316,10 +406,13 @@ def _authenticate_socket(environ, auth):
 #
 # Used by:
 #   - users/api/auth_views.py — _disconnect_user_sockets
-#   - admin/api/views.py — the same guarded helper
+#     (logout → only_session, change_password →
+#     except_session, logout_all / delete_me → account-wide)
+#   - admin/api/views.py — the same guarded helper, always
+#     account-wide
 ############################################################
 
-def disconnect_user_sockets(user_id) -> int:
+def disconnect_user_sockets(user_id, *, only_session=None, except_session=None) -> int:
     try:
         from knfapp.chat.socket import sio
     except ImportError:
@@ -330,6 +423,11 @@ def disconnect_user_sockets(user_id) -> int:
     for sid, uid in list(_connected_users.items()):
         if uid != user_id:
             continue
+        session = _connected_sessions.get(sid)
+        if only_session is not None and session != only_session:
+            continue
+        if except_session is not None and session == except_session:
+            continue
         try:
             sio.disconnect(sid)
             closed += 1
@@ -339,9 +437,11 @@ def disconnect_user_sockets(user_id) -> int:
         # here too keeps presence honest if it never ran
         _connected_users.pop(sid, None)
         _connected_names.pop(sid, None)
+        _connected_sessions.pop(sid, None)
 
     if closed:
-        logger.info("Disconnected %d socket(s) for user=%s", closed, user_id)
+        scope = "session" if only_session else ("other-sessions" if except_session else "account")
+        logger.info("Disconnected %d socket(s) for user=%s scope=%s", closed, user_id, scope)
     return closed
 
 
@@ -368,8 +468,9 @@ def disconnect_user_sockets(user_id) -> int:
 # conversationId must be a non-empty str before it can
 # reach the database as a bind parameter. Handlers that
 # touched the database close the thread's connection on
-# the way out — an engineio packet thread lives as long as
-# its socket, and must not park an idle connection.
+# the way out (_release_connection above) — an engineio
+# packet thread lives as long as its socket, and must not
+# park an idle connection.
 ############################################################
 
 def register_socket_events(sio):
@@ -398,7 +499,7 @@ def register_socket_events(sio):
             except Exception as e:
                 handle_socket_error(event, sid, e)
             finally:
-                close_old_connections()
+                _release_connection()
         return wrapped
 
 
@@ -426,14 +527,15 @@ def register_socket_events(sio):
     ############################################################
 
     def handle_connect(sid, environ, auth=None):
-        user = _authenticate_socket(environ, auth)
-        if not user:
+        resolved = _authenticate_socket(environ, auth)
+        if not resolved:
             logger.info("Socket connection rejected — invalid token (sid=%s ip=%s)",
                         sid, environ.get("REMOTE_ADDR") if environ else None)
             # 'unauthorized' is the ONE reason the client may
             # render as "session expired"
             raise ConnectionRefusedError("unauthorized")
 
+        user, session_hash = resolved
         user_id = user["id"]
 
         if len(_connected_users) >= _MAX_TOTAL_SOCKETS:
@@ -458,6 +560,7 @@ def register_socket_events(sio):
                 logger.warning("Could not disconnect evicted socket sid=%s user=%s", oldest, user_id)
             _connected_users.pop(oldest, None)
             _connected_names.pop(oldest, None)
+            _connected_sessions.pop(oldest, None)
             logger.info("Evicted oldest socket sid=%s for user=%s — newest wins past cap %d",
                         oldest, user_id, _MAX_SOCKETS_PER_USER)
 
@@ -469,6 +572,9 @@ def register_socket_events(sio):
 
             _connected_users[sid] = user_id
             _connected_names[sid] = user["display_name"] or "Unknown"
+            # The session behind this sid — what a single-device
+            # logout matches on (disconnect_user_sockets)
+            _connected_sessions[sid] = session_hash
             _stamp_last_active(user_id)
 
             logger.info("Socket connected: user=%s sid=%s rooms=%d", user_id, sid, len(room_ids))
@@ -480,10 +586,11 @@ def register_socket_events(sio):
             # user their session died over a transient DB hiccup
             _connected_users.pop(sid, None)
             _connected_names.pop(sid, None)
+            _connected_sessions.pop(sid, None)
             logger.exception("Socket handshake failed: user=%s sid=%s", user_id, sid)
             raise ConnectionRefusedError("error")
         finally:
-            close_old_connections()
+            _release_connection()
 
     sio.on("connect", handler=handle_connect)
 
@@ -495,7 +602,8 @@ def register_socket_events(sio):
     ############################################################
     #
     # "disconnect" — drops the sid from the presence table and
-    # the display-name cache beside it. Rooms need no cleanup:
+    # the display-name and session caches beside it. Rooms need
+    # no cleanup:
     # python-socketio clears them for a closed socket itself.
     # The user stays "online" for /online-status and the push
     # skip as long as ANY other sid of theirs is in the table.
@@ -508,9 +616,10 @@ def register_socket_events(sio):
     def handle_disconnect(sid, reason=None):
         user_id = _connected_users.pop(sid, None)
         _connected_names.pop(sid, None)
+        _connected_sessions.pop(sid, None)
         if user_id:
             _stamp_last_active(user_id)
-            close_old_connections()
+            _release_connection()
             logger.info("Socket disconnected: user=%s sid=%s reason=%s", user_id, sid, reason)
 
     sio.on("disconnect", handler=handle_disconnect)

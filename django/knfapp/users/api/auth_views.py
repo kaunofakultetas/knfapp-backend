@@ -20,7 +20,9 @@
 #    change_password — POST /api/auth/change-password
 #    logout          — POST /api/auth/logout
 #    logout_all      — POST /api/auth/logout-all
-#    (+ _invite_rejection and the two cross-app hooks)
+#    (+ _invite_rejection and the socket hook; the profile
+#    update's rules live in users/profile.py, shared with
+#    PUT /api/social/profile)
 ############################################################
 
 
@@ -31,12 +33,11 @@ from datetime import datetime, timezone
 
 
 import bcrypt
-from django.db import IntegrityError, models
-from django.views.decorators.http import require_POST
+from django.db import IntegrityError, models, transaction
 
 
 from knfapp.common import ratelimit
-from knfapp.common.http import client_ip, get_json_object, json_error, json_response
+from knfapp.common.http import client_ip, get_json_object, json_error, json_response, require_methods
 from knfapp.common.timestamps import as_naive_utc, parse_stored, utc_now, utc_now_iso
 from knfapp.notifications.models import PushToken
 from knfapp.users.auth import (
@@ -51,10 +52,8 @@ from knfapp.users.auth import (
 from knfapp.users.models import InvitationCode, Session, User
 
 
-# The uploads app owns disk cleanup; auth only hands it the
-# avatar path a profile update replaced
-from knfapp.uploads.storage import delete_upload
 from knfapp.users.erasure import erase_user_account
+from knfapp.users.profile import apply_profile_patch, commit_profile_patch
 
 
 logger = logging.getLogger(__name__)
@@ -122,7 +121,7 @@ def _invite_rejection(invite):
 #   - services/api/auth.ts — validateInvitationCode
 ############################################################
 
-@require_POST
+@require_methods("POST")
 def validate_code(request):
     ip = client_ip(request)
     key = f"validate:{ip}"
@@ -167,16 +166,26 @@ def validate_code(request):
 # valid one grants its role and invited=True, no code means
 # student/invited=False.
 #
-# The body is validated BEFORE the rate-limit attempt is
-# recorded — malformed retries must not eat an honest
-# user's budget. The code burn is an ATOMIC conditional
-# UPDATE on use_count (a racing twin cannot reuse the last
-# slot); its expiry gate is the aware parse of
-# _invite_rejection, and the whole request rolls back
-# together on the 409 path, discarding the burn. Uniqueness
-# is checked case-insensitively (iexact — 'Tomas' blocks a
-# new 'tomas', mirroring login's lookup) with the INSERT's
-# IntegrityError answering the same 409 for the race.
+# The body is validated BEFORE the per-IP slot is taken —
+# malformed retries must not eat an honest user's budget —
+# and taking it is ONE step (ratelimit.reserve judges and
+# records in a single lock hold; a probe that a burst of
+# threads all pass would reserve nothing). Every validated
+# attempt keeps its slot, a 201 included: this budget caps
+# account creation, not only guessing. Uniqueness is checked
+# case-insensitively (iexact — 'Tomas' blocks a new 'tomas',
+# mirroring login's lookup) BEFORE the invitation is spent: a
+# 4xx return COMMITS under ATOMIC_REQUESTS, so a typo in the
+# username must never cost a single-use curator code its one
+# use. The burn itself is an ATOMIC conditional UPDATE on
+# use_count (a racing twin cannot reuse the last slot); its
+# expiry gate is the aware parse of _invite_rejection. The
+# one 4xx left after the burn — the INSERT's IntegrityError
+# for the race the pre-check cannot see — marks the
+# transaction for rollback explicitly, so the burn goes with
+# it on every engine (SQLite keeps a transaction usable after
+# an IntegrityError and would otherwise commit the burn
+# behind the 409).
 #
 # Error bodies carry the stable machine `code` next to the
 # English prose: rate_limited, invalid_username,
@@ -190,20 +199,15 @@ def validate_code(request):
 #   - services/api/auth.ts — registerApi
 ############################################################
 
-@require_POST
+@require_methods("POST")
 def register(request):
-    # STEP 1: probe the per-IP budget WITHOUT spending it
-    # ===================================================
+    # STEP 1: shape-check the body — presence, then type, then the
+    # caps (username charset, canonical lowercased email, password
+    # policy, display_name stripped 1–100 and stored stripped).
+    # No slot is taken yet: a malformed retry costs no budget
+    # ============================================================
     ip = client_ip(request)
     rl_key = f"register:{ip}"
-    if ratelimit.check(rl_key, record=False):
-        return ratelimit.limited_response("Too many registration attempts. Please wait a few minutes.", rl_key)
-
-
-    # STEP 2: shape-check the body — presence, then type, then the
-    # caps (username charset, canonical lowercased email, password
-    # policy, display_name stripped 1–100 and stored stripped)
-    # ============================================================
     data = get_json_object(request)
     if not data:
         return json_error("JSON body required", 400)
@@ -236,14 +240,22 @@ def register(request):
     if len(display_name) > 100:
         return json_error("Display name must be at most 100 characters", 400)
 
-    # The body validated — only NOW does the attempt spend budget
-    ratelimit.record(rl_key)
+
+    # STEP 2: the body validated — only NOW is the per-IP slot
+    # taken, in one atomic step (reserve prunes, compares and
+    # appends under one lock hold — a probe answered "free" to 24
+    # threads at once would let all 24 through). The slot stays
+    # spent whatever follows, success included: the budget caps
+    # how many accounts one IP can create, not only bad guesses
+    # ===========================================================
+    if not ratelimit.reserve(rl_key):
+        return ratelimit.limited_response("Too many registration attempts. Please wait a few minutes.", rl_key)
 
 
-    # STEP 3: resolve role/invited — guest defaults, overridden only
-    # by a code that passes the canonical checks and is then burned
-    # ATOMICALLY (conditional UPDATE; rowcount 0 = a racer took the
-    # last use or the row vanished, and the re-read names which)
+    # STEP 3: judge the invitation code — guest defaults, overridden
+    # only by a code that passes the canonical checks. Judged, not
+    # yet spent: nothing below may cost the code a use until the
+    # registration is known to go through
     # ==============================================================
     raw_code = data.get("invitation_code")
     if raw_code is not None and not isinstance(raw_code, str):
@@ -251,6 +263,7 @@ def register(request):
     invite_code = (raw_code or "").strip()
     role = "student"
     invited = False
+    invite = None
 
     if invite_code:
         invite = InvitationCode.objects.filter(code=invite_code).first()
@@ -259,6 +272,22 @@ def register(request):
             slug, prose, _ = rejection
             return json_error(prose, 400, code=slug)
 
+
+    # STEP 4: one 409 for a taken username OR email, checked
+    # case-insensitively to mirror login's lookup — and checked
+    # BEFORE the burn: a 4xx return commits under ATOMIC_REQUESTS,
+    # so a burn ahead of this line would spend a single-use code
+    # over a typo
+    # ============================================================
+    if User.objects.filter(models.Q(username__iexact=username) | models.Q(email__iexact=email)).exists():
+        return json_error("Username or email already exists", 409, code="username_taken")
+
+
+    # STEP 5: burn the code ATOMICALLY (conditional UPDATE; rowcount
+    # 0 = a racer took the last use or the row vanished, and the
+    # re-read names which — nothing was spent on that path either)
+    # ==============================================================
+    if invite is not None:
         burned = InvitationCode.objects.filter(
             code=invite_code, use_count__lt=models.F("max_uses"),
         ).update(use_count=models.F("use_count") + 1)
@@ -271,16 +300,11 @@ def register(request):
         invited = True
 
 
-    # STEP 4: one 409 for a taken username OR email, checked
-    # case-insensitively to mirror login's lookup
-    # ======================================================
-    if User.objects.filter(models.Q(username__iexact=username) | models.Q(email__iexact=email)).exists():
-        return json_error("Username or email already exists", 409, code="username_taken")
-
-
-    # STEP 5: the user (bcrypt, fresh salt); an IntegrityError is
-    # the pre-check's race answering the same 409 — ATOMIC_REQUESTS
-    # rolls the uncommitted burn back with it
+    # STEP 6: the user (bcrypt, fresh salt); an IntegrityError is
+    # the pre-check's race answering the same 409 — with the
+    # transaction marked for rollback FIRST, so the burn above is
+    # discarded on every engine (PostgreSQL has already aborted
+    # the transaction, SQLite would happily commit it)
     # =============================================================
     user_id = str(uuid.uuid4())
     password_hash = bcrypt.hashpw(data["password"].encode(), bcrypt.gensalt()).decode()
@@ -292,10 +316,11 @@ def register(request):
             created_at=now, updated_at=now,
         )
     except IntegrityError:
+        transaction.set_rollback(True)
         return json_error("Username or email already exists", 409, code="username_taken")
 
 
-    # STEP 6: the session in the same transaction; the answer goes
+    # STEP 7: the session in the same transaction; the answer goes
     # through serialize_user — one user shape everywhere
     # ============================================================
     token = mint_session(user_id)
@@ -334,11 +359,16 @@ def register(request):
 # {"user", "token"} with a fresh 30-day session; the
 # newest SESSIONS_PER_USER rows survive.
 #
-# Two failure-only rate buckets: per IP (LOGIN_IP_MAX per
-# 5 min, probed before the body) and per identifier (10 per
-# 5 min) — an X-Forwarded-For spoofer still cannot hammer
-# one account, and successful sign-ins never lock a NATed
-# campus out. Unknown user and wrong password share the
+# Two failure-only rate buckets, per IP (LOGIN_IP_MAX per
+# 5 min) and per identifier (10 per 5 min): each slot is
+# RESERVED before the bcrypt work — ratelimit.reserve judges
+# and records in one lock hold, so a burst of threads cannot
+# all pass one probe and spend nothing — and refunded once
+# the password proves right. An X-Forwarded-For spoofer
+# still cannot hammer one account, and successful sign-ins
+# never lock a NATed campus out; the body is checked before
+# either slot, so a malformed one reserves nothing. Unknown
+# user and wrong password share the
 # identical 401 at the same bcrypt cost (dummy hash when no
 # candidate row); an unusable stored hash is logged and
 # skipped as a non-match, never a 500. users.active is
@@ -349,19 +379,13 @@ def register(request):
 #   - services/api/auth.ts — loginApi
 ############################################################
 
-@require_POST
+@require_methods("POST")
 def login(request):
-    # STEP 1: probe the per-IP failure budget
-    # =======================================
-    ip = client_ip(request)
-    ip_key = f"login:{ip}"
-    if ratelimit.check(ip_key, max_attempts=LOGIN_IP_MAX, record=False):
-        return ratelimit.limited_response("Too many login attempts. Please wait a few minutes.", ip_key)
-
-
-    # STEP 2: the body — "username" wins over "email"; both must be
-    # strings or bcrypt/.encode() would blow up
+    # STEP 1: the body — "username" wins over "email"; both must be
+    # strings or bcrypt/.encode() would blow up. Before any slot is
+    # taken: a malformed body reserves nothing
     # =============================================================
+    ip = client_ip(request)
     data = get_json_object(request)
     if not data:
         return json_error("JSON body required", 400)
@@ -373,9 +397,20 @@ def login(request):
     if not isinstance(identifier, str) or not isinstance(password, str):
         return json_error("Username/email and password must be strings", 400)
 
-    # STEP 2.1: the per-identifier bucket a spoofer cannot dodge
+
+    # STEP 2: reserve the per-IP slot, then the per-identifier one
+    # a spoofer cannot dodge — both taken BEFORE the bcrypt work,
+    # each in one lock hold, so the budgets bound the guesses made
+    # rather than the guesses that looked; a refused identifier
+    # hands the IP slot straight back (a 429 spends nothing)
+    # ============================================================
+    ip_key = f"login:{ip}"
+    if not ratelimit.reserve(ip_key, max_attempts=LOGIN_IP_MAX):
+        return ratelimit.limited_response("Too many login attempts. Please wait a few minutes.", ip_key)
+
     id_key = f"login:id:{identifier.strip().lower()}"
-    if ratelimit.check(id_key, record=False):
+    if not ratelimit.reserve(id_key):
+        ratelimit.refund(ip_key)
         return ratelimit.limited_response("Too many login attempts. Please wait a few minutes.", id_key)
 
 
@@ -406,11 +441,15 @@ def login(request):
         bcrypt.checkpw(password.encode(), DUMMY_PASSWORD_HASH)
 
     if not user:
-        # Only failures fill the buckets
-        ratelimit.record(ip_key)
-        ratelimit.record(id_key)
+        # A failure — both reserved slots stay spent
         logger.warning("Failed login for %r from %s", identifier, ip)
         return json_error("Invalid credentials", 401, code="invalid_credentials")
+
+    # The password matched — only failures spend budget, so both
+    # slots go back; before the active check on purpose, a
+    # deactivated holder who knows the password is not a guesser
+    ratelimit.refund(ip_key)
+    ratelimit.refund(id_key)
 
     # After the password on purpose — the flag is the holder's alone
     if not user.active:
@@ -477,23 +516,29 @@ def me(request):
 # logout
 ############################################################
 #
-# POST /api/auth/logout — deletes the PRESENTED session row
-# (other devices stay signed in) and, when the body names a
-# pushToken, that one owner-scoped push row with it.
+# POST /api/auth/logout — the single-DEVICE sign-out: deletes
+# the PRESENTED session row, the one owner-scoped push row
+# the body names as pushToken (this device's — one request,
+# one transaction, so the push row cannot outlive the
+# session), and cuts the sockets of that session alone. The
+# account's other devices keep their sessions, their push
+# rows and their realtime; logout_all is the everywhere
+# switch.
 #
 # Used by:
 #   - services/api/auth.ts — logoutApi (the captured-bearer
-#     detached call)
+#     detached call, carrying this device's push token)
 ############################################################
 
-@require_POST
+@require_methods("POST")
 @require_auth
 def logout(request):
     token = bearer_token(request) or ""
     user_id = request.user["id"]
     data = get_json_object(request) or {}
 
-    Session.objects.filter(token=hash_token(token)).delete()
+    session_hash = hash_token(token)
+    Session.objects.filter(token=session_hash).delete()
 
     # Owner-scoped single-device push cleanup — never the whole user
     push_token = data.get("pushToken")
@@ -501,7 +546,9 @@ def logout(request):
         PushToken.objects.filter(user_id=user_id, token=push_token).delete()
 
     logger.info("Logout: user=%s", user_id)
-    _disconnect_user_sockets(user_id)
+    # Only THIS session's sockets: the tablet that stays signed
+    # in keeps its realtime too
+    _disconnect_user_sockets(user_id, only_session=session_hash)
     return json_response({"message": "Logged out"})
 
 
@@ -524,7 +571,7 @@ def logout(request):
 #   - documented in swagger for the settings screen to adopt
 ############################################################
 
-@require_POST
+@require_methods("POST")
 @require_auth
 def logout_all(request):
     user_id = request.user["id"]
@@ -543,38 +590,32 @@ def logout_all(request):
 
 
 ############################################################
-# _propagate_display_name / _disconnect_user_sockets
+# _disconnect_user_sockets
 ############################################################
 #
-# The two cross-app hooks the auth routes fire best-effort,
-# each behind a guarded import so an auth route never fails
-# on another app's plumbing:
-#
-#   - a rename rewrites the author_name snapshots on the
-#     user's posts — the news app owns that table
-#   - a credential change kicks the user's live sockets —
-#     the chat app owns the socket layer; a socket-layer
-#     failure never fails the auth route that triggered it
+# The cross-app hook the auth routes fire best-effort: a
+# credential change or an erasure kicks the user's live
+# sockets. The scope keywords pass straight through to
+# chat/events.py disconnect_user_sockets — only_session for
+# the single-device logout, except_session for the password
+# change that keeps the caller signed in, neither for the
+# account-wide paths. The chat app owns the socket layer,
+# so the import is guarded and a socket-layer failure never
+# fails the auth route that triggered it. (The rename hook
+# that used to sit beside it moved to users/profile.py with
+# the rest of the profile update.)
 #
 # Used by:
-#   - update_me, change_password (below)
+#   - delete_me, change_password, logout, logout_all (below)
 ############################################################
 
-def _propagate_display_name(user_id, display_name):
-    try:
-        from knfapp.news.models import NewsPost
-    except ImportError:
-        return
-    NewsPost.objects.filter(author_id=user_id).update(author_name=display_name)
-
-
-def _disconnect_user_sockets(user_id):
+def _disconnect_user_sockets(user_id, *, only_session=None, except_session=None):
     try:
         from knfapp.chat.events import disconnect_user_sockets
     except ImportError:
         return
     try:
-        disconnect_user_sockets(user_id)
+        disconnect_user_sockets(user_id, only_session=only_session, except_session=except_session)
     except Exception:
         logger.warning("Could not disconnect sockets for user %s", user_id)
 
@@ -590,101 +631,34 @@ def _disconnect_user_sockets(user_id):
 ############################################################
 #
 # PUT /api/auth/me — partial profile update: display name,
-# avatar (own /api/uploads/ paths or clearing only — null
-# and "" both clear), and the three student-card fields
-# (strings ≤50 after strip; null or blank stores NULL).
-# camelCase keys win when both spellings arrive. One UPDATE
-# from the whitelisted fields, updated_at stamped, the
-# author-name snapshots rewritten in the same transaction,
-# and the answer is the re-read row through serialize_user.
-# A replaced own-upload avatar is deleted from disk after
-# the commit, best-effort.
+# avatar and the three student-card fields. The rules, the
+# UPDATE, the rename propagation and the replaced avatar's
+# cleanup on the commit live in users/profile.py, shared
+# with PUT /api/social/profile; the answer is the re-read
+# row through serialize_user — the same key set from
+# either route. Thirty updates per user per 5 minutes
+# (429, the "profile" bucket both routes share) — the
+# limit sits on THIS function, not on `me`: GET
+# /api/auth/me is polled by the app. request.user is
+# already set by `me`'s require_auth.
 #
 # Used by:
 #   - services/api/auth.ts — updateMe (profile screen, the
 #     student-card editor)
 ############################################################
 
+@ratelimit.per_user("profile", max_attempts=30)
 def update_me(request):
-    # STEP 1: body, then collect the fields actually present
-    # ======================================================
     data = get_json_object(request)
     if not data:
         return json_error("JSON body required", 400)
 
-    updates = {}
-    new_display_name = None
-    replaced_avatar = None
-
-    # STEP 1.1: display name — present-but-blank is a 400,
-    # absent is simply skipped
-    dn_key = "displayName" if "displayName" in data else "display_name"
-    if dn_key in data:
-        if not isinstance(data[dn_key], str):
-            return json_error("display_name must be a string", 400)
-        display_name = data[dn_key].strip()
-        if not display_name:
-            return json_error("Display name cannot be empty", 400)
-        if len(display_name) > 100:
-            return json_error("Display name must be at most 100 characters", 400)
-        updates["display_name"] = display_name
-        new_display_name = display_name
-
-    # STEP 1.2: avatar — own uploads or clearing only; a replaced
-    # own upload is remembered for disk cleanup
-    av_key = "avatarUrl" if "avatarUrl" in data else "avatar_url"
-    if av_key in data:
-        av = data[av_key]
-        if av not in (None, "") and (not isinstance(av, str) or not av.startswith("/api/uploads/")):
-            return json_error("avatar_url must be a relative /api/uploads/ path", 400)
-        updates["avatar_url"] = av
-        old_avatar = request.user.get("avatar_url")
-        if old_avatar and old_avatar != av and old_avatar.startswith("/api/uploads/"):
-            replaced_avatar = old_avatar
-
-    # STEP 1.3: student-card fields — the 400 names the key the
-    # client sent; explicit null and a blank string both store NULL
-    for camel, snake, column in [
-        ("studentNumber", "student_number", "student_number"),
-        ("studyGroup", "study_group", "study_group"),
-        ("studyProgram", "study_program", "study_program"),
-    ]:
-        field = camel if camel in data else snake
-        if field in data:
-            val = data[field]
-            if val is not None:
-                if not isinstance(val, str):
-                    return json_error(f"{field} must be a string", 400)
-                val = val.strip()
-                if len(val) > 50:
-                    return json_error(f"{field} must be at most 50 characters", 400)
-                if not val:
-                    val = None
-            updates[column] = val
-
-    if not updates:
-        return json_error("No fields to update", 400)
-
-
-    # STEP 2: one UPDATE from the whitelist, the rename
-    # propagated in the same transaction, then re-read
-    # ================================================
-    updates["updated_at"] = utc_now()
-    User.objects.filter(id=request.user["id"]).update(**updates)
-    if new_display_name:
-        # Same transaction as the rename — posts never show a
-        # half-renamed author
-        _propagate_display_name(request.user["id"], new_display_name)
-
-    row = User.objects.filter(id=request.user["id"]).values().first()
-    if row is None:
-        # The row vanished between the auth check and the re-read —
-        # answer the session-dead 401 the client already handles
-        return json_error("Authentication required", 401)
-
-    if replaced_avatar:
-        delete_upload(replaced_avatar)
-
+    patch, error = apply_profile_patch(request, data)
+    if error:
+        return error
+    row, error = commit_profile_patch(request, patch)
+    if error:
+        return error
     return json_response(serialize_user(row))
 
 
@@ -705,29 +679,28 @@ def update_me(request):
 # the new one through the register policy, rewrites the
 # hash and drops every OTHER session in one commit — a
 # compromised credential dies everywhere except the device
-# doing the rotation. A wrong old password is a 400 (code
+# doing the rotation, whose socket is likewise the one left
+# standing. A wrong old password is a 400 (code
 # invalid_credentials), NOT a 401: the client treats any
 # authenticated 401 as "session dead" and would tear the
 # login down over a typo. Per-user limited, failures only —
-# verifying old passwords is a password oracle.
+# verifying old passwords is a password oracle — with the
+# slot RESERVED before the bcrypt check (one lock hold, no
+# probe a burst can all pass) and refunded on a match.
 #
 # Used by:
 #   - documented in swagger for the settings screen to adopt
 ############################################################
 
-@require_POST
+@require_methods("POST")
 @require_auth
 def change_password(request):
-    # STEP 1: the failure budget probe
-    # ================================
+    # STEP 1: body, both key spellings, then the shared policy —
+    # before any slot is taken, so a malformed body or a rejected
+    # new password reserves nothing
+    # ===========================================================
     user_id = request.user["id"]
     rl_key = f"chpass:{user_id}"
-    if ratelimit.check(rl_key, record=False):
-        return ratelimit.limited_response("Too many attempts. Please wait a few minutes.", rl_key)
-
-
-    # STEP 2: body, both key spellings, then the shared policy
-    # ========================================================
     data = get_json_object(request)
     if not data:
         return json_error("JSON body required", 400)
@@ -745,19 +718,28 @@ def change_password(request):
         return json_error(prose, 400, code=slug)
 
 
-    # STEP 3: verify against a fresh hash read, rewrite, and drop
-    # every other session in the same commit
-    # ===========================================================
+    # STEP 2: take the failure-budget slot BEFORE the bcrypt oracle
+    # (reserve judges and records in one lock hold), then verify
+    # against a fresh hash read — a wrong old password keeps the
+    # slot, a right one hands it back
+    # =============================================================
+    if not ratelimit.reserve(rl_key):
+        return ratelimit.limited_response("Too many attempts. Please wait a few minutes.", rl_key)
+
     row = User.objects.filter(id=user_id).values("password_hash").first()
     try:
         matched = row is not None and bcrypt.checkpw(old_password.encode(), row["password_hash"].encode())
     except (TypeError, ValueError):
         matched = False
     if not matched:
-        ratelimit.record(rl_key)
         logger.warning("Password change rejected (wrong old password) for user %s", user_id)
         return json_error("Invalid credentials", 400, code="invalid_credentials")
+    ratelimit.refund(rl_key)
 
+
+    # STEP 3: rewrite, and drop every other session in the same
+    # commit
+    # =========================================================
     new_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
     User.objects.filter(id=user_id).update(password_hash=new_hash, updated_at=utc_now())
 
@@ -767,7 +749,8 @@ def change_password(request):
     Session.objects.filter(user_id=user_id).exclude(token=current_hash).delete()
 
     logger.info("Password changed for user %s (other sessions revoked)", user_id)
-    _disconnect_user_sockets(user_id)
+    # The surviving session keeps its socket — every other one goes
+    _disconnect_user_sockets(user_id, except_session=current_hash)
     return json_response({"message": "Password changed"})
 
 
@@ -784,7 +767,9 @@ def change_password(request):
 # The self-service GDPR pair. Erasure is password-confirmed
 # — a stolen session token alone must not destroy an
 # account — with wrong guesses burning change-password's
-# budget (never a password oracle), and the last active
+# budget (never a password oracle; the slot is reserved
+# before the bcrypt check and refunded on a match), and the
+# last active
 # admin cannot erase themselves out of the system. On
 # success every session is gone, so the 200 is the
 # account's last authenticated response. Export answers the
@@ -798,16 +783,11 @@ def change_password(request):
 ############################################################
 
 def delete_me(request):
-    # STEP 1: the same failure budget change-password runs on
-    # =======================================================
+    # STEP 1: the password confirm's body — before any slot is
+    # taken, so a malformed body reserves nothing
+    # ========================================================
     user_id = request.user["id"]
     rl_key = f"chpass:{user_id}"
-    if ratelimit.check(rl_key, record=False):
-        return ratelimit.limited_response("Too many attempts. Please wait a few minutes.", rl_key)
-
-
-    # STEP 2: the password confirm
-    # ============================
     data = get_json_object(request)
     if not data:
         return json_error("JSON body required", 400)
@@ -815,15 +795,24 @@ def delete_me(request):
     if not password or not isinstance(password, str):
         return json_error("Password required", 400)
 
+
+    # STEP 2: the same failure budget change-password runs on,
+    # taken BEFORE the bcrypt oracle (one lock hold — no probe a
+    # burst can all pass) and handed back once the password proves
+    # right; a wrong guess keeps its slot
+    # ============================================================
+    if not ratelimit.reserve(rl_key):
+        return ratelimit.limited_response("Too many attempts. Please wait a few minutes.", rl_key)
+
     row = User.objects.filter(id=user_id).values("password_hash").first()
     try:
         matched = row is not None and bcrypt.checkpw(password.encode(), row["password_hash"].encode())
     except (TypeError, ValueError):
         matched = False
     if not matched:
-        ratelimit.record(rl_key)
         logger.warning("Account deletion rejected (wrong password) for user %s", user_id)
         return json_error("Invalid credentials", 400, code="invalid_credentials")
+    ratelimit.refund(rl_key)
 
 
     # STEP 3: admin continuity — the last active admin hands

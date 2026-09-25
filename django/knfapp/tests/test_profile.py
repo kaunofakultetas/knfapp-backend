@@ -1,14 +1,20 @@
 ############################################################
 #  [*] Regression tests — PUT /me and change-password
 #
-#  The profile update's whitelist rules (avatar paths,
-#  camelCase precedence, blank-vs-absent) and the password
-#  rotation's two security decisions: the wrong-old answer
-#  is a 400 (never the session-killing 401) and every OTHER
-#  session dies with the rotation.
+#  The profile update's whitelist rules (avatar paths AND
+#  their owner — somebody else's registered upload is 400
+#  upload_not_owned, the current avatar sent back unchanged
+#  a no-op; camelCase precedence, blank-vs-absent), the
+#  replaced avatar's cleanup on the commit, the PUT's own
+#  rate limit (the polled GET is never limited), the parity
+#  of the two profile routes (one shared routine), and the
+#  password rotation's two security decisions: the
+#  wrong-old answer is a 400 (never the session-killing
+#  401) and every OTHER session dies with the rotation.
 ############################################################
 
 
+import os
 import shutil
 import tempfile
 
@@ -18,9 +24,10 @@ from django.test import Client, TestCase
 
 from knfapp.common import ratelimit
 from knfapp.uploads import storage
+from knfapp.uploads.models import Upload
 from knfapp.users import auth
 from knfapp.users.models import Session, User
-from .utils import PASSWORD, bearer, create_user
+from .utils import PASSWORD, bearer, create_user, register_upload
 
 
 class UpdateMeTests(TestCase):
@@ -35,6 +42,13 @@ class UpdateMeTests(TestCase):
         return bearer(self.client.put, "/api/auth/me", token or self.token,
                       data=body, content_type="application/json")
 
+    def _throwaway_upload_dir(self):
+        tmp = tempfile.mkdtemp(prefix="knfapp-av-")
+        storage._upload_dir = tmp
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        self.addCleanup(lambda: setattr(storage, "_upload_dir", None))
+        return tmp
+
     def test_camel_case_wins_and_the_answer_is_the_reread_row(self):
         response = self._put({"displayName": "  Tomas V.  ", "display_name": "ignored"})
         self.assertEqual(response.status_code, 200)
@@ -48,22 +62,43 @@ class UpdateMeTests(TestCase):
         self.assertEqual(cleared.status_code, 200)
         self.assertIsNone(cleared.json()["avatarUrl"])
 
+    def test_the_avatar_must_be_the_callers_own_registered_upload(self):
+        tmp = self._throwaway_upload_dir()
+        other = create_user(username="kitas", email="kitas@knf.vu.lt")
+        foreign = register_upload(tmp, other)
+        own = register_upload(tmp, self.user)
+
+        refused = self._put({"avatarUrl": f"/api/uploads/{foreign}"})
+        self.assertEqual((refused.status_code, refused.json()["code"]), (400, "upload_not_owned"))
+        self.assertIsNone(User.objects.get(id=self.user.id).avatar_url)
+
+        accepted = self._put({"avatarUrl": f"/api/uploads/{own}"})
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["avatarUrl"], f"/api/uploads/{own}")
+
+        # The whole profile PUT back: the current avatar, unchanged,
+        # is a no-op — even once its ledger row is gone (SET_NULL
+        # after an erasure, or a pre-ledger file)
+        Upload.objects.filter(filename=own).delete()
+        again = self._put({"avatarUrl": f"/api/uploads/{own}", "displayName": "Tomas"})
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(again.json()["avatarUrl"], f"/api/uploads/{own}")
+
     def test_a_replaced_own_avatar_is_deleted_from_disk(self):
-        tmp = tempfile.mkdtemp(prefix="knfapp-av-")
-        storage._upload_dir = tmp
-        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
-        self.addCleanup(lambda: setattr(storage, "_upload_dir", None))
-
-        old_name = "a" * 32 + ".jpg"
-        open(f"{tmp}/{old_name}", "wb").write(b"x")
+        tmp = self._throwaway_upload_dir()
+        # Both registered to the user: the sink refuses a rowless
+        # old file, and the acceptance refuses a rowless new one
+        old_name = register_upload(tmp, self.user)
+        new_name = register_upload(tmp, self.user)
         User.objects.filter(id=self.user.id).update(avatar_url=f"/api/uploads/{old_name}")
-        # Re-mint so request.user carries the old avatar
-        token = auth.mint_session(self.user.id)
 
-        response = self._put({"avatarUrl": "/api/uploads/" + "b" * 32 + ".jpg"}, token=token)
+        # The unlink rides the commit
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self._put({"avatarUrl": f"/api/uploads/{new_name}"})
         self.assertEqual(response.status_code, 200)
-        import os
-        self.assertFalse(os.path.exists(f"{tmp}/{old_name}"))
+        self.assertFalse(os.path.exists(os.path.join(tmp, old_name)))
+        self.assertFalse(Upload.objects.filter(filename=old_name).exists())
+        self.assertTrue(os.path.exists(os.path.join(tmp, new_name)))
 
     def test_student_fields_blank_or_null_store_null(self):
         response = self._put({"studentNumber": "  ", "studyGroup": "IS-3", "studyProgram": None})
@@ -75,6 +110,28 @@ class UpdateMeTests(TestCase):
     def test_an_empty_update_is_a_400(self):
         self.assertEqual(self._put({}).status_code, 400)
         self.assertEqual(self._put({"unknownField": "x"}).status_code, 400)
+
+    def test_the_31st_update_is_a_429_while_the_polled_get_is_not(self):
+        for i in range(30):
+            self.assertEqual(self._put({"displayName": f"Tomas {i}"}).status_code, 200, i)
+        limited = self._put({"displayName": "Tomas 31"})
+        self.assertEqual((limited.status_code, limited.json()["code"]), (429, "rate_limited"))
+        self.assertEqual(bearer(self.client.get, "/api/auth/me", self.token).status_code, 200)
+
+    def test_both_profile_routes_answer_the_same_shape(self):
+        # One routine behind PUT /api/auth/me and PUT
+        # /api/social/profile — the same patch must come back with
+        # the same keys and values from either
+        patch = {"displayName": "Tomas V.", "studyGroup": "IS-3", "studentNumber": None}
+        via_auth = self._put(patch)
+        via_social = bearer(self.client.put, "/api/social/profile", self.token,
+                            data=patch, content_type="application/json")
+        self.assertEqual((via_auth.status_code, via_social.status_code), (200, 200))
+        self.assertEqual(via_auth.json(), via_social.json())
+        self.assertEqual(set(via_auth.json()), {
+            "id", "username", "email", "displayName", "role", "avatarUrl",
+            "invited", "studentNumber", "studyGroup", "studyProgram",
+        })
 
 
 class ChangePasswordTests(TestCase):

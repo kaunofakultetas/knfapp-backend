@@ -6,31 +6,35 @@
 //  source with the on-demand re-index (cron's exact sync —
 //  incremental is subsecond, the full re-embed asks first),
 //  a retrieval test box showing precisely what the agent's
-//  searchHandbook tool would be handed for a question, and
-//  the versioned prompt manager — the assistant's ENTIRE
+//  searchHandbook tool would be handed for a question, the
+//  CURATED ANSWERS an admin writes by hand (embedded on save,
+//  live for the next chat turn, edited or deleted in place),
+//  and the versioned prompt manager — the assistant's ENTIRE
 //  system prompt lives here as immutable versions, one
 //  active at most; with none active the assistant refuses
 //  every chat (503) until an admin activates one. The
 //  conversation review lives on its own page
 //  (/assistant-threads).
 //
-//  Reads GET /api/admin/assistant/overview and .../prompts
-//  (TanStack queries ['assistant','overview'] and
-//  ['assistant','prompts']); every mutation invalidates
-//  both so the numbers and the version list never disagree.
+//  Reads GET /api/admin/assistant/overview, .../prompts and
+//  .../knowledge/curated (TanStack queries under the
+//  ['assistant', …] prefix); every mutation invalidates the
+//  prefix so the numbers, the entries and the version list
+//  never disagree.
 //
 //  Split into (root component last):
 //
 //    StatTile        — one overview number
 //    KnowledgeCard   — sources, freshness, re-index
 //    RetrievalTester — question in, the tool's hits out
+//    CuratedCard     — the hand-written answers, editable
 //    PromptComposer  — a NEW version, save or save+activate
 //    PromptRow       — one immutable version, expandable
 //    Assistant       — the page itself (default export)
 // -----------------------------------------------------------
 
 import { useState } from "react";
-import { Button, CircularProgress, TextField } from '@mui/material';
+import { Button, CircularProgress, MenuItem, TextField } from '@mui/material';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import toast from 'react-hot-toast';
 
@@ -218,6 +222,146 @@ function RetrievalTester({ t }) {
 
 
 // -----------------------------------------------------------
+// CuratedCard
+// -----------------------------------------------------------
+//
+// The answers no scraped page carries, written by hand: a
+// language, a one-line question (the line the assistant
+// cites) and the answer. Saving embeds the entry through
+// the AI gateway at once — it is live for the next chat
+// turn, no re-index needed. The same form edits an existing
+// entry (prefilled; a save re-embeds it), and every entry
+// carries its delete. The repo-owned base entries are code
+// and are not listed here.
+//
+// Used by:
+//   - Assistant (below)
+// -----------------------------------------------------------
+
+function CuratedCard({ t, entries, save, remove }) {
+
+  const [editing, setEditing] = useState(null);
+  const [language, setLanguage] = useState('lt');
+  const [question, setQuestion] = useState('');
+  const [answer, setAnswer] = useState('');
+
+
+  const reset = () => {
+    setEditing(null);
+    setQuestion('');
+    setAnswer('');
+  };
+
+  const startEdit = (entry) => {
+    setEditing(entry);
+    setLanguage(entry.language);
+    setQuestion(entry.question);
+    setAnswer(entry.answer);
+  };
+
+  const submit = () => {
+    save.mutate(
+      { id: editing?.id ?? null, language, question: question.trim(), answer: answer.trim() },
+      { onSuccess: reset },
+    );
+  };
+
+
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white p-4">
+      <div className="mb-1 font-semibold text-gray-900">
+        {t("curated.title")} — {entries.length}
+      </div>
+      <div className="mb-3 text-sm text-gray-500">{t("curated.hint")}</div>
+
+      {/* The form — adds, or edits the entry it was opened on */}
+      <div className="flex flex-col gap-2">
+        <div className="flex gap-2">
+          <TextField
+            select
+            size="small"
+            value={language}
+            onChange={(event) => setLanguage(event.target.value)}
+            sx={{ width: 96 }}
+          >
+            <MenuItem value="lt">LT</MenuItem>
+            <MenuItem value="en">EN</MenuItem>
+          </TextField>
+          <TextField
+            size="small"
+            fullWidth
+            placeholder={t("curated.questionPlaceholder")}
+            value={question}
+            onChange={(event) => setQuestion(event.target.value)}
+          />
+        </div>
+        <TextField
+          size="small"
+          fullWidth
+          multiline
+          minRows={3}
+          placeholder={t("curated.answerPlaceholder")}
+          value={answer}
+          onChange={(event) => setAnswer(event.target.value)}
+        />
+        <div className="flex gap-2">
+          <Button
+            variant="contained"
+            size="small"
+            disabled={!question.trim() || !answer.trim() || save.isPending}
+            startIcon={save.isPending ? <CircularProgress size={14} color="inherit" /> : null}
+            onClick={submit}
+          >
+            {editing ? t("curated.update") : t("curated.add")}
+          </Button>
+          {editing ? (
+            <Button variant="outlined" size="small" onClick={reset}>
+              {t("curated.cancel")}
+            </Button>
+          ) : null}
+        </div>
+      </div>
+
+      {/* The entries, newest first */}
+      {entries.length === 0 ? (
+        <div className="mt-3 text-sm text-gray-500">{t("curated.empty")}</div>
+      ) : null}
+      {entries.map((entry) => (
+        <div key={entry.id} className="mt-3 border-t border-gray-100 pt-2">
+          <div className="flex items-center gap-2">
+            <span className="text-xs uppercase text-gray-400">{entry.language}</span>
+            <span className="text-sm font-medium text-gray-900">{entry.question}</span>
+            <span className="ml-auto text-xs text-gray-400">{formatDateTime(entry.indexedAt)}</span>
+          </div>
+          <div className="whitespace-pre-wrap text-sm text-gray-600">{entry.answer}</div>
+          <div className="mt-1 flex gap-2">
+            <Button size="small" onClick={() => startEdit(entry)}>
+              {t("curated.edit")}
+            </Button>
+            <Button
+              size="small"
+              color="error"
+              disabled={remove.isPending}
+              onClick={() => {
+                if (window.confirm(t("curated.deleteConfirm"))) remove.mutate(entry.id);
+              }}
+            >
+              {t("curated.delete")}
+            </Button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+
+
+
+
+
+// -----------------------------------------------------------
 // PromptComposer
 // -----------------------------------------------------------
 //
@@ -342,9 +486,10 @@ function PromptRow({ t, prompt, activate }) {
 // Assistant (default export)
 // -----------------------------------------------------------
 //
-// The two queries load side by side; the four mutations
-// (re-index, save version, activate, core-only) each
-// invalidate both on success and toast their outcome —
+// The three queries load side by side; the six mutations
+// (re-index, save/delete a curated answer, save version,
+// activate, core-only) each invalidate the prefix on
+// success and toast their outcome —
 // api/client.js already toasts mutation FAILURES app-wide.
 //
 // Used by:
@@ -364,6 +509,10 @@ export default function Assistant({ authData }) {
   const prompts = useQuery({
     queryKey: ['assistant', 'prompts'],
     queryFn: async () => (await api.get('/api/admin/assistant/prompts')).data.prompts,
+  });
+  const curated = useQuery({
+    queryKey: ['assistant', 'curated'],
+    queryFn: async () => (await api.get('/api/admin/assistant/knowledge/curated')).data.entries,
   });
 
   const refetchBoth = () => {
@@ -395,6 +544,20 @@ export default function Assistant({ authData }) {
     mutationFn: async () => (await api.post('/api/admin/assistant/prompts/deactivate')).data,
     onSuccess: refetchBoth,
   });
+  const saveCurated = useMutation({
+    mutationFn: async ({ id, ...body }) =>
+      (await api.post(id
+        ? `/api/admin/assistant/knowledge/curated/${id}/update`
+        : '/api/admin/assistant/knowledge/curated', body)).data,
+    onSuccess: () => {
+      toast.success(t("curated.saved"));
+      refetchBoth();
+    },
+  });
+  const removeCurated = useMutation({
+    mutationFn: async (id) => (await api.post(`/api/admin/assistant/knowledge/curated/${id}/delete`)).data,
+    onSuccess: refetchBoth,
+  });
 
 
   return (
@@ -403,9 +566,9 @@ export default function Assistant({ authData }) {
 
         <PageTitle>{t("TITLE")}</PageTitle>
 
-        {overview.isLoading || prompts.isLoading ? (
+        {overview.isLoading || prompts.isLoading || curated.isLoading ? (
           <div className="flex justify-center py-10"><CircularProgress /></div>
-        ) : overview.isError || prompts.isError ? (
+        ) : overview.isError || prompts.isError || curated.isError ? (
           <div className="py-10 text-center text-sm text-red-600">{t("loadError")}</div>
         ) : (
           <div className="flex flex-col gap-4">
@@ -421,6 +584,7 @@ export default function Assistant({ authData }) {
 
             <KnowledgeCard t={t} knowledge={overview.data.knowledge} reindex={reindex} />
             <RetrievalTester t={t} />
+            <CuratedCard t={t} entries={curated.data ?? []} save={saveCurated} remove={removeCurated} />
 
             {/* The versioned prompt manager */}
             <div className="mt-2 font-semibold text-gray-900">{t("prompts.title")}</div>

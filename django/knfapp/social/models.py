@@ -141,7 +141,11 @@ REPORT_STATUSES = ("open", "resolved")
 # DELETES the row — the two friendships rows are the state
 # of record — and 'rejected' rows live only as long as the
 # re-ask cooldown. The partial unique index on the pending
-# pair settles a mutual-send race as a 409, never two rows.
+# DIRECTED pair settles a same-direction race (two sends of
+# A→B) as a 409, never two rows; a crossed mutual send (A→B
+# and B→A) is two legal rows, settled by the views — the
+# auto-accept branch plus the both-directions cleanup accept
+# runs (social/api/views.py).
 #
 # Table: friend_requests
 # -----------------------------------------------------------

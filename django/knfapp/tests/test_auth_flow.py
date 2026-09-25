@@ -10,10 +10,15 @@
 ############################################################
 
 
+from unittest import mock
+
+
+from django.db import IntegrityError
 from django.test import Client, TestCase
 
 
 from knfapp.common import ratelimit
+from knfapp.users.api import auth_views
 from knfapp.users.models import InvitationCode, Session, User
 from .utils import PASSWORD, bearer, create_invite, create_user
 
@@ -87,6 +92,32 @@ class AuthFlowTests(TestCase):
         create_invite(code="PASKUTINIS", max_uses=1, use_count=1)
         response = self._register(invitation_code="PASKUTINIS")
         self.assertEqual((response.status_code, response.json()["code"]), (400, "invite_exhausted"))
+
+    def test_a_taken_username_does_not_burn_the_invitation(self):
+        # A 4xx return commits under ATOMIC_REQUESTS — a typo in the
+        # username must not spend a single-use curator code
+        create_user(username="Tomas", email="tomas@knf.vu.lt")
+        create_invite(code="VIENKARTINIS", role="curator", max_uses=1)
+        response = self._register(username="tomas", email="kitas@knf.vu.lt", invitation_code="VIENKARTINIS")
+        self.assertEqual((response.status_code, response.json()["code"]), (409, "username_taken"))
+        self.assertEqual(InvitationCode.objects.get(code="VIENKARTINIS").use_count, 0)
+
+        # …and the honest retry still gets its one use
+        response = self._register(username="tomas2", email="kitas@knf.vu.lt", invitation_code="VIENKARTINIS")
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()["user"]["role"], "curator")
+        self.assertEqual(InvitationCode.objects.get(code="VIENKARTINIS").use_count, 1)
+
+    def test_the_race_behind_the_pre_check_discards_the_burn_too(self):
+        # The INSERT's IntegrityError is the pre-check's race. SQLite
+        # keeps the transaction usable after it, so without an
+        # explicit rollback mark the burn would commit behind the 409
+        create_invite(code="LENKTYNES", role="curator", max_uses=1)
+        with mock.patch.object(auth_views.User.objects, "create", side_effect=IntegrityError("users.username")):
+            response = self._register(invitation_code="LENKTYNES")
+        self.assertEqual((response.status_code, response.json()["code"]), (409, "username_taken"))
+        self.assertEqual(InvitationCode.objects.get(code="LENKTYNES").use_count, 0)
+        self.assertEqual(User.objects.count(), 0)
 
 
     # ---- validate-code ---------------------------------

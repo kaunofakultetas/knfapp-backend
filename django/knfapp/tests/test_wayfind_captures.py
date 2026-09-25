@@ -10,7 +10,9 @@
 #  by hand (Django fills nothing for PUT); a picture past
 #  60 MP (Pillow's hard decompression-bomb stop, twice the
 #  process-wide 30 MP guard) answers 413 too_large for
-#  frames and direct panoramas alike; finish gates on 8
+#  frames and direct panoramas alike, and so does a body
+#  declared past DATA_UPLOAD_MAX_MEMORY_SIZE — on its
+#  Content-Length, before it is read; finish gates on 8
 #  frames, on status and on its optional body. The SVG plan
 #  store cuts scripts before hashing.
 ############################################################
@@ -22,6 +24,7 @@ import shutil
 import tempfile
 
 
+from django.conf import settings
 from django.test import Client, TestCase, override_settings
 from django.test.client import BOUNDARY, MULTIPART_CONTENT, encode_multipart
 from PIL import Image
@@ -197,6 +200,30 @@ class FrameUploadTests(CaptureTestCase):
         response = bearer(self.client.post, "/api/wayfind/buildings/b1/panoramas", self.token,
                           data={"file": _file(bomb_bytes(), "p.png")})
         self.assertEqual(response.status_code, 413)
+        self.assertEqual(json.loads(response.content)["code"], "too_large")
+
+    def test_a_body_declared_past_the_ceiling_is_a_json_413_before_it_is_read(self):
+        # A forged Content-Length past DATA_UPLOAD_MAX_MEMORY_SIZE on
+        # an otherwise valid frame: the phone gets a JSON too_large
+        # it can render (what the proxy's empty 413 used to be), and
+        # nothing is stored — the body was never parsed
+        declared = str(settings.DATA_UPLOAD_MAX_MEMORY_SIZE + 1)
+        megabytes = settings.DATA_UPLOAD_MAX_MEMORY_SIZE // (1024 * 1024)
+        fields = {"yawDeg": "0", "pitchDeg": "0", "rollDeg": "0", "file": _file(frame_bytes(0))}
+        response = bearer(self.client.put, "/api/wayfind/captures/cap-0000-0001/frames/r0-0", self.token,
+                          data=encode_multipart(BOUNDARY, fields), content_type=MULTIPART_CONTENT,
+                          CONTENT_LENGTH=declared)
+        self.assertEqual(response.status_code, 413, response.content)
+        body = json.loads(response.content)
+        self.assertEqual(body["code"], "too_large")
+        self.assertIn(f"{megabytes} MB", body["error"])
+        status = bearer(self.client.get, "/api/wayfind/captures/cap-0000-0001", self.token)
+        self.assertEqual(json.loads(status.content)["frames"], 0)
+
+        # The direct panorama upload keeps the same promise
+        response = bearer(self.client.post, "/api/wayfind/buildings/b1/panoramas", self.token,
+                          data={"file": _file(frame_bytes(0), "p.jpg")}, CONTENT_LENGTH=declared)
+        self.assertEqual(response.status_code, 413, response.content)
         self.assertEqual(json.loads(response.content)["code"], "too_large")
 
 

@@ -110,6 +110,9 @@ export const TOOL_SCHEMAS = {
             required: ["id", "title", "date", "source"],
           },
         },
+        // Set by execute on an empty answer (see below) — declared
+        // so the served contract matches what the model receives
+        note: { type: "string" },
       },
       required: ["posts"],
     },

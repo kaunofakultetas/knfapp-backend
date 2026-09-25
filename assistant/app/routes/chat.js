@@ -10,12 +10,17 @@
 //  and — after the stream closes — persist the turn's two
 //  new messages and one telemetry row, both fire-and-forget
 //  (a lost write must never surface as a chat failure).
+//  The response head waits for the model's first word: a
+//  gateway that refuses the turn (quota, dead key, 5xx) is
+//  answered as the JSON envelope with the status it means,
+//  not as apology text inside a 200.
 //
 //  Split into:
 //
 //    validateBody       — clamp sizes, 400 on nonsense
 //    verifyThread       — the asker may write this thread
 //    prepareMessages    — UIMessages → pruned model messages
+//    awaitFirstEvent    — hold the head until the model answers
 //    pipeWebResponse    — Web Response → Express response
 //    persistTurn        — the two new messages, upserted
 //    logTurn            — one telemetry row
@@ -25,7 +30,9 @@
 import { randomUUID } from "node:crypto";
 
 import { Router } from "express";
-import { convertToModelMessages, pruneMessages, stepCountIs, streamText } from "ai";
+import {
+  convertToModelMessages, createUIMessageStreamResponse, pruneMessages, stepCountIs, streamText,
+} from "ai";
 
 import {
   CHAT_CHUNK_TIMEOUT_MS,
@@ -37,7 +44,9 @@ import {
   MAX_STEPS,
 } from "../config.js";
 import { AI_CHAT_MODEL } from "../config.js";
-import { HttpError, formatStreamError, streamErrorToAssistantText } from "../middleware/errors.js";
+import {
+  HttpError, formatStreamError, gatewayErrorToHttpError, streamErrorToAssistantText,
+} from "../middleware/errors.js";
 import { buildSystemPrompt } from "../llm/prompt.js";
 import { getModel, isModelConfigured } from "../llm/provider.js";
 import { createTools } from "../llm/tools.js";
@@ -184,13 +193,83 @@ async function prepareMessages(messages) {
 
 
 // -----------------------------------------------------------
+// awaitFirstEvent
+// -----------------------------------------------------------
+//
+//   awaitFirstEvent(uiStream, () => firstError) → chunk stream
+//
+// The head is not written until the model has said
+// something. streamText is lazy — its UI stream exists
+// before the gateway is contacted — so committing 200
+// text/event-stream up front turned every gateway refusal
+// (quota 429, dead virtual key, 5xx, refused connection)
+// into apology text inside a success, which the phone's
+// failure taxonomy can never read. Reads the UI chunk
+// stream up to its first substantive chunk: `start` (the
+// message id, minted before any model contact) is held; an
+// `error` seen before any content is the gateway refusing
+// the turn — the stream is cancelled and the failure is
+// thrown as the HttpError the envelope answers. Anything
+// else is the answer beginning: the held chunks are
+// replayed ahead of the rest. The raw error comes from the
+// caller's streamText onError hook, which fires before the
+// error chunk reaches this reader; the chunk itself carries
+// only the sanitized text.
+//
+// Used by:
+//   - POST / (below)
+// -----------------------------------------------------------
+
+async function awaitFirstEvent(uiStream, firstError) {
+  const reader = uiStream.getReader();
+  const held = [];
+  let ended = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      ended = true;
+      break;
+    }
+    if (value.type === "error") {
+      // Cancelling still runs the SDK's onEnd — persistTurn
+      // sees the reply, and skips it for having no content
+      await reader.cancel().catch(() => {});
+      throw gatewayErrorToHttpError(firstError());
+    }
+    held.push(value);
+    if (value.type !== "start") break;
+  }
+
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of held) controller.enqueue(chunk);
+      if (ended) controller.close();
+    },
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) controller.close();
+      else controller.enqueue(value);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
+
+
+
+
+// -----------------------------------------------------------
 // pipeWebResponse
 // -----------------------------------------------------------
 //
 // The AI SDK hands back a Web Response whose body is the
 // SSE stream; Express wants writes. Copy status + headers,
 // pump chunks, always end — a client that vanished
-// mid-answer is a log line, not a crash.
+// mid-answer is a log line, not a crash. The head goes out
+// here, and only here — by now awaitFirstEvent has proven
+// the model is answering.
 //
 // Used by:
 //   - POST / (below)
@@ -229,10 +308,14 @@ async function pipeWebResponse(webResponse, res) {
 // failed is replayed by the NEXT turn's batch, because the
 // client's request always carries the history and the
 // upsert is idempotent. Django caps a batch at 20; the tail
-// plus the reply stays inside it.
+// plus the reply stays inside it. A reply with no content —
+// nothing past the step markers, the shape of a turn the
+// gateway refused — is not stored: the SDK's onEnd fires for
+// a cancelled stream too, and it used to write a permanent
+// blank bubble into the thread.
 //
 // Used by:
-//   - POST / (below) — toUIMessageStreamResponse onEnd
+//   - POST / (below) — toUIMessageStream onEnd
 // -----------------------------------------------------------
 
 // How many trailing request messages ride in each persistence
@@ -243,8 +326,10 @@ function persistTurn(threadId, userId, requestMessages, responseMessage) {
   const tail = requestMessages
     .filter((message) => message?.id && (message.role === "user" || message.role === "assistant"))
     .slice(-PERSIST_TAIL);
+  const hasContent = Array.isArray(responseMessage?.parts)
+    && responseMessage.parts.some((part) => part?.type !== "step-start");
   const batch = [...tail.filter((message) => message.id !== responseMessage?.id),
-                 ...(responseMessage?.id && responseMessage.role ? [responseMessage] : [])];
+                 ...(responseMessage?.id && responseMessage.role && hasContent ? [responseMessage] : [])];
   if (!threadId || batch.length === 0) return;
 
   internalFetch(`/internal/assistant/threads/${threadId}/messages`, {
@@ -299,11 +384,13 @@ function logTurn({ threadId, userId, language, clientVersion, usage, toolCalls, 
 // -----------------------------------------------------------
 //
 // The composition: identity → rate limit → validation →
-// thread check → streamText with the three tools →
-// UI message stream out; persistence and telemetry hang
-// off the two finish hooks. An unconfigured gateway is a
-// clean 503 the engine reads as 'unavailable' — never a
-// stream that dies mid-first-token.
+// thread check → streamText with the three tools → the
+// first model event awaited → UI message stream out;
+// persistence and telemetry hang off the two finish hooks.
+// An unconfigured gateway is a clean 503 the engine reads
+// as 'unavailable', a gateway refusing the turn is the
+// status it means (429 quota, 503 auth, 502/504 the rest)
+// — never a stream that dies mid-first-token.
 //
 // Used by:
 //   - the mobile engine's createKnfAssistantTransport
@@ -330,7 +417,10 @@ router.post("/", async (req, res, next) => {
 
     // The prompt lives only in the database — no active
     // version means the assistant is deliberately OFF, and
-    // that must read as a clear 503, never a promptless run
+    // that must read as a clear 503, never a promptless run.
+    // (A store that could not be asked is activePrompt's own
+    // 503 PROMPT_UNAVAILABLE — a different message, so nobody
+    // is sent to activate a prompt that is active.)
     const prompt = await activePrompt();
     if (!prompt.text) {
       throw new HttpError(503, "PROMPT_NOT_CONFIGURED",
@@ -347,6 +437,10 @@ router.post("/", async (req, res, next) => {
     let turnLogged = false;
     const toolCalls = [];
     const spent = { inputTokens: 0, outputTokens: 0 };
+    // The first raw model error — the SDK's UI stream carries
+    // only its text, and awaitFirstEvent needs the class and
+    // status to answer a refusal with the right envelope
+    let firstStreamError = null;
     const logOnce = (outcome, usage = null) => {
       if (turnLogged) return;
       turnLogged = true;
@@ -382,6 +476,7 @@ router.post("/", async (req, res, next) => {
         spent.outputTokens += usage?.outputTokens ?? 0;
       },
       onError: ({ error }) => {
+        firstStreamError ??= error;
         console.error("Chat stream error:", formatStreamError(error));
         logOnce("error");
       },
@@ -393,7 +488,7 @@ router.post("/", async (req, res, next) => {
       },
     });
 
-    const webResponse = result.toUIMessageStreamResponse({
+    const uiStream = result.toUIMessageStream({
       originalMessages: messages,
       // Without this the response message carries NO id when
       // the last original message is the user's — and an
@@ -409,11 +504,16 @@ router.post("/", async (req, res, next) => {
         persistTurn(threadId, userId, messages, reply);
       },
     });
-    await pipeWebResponse(webResponse, res);
+    // The same Web Response toUIMessageStreamResponse builds —
+    // headers, SSE framing — over the stream once its first
+    // event has proven the model is answering
+    const stream = await awaitFirstEvent(uiStream, () => firstStreamError);
+    await pipeWebResponse(createUIMessageStreamResponse({ stream }), res);
   } catch (err) {
-    // The 429's Retry-After tells the engine's quota failure
-    // how long the person actually waits
-    if (err instanceof HttpError && err.status === 429 && err.details?.retryAfterS) {
+    // Retry-After tells the engine's quota / unavailable
+    // failure how long the person actually waits — the turn
+    // limiter's window, or the gateway's own header relayed
+    if (err instanceof HttpError && err.details?.retryAfterS != null) {
       res.set("Retry-After", String(err.details.retryAfterS));
     }
     next(err);

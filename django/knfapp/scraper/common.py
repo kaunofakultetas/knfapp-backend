@@ -16,8 +16,8 @@
 #      a run tests between fetches
 #    - normalise_url — the dedup key for
 #      news_posts.source_url: post-redirect, no fragment, no
-#      tracking params, canonical scheme/host, no trailing
-#      slash
+#      tracking params, canonical scheme/host, no vu.lt
+#      language segment, no trailing slash
 #    - utc_now_naive / parse_source_datetime /
 #      sanitise_published_at — source datetimes with the
 #      offset APPLIED instead of dropped, a [now - 5 years,
@@ -250,11 +250,23 @@ def host_allowed(url: str, allowed_hosts) -> bool:
 # news_posts.source_url dedup key and as the stored value:
 # https scheme, lowercase host without a leading "www.", no
 # fragment, tracking parameters (utm_*, fbclid, gclid, …)
-# dropped, and no trailing slash on a non-root path. Two
-# links to the same article — one from a listing, one after
-# a redirect, one with a campaign tag — collapse to one key.
+# dropped, vu.lt's language segment (/lt/, /en/) dropped,
+# and no trailing slash on a non-root path. Two links to
+# the same article — one from a listing, one after a
+# redirect, one with a campaign tag — collapse to one key.
 # Anything unparsable is handed back stripped, never
 # dropped.
+#
+# The language rule is what makes the vu.lt scraper's
+# listing key equal its stored key: the listing cards link
+# "/lt/visos-naujienos/<slug>", the article itself lands on
+# "/visos-naujienos/<slug>" after the site's redirect, and
+# the stored row and any tombstone hold that landing form.
+# Keyed on the raw listing href, the already-stored and
+# tombstone tests at the listing stage matched nothing —
+# every tick re-fetched twenty stored articles, and an
+# article an admin had deleted came back on the next one.
+# vu.lt only: the faculty site's paths are left alone.
 #
 # Used by:
 #   - knf_scraper.py, vu_scraper.py — the dedup key and the
@@ -262,6 +274,17 @@ def host_allowed(url: str, allowed_hosts) -> bool:
 #   - load_deleted_urls (below) — tombstones are matched in
 #     the same shape
 ############################################################
+
+# The language segment vu.lt serves every page under and
+# redirects away from, as the first path segment only
+_VU_LANGUAGE_PREFIX_RE = re.compile(r"^/(?:lt|en)(?=/|$)", re.IGNORECASE)
+
+
+def _strip_vu_language_prefix(host: str, path: str) -> str:
+    if host not in VU_HOSTS:
+        return path
+    return _VU_LANGUAGE_PREFIX_RE.sub("", path, count=1) or "/"
+
 
 def normalise_url(url: str) -> str:
     if not url:
@@ -285,10 +308,11 @@ def normalise_url(url: str) -> str:
         host = host[4:]
 
 
-    # STEP 2: path without its trailing slash, query without
-    # the campaign tags, fragment gone entirely
-    # ======================================================
-    path = parsed.path or "/"
+    # STEP 2: path without vu.lt's language segment and without
+    # its trailing slash, query without the campaign tags,
+    # fragment gone entirely
+    # =========================================================
+    path = _strip_vu_language_prefix(host, parsed.path or "/")
     if len(path) > 1:
         path = path.rstrip("/") or "/"
 

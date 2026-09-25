@@ -15,7 +15,9 @@
 #  Beyond the prompt store, the console's other two
 #  assistant surfaces live here too: the KNOWLEDGE BASE
 #  (per-source counts and freshness, a retrieval test box,
-#  the re-index button running cron's exact sync) and the
+#  the re-index button running cron's exact sync, and the
+#  CURATED ANSWERS an admin writes by hand — embedded on
+#  save into support_chunks, see curated.py) and the
 #  THREAD REVIEW — the stored conversations with their
 #  thumbs verdicts, transcript reads audited person by
 #  person because student chats are personal data.
@@ -30,11 +32,17 @@
 #    assistant_overview — GET the dashboard numbers
 #    reindex_knowledge — POST cron's sync, on demand
 #    knowledge_search  — POST a retrieval test
+#    _curated_body     — one validation for add and edit
+#    list_curated      — GET the console-authored answers
+#    create_curated    — POST a new answer, embedded now
+#    update_curated    — POST re-embed one answer
+#    delete_curated    — POST drop one answer
 #    review_threads    — GET the conversation list
 #    review_thread     — GET one transcript, audited
 ############################################################
 
 
+import uuid
 from datetime import timedelta
 
 from django.db import IntegrityError, transaction
@@ -42,13 +50,19 @@ from django.db.models import Count, Max, Q
 from django.utils import timezone
 
 from knfapp.admin.audit import write_audit
+from knfapp.assistant.curated import (
+    MAX_ANSWER_CHARS, MAX_QUESTION_CHARS, delete_entry, entry_exists, entry_payload,
+    list_entries, save_entry,
+)
 from knfapp.assistant.gateway import GatewayError
 from knfapp.assistant.indexing import run_index
 from knfapp.assistant.models import (
-    AssistantMessage, AssistantPrompt, AssistantThread, AssistantTurn, SupportChunk,
+    LANGUAGES, AssistantMessage, AssistantPrompt, AssistantThread, AssistantTurn, SupportChunk,
 )
 from knfapp.assistant.search import search_chunks
-from knfapp.common.http import get_json_object, json_error, json_response, parse_pagination
+from knfapp.common.http import (
+    clean_param, get_json_object, json_error, json_response, parse_pagination, require_methods,
+)
 from knfapp.users.auth import require_role
 
 
@@ -102,10 +116,9 @@ def _prompt_payload(row):
 #   - the admin console
 ############################################################
 
+@require_methods("GET")
 @require_role("admin")
 def list_prompts(request):
-    if request.method != "GET":
-        return json_error("Method not allowed", 405)
     rows = AssistantPrompt.objects.order_by("-version")[:200]
     return json_response({"prompts": [_prompt_payload(row) for row in rows]})
 
@@ -131,10 +144,9 @@ def list_prompts(request):
 #   - the admin console
 ############################################################
 
+@require_methods("POST")
 @require_role("admin")
 def create_prompt(request):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     body = get_json_object(request)
     if body is None:
         return json_error("Invalid JSON", 400)
@@ -188,10 +200,9 @@ def create_prompt(request):
 #   - the admin console
 ############################################################
 
+@require_methods("POST")
 @require_role("admin")
 def activate_prompt(request, version):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     # A racing double-activate leaves one loser on the partial
     # unique constraint — 409, retry, never a raw 500
     try:
@@ -227,10 +238,9 @@ def activate_prompt(request, version):
 #   - the admin console
 ############################################################
 
+@require_methods("POST")
 @require_role("admin")
 def deactivate_prompt(request):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     AssistantPrompt.objects.filter(active=True).update(active=False)
     write_audit(request.user["id"], "assistant_prompt_deactivate")
     return json_response({"active": None})
@@ -257,10 +267,9 @@ def deactivate_prompt(request):
 #   - the admin console — the assistant dashboard
 ############################################################
 
+@require_methods("GET")
 @require_role("admin")
 def assistant_overview(request):
-    if request.method != "GET":
-        return json_error("Method not allowed", 405)
 
     sources = list(SupportChunk.objects.values("source")
                    .annotate(count=Count("id"), newest=Max("indexed_at"))
@@ -314,10 +323,9 @@ def assistant_overview(request):
 #   - the admin console — the re-index buttons
 ############################################################
 
+@require_methods("POST")
 @require_role("admin")
 def reindex_knowledge(request):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     body = get_json_object(request) or {}
     reindex_all = bool(body.get("all"))
     try:
@@ -350,10 +358,9 @@ def reindex_knowledge(request):
 #   - the admin console — the knowledge test box
 ############################################################
 
+@require_methods("POST")
 @require_role("admin")
 def knowledge_search(request):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     body = get_json_object(request)
     if body is None:
         return json_error("Invalid JSON", 400)
@@ -366,6 +373,174 @@ def knowledge_search(request):
     except GatewayError as exc:
         return json_error(f"Embedding gateway unavailable: {exc}", 502)
     return json_response({"results": results})
+
+
+
+
+
+
+
+
+############################################################
+# _curated_body
+############################################################
+#
+#   _curated_body(request) → (fields, None) | (None, refusal)
+#
+# The one validation an add and an edit share: a one-line
+# question, a non-empty answer, both under the caps that
+# keep an entry exactly one chunk, and a language the
+# retrieval filter knows.
+#
+# Used by:
+#   - create_curated / update_curated (below)
+############################################################
+
+def _curated_body(request):
+    body = get_json_object(request)
+    if body is None:
+        return None, json_error("Invalid JSON", 400)
+    question = " ".join(str(body.get("question") or "").split())
+    answer = str(body.get("answer") or "").strip()
+    language = body.get("language")
+    if not question:
+        return None, json_error("question is required", 400)
+    if len(question) > MAX_QUESTION_CHARS:
+        return None, json_error(f"question is capped at {MAX_QUESTION_CHARS} characters", 400)
+    if not answer:
+        return None, json_error("answer is required", 400)
+    if len(answer) > MAX_ANSWER_CHARS:
+        return None, json_error(f"answer is capped at {MAX_ANSWER_CHARS} characters", 400)
+    if language not in LANGUAGES:
+        return None, json_error("language must be lt or en", 400)
+    return {"question": question, "answer": answer, "language": language}, None
+
+
+
+
+
+
+
+
+############################################################
+# list_curated
+############################################################
+#
+# GET /api/admin/assistant/knowledge/curated → {entries}
+#
+# The console-authored answers, newest first — what the
+# curated card edits in place. The repo-owned CURATED_FAQ
+# base is code and is not listed.
+#
+# Used by:
+#   - the admin console — the curated answers card
+############################################################
+
+@require_methods("GET")
+@require_role("admin")
+def list_curated(request):
+    return json_response({"entries": list_entries()})
+
+
+
+
+
+
+
+
+############################################################
+# create_curated
+############################################################
+#
+# POST /api/admin/assistant/knowledge/curated
+#   {question, answer, language} → the entry, 201
+#
+# Embedded through the gateway NOW and live for the next
+# chat turn — no re-index needed. A dead gateway answers
+# 502 having written nothing.
+#
+# Used by:
+#   - the admin console — the curated answers card
+############################################################
+
+@require_methods("POST")
+@require_role("admin")
+def create_curated(request):
+    fields, refused = _curated_body(request)
+    if refused is not None:
+        return refused
+    entry_id = str(uuid.uuid4())
+    try:
+        row = save_entry(entry_id, **fields)
+    except GatewayError as exc:
+        return json_error(f"Embedding gateway unavailable: {exc}", 502)
+    write_audit(request.user["id"], "assistant_curated_create", target=entry_id,
+                payload={"language": fields["language"]})
+    return json_response(entry_payload(row), status=201)
+
+
+
+
+
+
+
+
+############################################################
+# update_curated
+############################################################
+#
+# POST /api/admin/assistant/knowledge/curated/<id>/update
+#   {question, answer, language} → the entry
+#
+# Re-embeds the entry under a NEW content-derived id and
+# drops the old row in the same transaction. 404 for an id
+# the console never minted (or already deleted).
+#
+# Used by:
+#   - the admin console — the curated answers card
+############################################################
+
+@require_methods("POST")
+@require_role("admin")
+def update_curated(request, entry_id):
+    fields, refused = _curated_body(request)
+    if refused is not None:
+        return refused
+    if not entry_exists(entry_id):
+        return json_error("Entry not found", 404)
+    try:
+        row = save_entry(str(entry_id), **fields)
+    except GatewayError as exc:
+        return json_error(f"Embedding gateway unavailable: {exc}", 502)
+    write_audit(request.user["id"], "assistant_curated_update", target=str(entry_id),
+                payload={"language": fields["language"]})
+    return json_response(entry_payload(row))
+
+
+
+
+
+
+
+
+############################################################
+# delete_curated
+############################################################
+#
+# POST /api/admin/assistant/knowledge/curated/<id>/delete
+#   → {deleted: true}
+#
+# Used by:
+#   - the admin console — the curated answers card
+############################################################
+
+@require_methods("POST")
+@require_role("admin")
+def delete_curated(request, entry_id):
+    if not delete_entry(str(entry_id)):
+        return json_error("Entry not found", 404)
+    write_audit(request.user["id"], "assistant_curated_delete", target=str(entry_id))
+    return json_response({"deleted": True})
 
 
 
@@ -392,10 +567,9 @@ def knowledge_search(request):
 #   - the admin console — the review list
 ############################################################
 
+@require_methods("GET")
 @require_role("admin")
 def review_threads(request):
-    if request.method != "GET":
-        return json_error("Method not allowed", 405)
     page, per_page, err = parse_pagination(request)
     if err:
         return err
@@ -404,7 +578,7 @@ def review_threads(request):
     # out — the page's counts come from ONE grouped query over
     # the page's threads instead of join annotations
     threads = AssistantThread.objects.select_related("user")
-    if request.GET.get("rating") == "down":
+    if clean_param(request.GET.get("rating")) == "down":
         threads = threads.filter(messages__rating=-1).distinct()
     threads = threads.order_by("-last_message_at")
 
@@ -457,10 +631,9 @@ def review_threads(request):
 #   - the admin console — the transcript reader
 ############################################################
 
+@require_methods("GET")
 @require_role("admin")
 def review_thread(request, thread_id):
-    if request.method != "GET":
-        return json_error("Method not allowed", 405)
     thread = AssistantThread.objects.filter(id=thread_id).select_related("user").first()
     if thread is None:
         return json_error("Not found", 404)

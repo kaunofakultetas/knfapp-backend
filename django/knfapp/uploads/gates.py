@@ -21,6 +21,7 @@
 
 import io
 import logging
+import warnings
 
 
 from PIL import Image
@@ -35,16 +36,29 @@ ALLOWED_DOC_EXTENSIONS = ("pdf", "docx", "xlsx", "pptx", "zip", "txt")
 ALLOWED_VIDEO_EXTENSIONS = ("mp4", "mov", "m4v", "webm")
 ALLOWED_AUDIO_EXTENSIONS = ("m4a", "aac", "mp3")
 
+# The containers reencode_image writes — what a photo is
+# STORED as whatever it arrived as. storage.FILENAME_RE is
+# built from this tuple and the three admit-lists above, so
+# the serve/delete gate can never fall behind the upload gate
+STORED_IMAGE_EXTENSIONS = ("jpg", "png", "gif", "webp")
+
 MAX_FILE_SIZE = 5 * 1024 * 1024          # mirrored by mobile MAX_UPLOAD_BYTES
 VIDEO_MAX_SIZE = 50 * 1024 * 1024        # mirrored by mobile MAX_VIDEO_UPLOAD_BYTES
 MAX_IMAGE_PIXELS = 30 * 1000 * 1000      # 30 MP decoded, animation frames counted
 MAX_EDGE = 2048                          # longest edge kept after downscaling
 JPEG_QUALITY = 85
 
-# Pillow's own decompression-bomb guard, set to the same ceiling
-# the gate enforces — a hostile header cannot make the decoder
-# allocate gigabytes before we look at it
-Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+# Pillow's own decompression-bomb guard, deliberately at HALF
+# the gate's ceiling: Pillow raises only past TWICE its value
+# and merely warns in between, so half is what lands its hard
+# stop exactly on MAX_IMAGE_PIXELS — a single-frame header
+# past the ceiling dies inside Image.open, before verify()
+# reads a chunk or a pixel buffer exists. The warning it emits
+# in the band between (an honest 20 MP photo) is silenced:
+# reencode_image's own header check is the authority there,
+# and it runs BEFORE the decode
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS // 2
+warnings.filterwarnings("ignore", category=Image.DecompressionBombWarning)
 
 MIME_BY_EXT = {
     "pdf": "application/pdf",
@@ -207,11 +221,14 @@ def sniff_image_format(blob):
 #
 # The real gate. Decodes with Pillow and answers
 # (ext, canonical bytes, None) or (None, None, (message,
-# code)). Nothing from the source's metadata reaches
-# save(), so EXIF (GPS included), APP1 and XMP are dropped
-# by construction; the pixel budget counts animation
-# frames, so a 200-frame GIF cannot smuggle a bomb past a
-# single-frame check.
+# code)). The pixel budget is settled from the HEADER —
+# size times frame count, both readable without decoding —
+# and only an image inside it is ever load()ed: a 50 MP
+# header on a 200-byte body is refused before Pillow would
+# allocate its ~150 MB buffer, and a 200-frame GIF cannot
+# smuggle a bomb past a single-frame check. Nothing from
+# the source's metadata reaches save(), so EXIF (GPS
+# included), APP1 and XMP are dropped by construction.
 #
 # Canonical output: animations keep their frames and stay
 # WebP when they arrived as WebP (GIF re-encode can grow
@@ -225,30 +242,53 @@ def sniff_image_format(blob):
 
 def reencode_image(raw):
     too_many_pixels = (f"Image too large. Max {MAX_IMAGE_PIXELS // (1000 * 1000)} megapixels", "image_too_large")
+    unreadable = ("File content could not be read as an image", "bad_file_content")
 
-    # STEP 1: decode — verify() consumes its object, so the image
-    # we work on is a second, fresh open; a bomb far past the
-    # ceiling never decodes at all (Image.MAX_IMAGE_PIXELS raises)
+    # STEP 1: open and verify — verify() consumes its object, so
+    # the image we work on is a second, fresh open. Neither call
+    # decodes a pixel: verify() walks the container's chunks, and
+    # a single-frame header past the ceiling raises out of
+    # Image.open itself (Image.MAX_IMAGE_PIXELS, above)
     # ===========================================================
     try:
         Image.open(io.BytesIO(raw)).verify()
         img = Image.open(io.BytesIO(raw))
-        img.load()
     except Image.DecompressionBombError:
         logger.info("Upload rejected: decompression bomb")
         return None, None, too_many_pixels
     except Exception:
         logger.info("Upload rejected: bytes do not decode as an image")
-        return None, None, ("File content could not be read as an image", "bad_file_content")
+        return None, None, unreadable
 
-    # STEP 2: pixel budget, frames included
-    # =====================================
-    frames = getattr(img, "n_frames", 1)
-    if img.width * img.height * frames > MAX_IMAGE_PIXELS:
+    # STEP 2: the pixel budget from the header, frames included —
+    # settled BEFORE load(), so a body whose header promises more
+    # than the ceiling never has its buffer allocated. Counting
+    # frames walks the container's frame headers, not its pixels
+    # ============================================================
+    try:
+        frames = getattr(img, "n_frames", 1)
+        pixels = img.width * img.height * frames
+    except Exception:
         img.close()
+        logger.info("Upload rejected: bytes do not decode as an image")
+        return None, None, unreadable
+
+    if pixels > MAX_IMAGE_PIXELS:
+        img.close()
+        logger.info("Upload rejected: %d pixels over the %d ceiling", pixels, MAX_IMAGE_PIXELS)
         return None, None, too_many_pixels
 
-    # STEP 3: re-encode into the canonical container — only pixels
+    # STEP 3: the decode — only an image inside the budget gets
+    # this far
+    # =========================================================
+    try:
+        img.load()
+    except Exception:
+        img.close()
+        logger.info("Upload rejected: bytes do not decode as an image")
+        return None, None, unreadable
+
+    # STEP 4: re-encode into the canonical container — only pixels
     # cross over, never the source's metadata
     # ============================================================
     buffer = io.BytesIO()
@@ -271,7 +311,7 @@ def reencode_image(raw):
             ext = "jpg"
     except Exception:
         logger.warning("Upload rejected: re-encode failed", exc_info=True)
-        return None, None, ("File content could not be read as an image", "bad_file_content")
+        return None, None, unreadable
     finally:
         img.close()
 

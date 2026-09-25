@@ -18,10 +18,16 @@
 #  Dedup key and stored source_url are the canonical
 #  normalise_url form of the POST-REDIRECT URL, so one
 #  article behind two links (or a campaign-tagged one) is
-#  stored once; ON CONFLICT DO NOTHING is the backstop, and the
-#  run lock is the same two layers as knf_scraper.py's — the
-#  module threading.Lock in-process, common.open_run across
-#  the gunicorn workers and the cron container.
+#  stored once. The listing href takes the SAME shape before
+#  it is used as a key — normalise_url drops the /lt/
+#  language segment the cards carry and the site's redirect
+#  drops — so the already-stored and tombstone tests at the
+#  listing stage actually match the rows: a stored article
+#  costs no fetch, and one an admin deleted stays deleted.
+#  ON CONFLICT DO NOTHING is the backstop, and the run lock
+#  is the same two layers as knf_scraper.py's — the module
+#  threading.Lock in-process, common.open_run across the
+#  gunicorn workers and the cron container.
 #
 #  The cron command runs it every 20 minutes; admins fire it
 #  by hand through POST /api/scraper/trigger (alias /run —
@@ -224,7 +230,10 @@ def _run(run_id, pages, notify, deadline):
 
             # STEP 2.1: harvest article links from the server-rendered
             # HTML: anchors under /visos-naujienos/ or /naujienos/ that
-            # carry a real title, resolved and canonicalised
+            # carry a real title, resolved and canonicalised into the
+            # STORED shape (the /lt/ segment the cards carry is gone,
+            # as it is from the article's own URL) — the tombstone and
+            # already-stored tests below key on exactly that shape
             for link_data in _listing_links(soup):
                 full_url = normalise_url(urljoin(BASE_URL, link_data["href"]))
 
@@ -302,6 +311,13 @@ def _run(run_id, pages, notify, deadline):
                 # row, so the article is simply retried next run
                 if not title and not article_data["content"]:
                     logger.warning("vu.lt article parsed to nothing — not stored: %s", full_url)
+                    continue
+
+                # Belt and braces on the POST-REDIRECT key: a tombstone
+                # the listing key could not see (a redirect that landed
+                # somewhere new) still holds here
+                if full_url in tombstoned:
+                    logger.info("vu.lt article is tombstoned — not stored: %s", full_url)
                     continue
 
                 # The same story republished under a second URL. Only

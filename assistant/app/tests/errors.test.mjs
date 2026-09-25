@@ -66,6 +66,28 @@ test("a generic throw is a 500 whose real message stays OFF the wire", () => {
 });
 
 
+test("a body-parser refusal keeps its 4xx under our code — never a 500 that reads as our outage", () => {
+  // http-errors' shape, as express.json throws it
+  const malformed = Object.assign(new SyntaxError("Unexpected token } in JSON at position 3"),
+                                  { status: 400, statusCode: 400, expose: true, type: "entity.parse.failed" });
+  const bad = normalizeError(malformed);
+  assert.equal(bad.status, 400);
+  assert.equal(bad.code, "INVALID_BODY");
+  assert.equal(bad.details, "entity.parse.failed");
+  assert.doesNotMatch(bad.message, /Unexpected token/);
+
+  const huge = Object.assign(new Error("request entity too large"),
+                             { status: 413, statusCode: 413, expose: true, type: "entity.too.large" });
+  assert.equal(normalizeError(huge).status, 413);
+  assert.equal(normalizeError(huge).code, "PAYLOAD_TOO_LARGE");
+
+  // A 4xx-shaped error that is NOT exposable stays a 500 —
+  // `expose` is the client-fault marker, not the status
+  const internal = Object.assign(new Error("db"), { status: 404, expose: false });
+  assert.equal(normalizeError(internal).status, 500);
+});
+
+
 test("after headers are sent the middleware only closes the stream", () => {
   const res = fakeRes();
   res.headersSent = true;

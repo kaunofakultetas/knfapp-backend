@@ -9,15 +9,18 @@
 #  push-shape guards, the dated timetable sync (confirm
 #  instead of reinsert, converge across group feeds, retire
 #  only what a healthy feed dropped, keep the past until
-#  retention), and the admin routes' status
-#  mapping with the stable error slug — the raw exception
-#  text stays out of HTTP bodies.
+#  retention), the vu.lt listing key that must equal the
+#  stored key (else a deleted article resurrects and every
+#  tick re-fetches what it already holds), and the admin
+#  routes' status mapping with the stable error slug — the
+#  raw exception text stays out of HTTP bodies.
 ############################################################
 
 
 import json
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from unittest import mock
 
 
 from django.test import Client, TestCase
@@ -25,7 +28,8 @@ from django.test import Client, TestCase
 
 from knfapp.common import ratelimit
 from knfapp.common.timestamps import utc_now_iso
-from knfapp.scraper import common
+from knfapp.news.models import DeletedSourceUrl, NewsPost
+from knfapp.scraper import common, vu_scraper
 from knfapp.scraper.api import views
 from knfapp.scraper.models import ScraperRun
 from knfapp.scraper.schedule_scraper import RETENTION_DAYS, _sync_schedule
@@ -37,7 +41,7 @@ from knfapp.schedule.models import (
     ScheduleTeacher,
 )
 from knfapp.users import auth
-from .utils import bearer, create_user
+from .utils import bearer, create_post, create_user
 
 
 def _run_row(source, status="completed", age_days=0, found=0, run_id=None):
@@ -273,6 +277,58 @@ class TimetableRunTests(TestCase):
             self.assertEqual(ScheduleEvent.objects.count(), 10)
         finally:
             ss.scrape_group_list, ss.scrape_group_schedule = real_list, real_schedule
+
+
+class VuListingKeyTests(TestCase):
+
+    # Three cards as the live listing prints them — every href
+    # under the /lt/ language segment the site redirects away from
+    LISTING = """
+        <main>
+          <a href="/lt/visos-naujienos/jau-saugoma">Jau saugoma naujiena apie fakultetą</a>
+          <a href="/lt/visos-naujienos/istrinta">Administratoriaus ištrinta naujiena</a>
+          <a href="/lt/visos-naujienos/nauja">Visiškai nauja naujiena apie mokslą</a>
+        </main>
+    """
+
+    @staticmethod
+    def _article(slug):
+        return f"""<html><head>
+          <meta property="article:published_time" content="2026-09-01T10:00:00+03:00">
+        </head><body><h1>Straipsnis {slug}</h1>
+          <article><p>Turinys apie {slug} ir dar šiek tiek teksto.</p></article>
+        </body></html>"""
+
+    def _fake_fetch(self, fetched):
+        # The listing once (a later page ends the paging), and every
+        # article behind the site's redirect: the URL it lands on
+        # has no /lt/ — the shape the stored row and the tombstone
+        # hold
+        def fetch(url, hosts, params=None, **_kwargs):
+            if url == vu_scraper.NEWS_URL:
+                return None if params else (self.LISTING.encode(), url)
+            fetched.append(url)
+            final = url.replace("/lt/", "/", 1)
+            return self._article(final.rsplit("/", 1)[-1]).encode(), final
+        return fetch
+
+    def test_the_listing_key_matches_the_stored_row_and_the_tombstone(self):
+        create_post(source="vu.lt", title="Jau saugoma", source_url="https://vu.lt/visos-naujienos/jau-saugoma")
+        DeletedSourceUrl.objects.create(source_url="https://vu.lt/visos-naujienos/istrinta",
+                                        deleted_at=datetime.now(timezone.utc))
+        fetched = []
+        with mock.patch.object(vu_scraper, "fetch", side_effect=self._fake_fetch(fetched)):
+            result = vu_scraper.scrape_vu_news(pages=1, notify=False)
+
+        self.assertEqual((result["found"], result["new"]), (3, 1))
+        # The stored and the tombstoned article cost no fetch: the
+        # listing key already told them apart
+        self.assertEqual(fetched, ["https://vu.lt/visos-naujienos/nauja"])
+        # The deleted one stays deleted, the new one lands under the
+        # stored shape
+        self.assertFalse(NewsPost.objects.filter(source_url__contains="istrinta").exists())
+        self.assertTrue(NewsPost.objects.filter(source_url="https://vu.lt/visos-naujienos/nauja").exists())
+        self.assertEqual(NewsPost.objects.filter(source="vu.lt").count(), 2)
 
 
 class ScraperRouteTests(TestCase):

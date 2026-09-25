@@ -21,6 +21,20 @@
     "run": "Ieškoti",
     "empty": "Nieko nerasta — klausimas neturi atramos žinių bazėje."
   },
+  "curated": {
+    "title": "Ranka rašyti atsakymai",
+    "hint": "Žinios, kurių nėra jokiame puslapyje: sesijos, perlaikymai, pažymos, mokesčiai… Išsaugotas įrašas įterpiamas iš karto ir galioja nuo kito pokalbio.",
+    "questionPlaceholder": "Klausimas, kaip jį užduotų studentas (viena eilutė)",
+    "answerPlaceholder": "Atsakymas — trumpas, faktinis, savarankiškas; asistentas jį cituoja, o ne perpasakoja",
+    "add": "Pridėti",
+    "update": "Išsaugoti pakeitimus",
+    "cancel": "Atšaukti",
+    "edit": "Redaguoti",
+    "delete": "Ištrinti",
+    "deleteConfirm": "Ištrinti šį atsakymą iš žinių bazės?",
+    "saved": "Atsakymas išsaugotas ir įterptas",
+    "empty": "Ranka rašytų atsakymų dar nėra."
+  },
   "prompts": {
     "title": "Sistemos prompto versijos",
     "activeLine": "Aktyvi versija: v{version} — tai VISAS asistento sistemos promptas.",

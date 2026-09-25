@@ -8,9 +8,10 @@
 #  a usable bearer. Every protected route resolves the
 #  presented token through resolve_session_token, which
 #  re-loads the user on every request so a deactivated
-#  account is locked out immediately, expired rows are
-#  purged lazily (push tokens die with them), and the
-#  password hash never leaves this module's queries.
+#  account is locked out immediately, an expired row is
+#  purged lazily (that one session row — never a push
+#  row), and the password hash never leaves this
+#  module's queries.
 #
 #  The decorators attach the resolved user to request.user,
 #  so a handler body reads its caller off the request and
@@ -41,7 +42,6 @@ from django.db import OperationalError
 
 from knfapp.common.http import json_error
 from knfapp.common.timestamps import parse_stored, utc_now
-from knfapp.notifications.models import PushToken
 from knfapp.users.models import Session, User
 
 
@@ -117,10 +117,28 @@ def bearer_token(request):
 #
 # Expiry is compared aware-to-aware (malformed counts as
 # expired — a 401, never a 500). An expired row is purged
-# on the spot together with the user's push_tokens rows (a
-# device without a live session must not keep getting
-# message previews); the purge is best-effort — a locked
-# database yields a clean None, not a 500.
+# on the spot, and the purge is per SESSION: that one row,
+# by token hash, nothing else. It used to take every
+# push_tokens row of the USER with it, which silenced the
+# account's other phones — sessions lapse on the absolute
+# 30-day clock they were minted on, so two devices signed
+# in on different days expire on different days, and a
+# stale tablet opening the app (or a background socket
+# reconnect through chat/events.py) wiped the live phone's
+# registration, which the mobile engine's 7-day dedupe then
+# never re-asserted. A push row is torn down by the device
+# that OWNS it (logout with its pushToken in the body), by
+# logout_all, by admin deactivation / erasure, or by the
+# nightly orphan prune (notifications/push.py) once its
+# owner holds no live session at all. The one behaviour
+# given up: a device whose session expires while it is
+# offline keeps its push row — and its previews — until it
+# next opens the app or the nightly sweep runs. The proper
+# long-term shape is a session-scoped push row
+# (push_tokens.session_id) so this purge can take exactly
+# the expired device's registration. The purge is
+# best-effort — a locked database yields a clean None, not
+# a 500.
 #
 # users.active is the backstop for flags flipped outside
 # the admin route (DbGate, direct SQL) and for a login that
@@ -146,14 +164,13 @@ def resolve_session_token(token):
 
 
     # STEP 2: aware-to-aware expiry; malformed = expired. The lazy
-    # purge (session row + push tokens) is best-effort
+    # purge is the ONE session row — never a push row (banner) —
+    # and best-effort
     # ============================================================
     expires = parse_stored(row["expires_at"])
     if expires is None or expires < datetime.now(timezone.utc):
         try:
             Session.objects.filter(token=hash_token(token)).delete()
-            # Push dies with the session — reason in the banner
-            PushToken.objects.filter(user_id=row["user_id"]).delete()
         except OperationalError:
             logger.warning("Expired-session purge skipped (database locked)")
         return None
@@ -312,6 +329,8 @@ def mint_session(user_id):
 #
 # Used by:
 #   - api/auth_views.py — register, login, me, update_me
+#   - social/api/views.py — update_profile (the same
+#     profile routine, the same answer)
 ############################################################
 
 def serialize_user(u):

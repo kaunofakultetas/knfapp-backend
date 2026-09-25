@@ -23,10 +23,15 @@ import { HttpError } from "../middleware/errors.js";
 // felt, long enough to spare the per-request round trip
 const CACHE_MS = 60_000;
 
-// token → { userId, expiresAt }; entries are pruned lazily
-// on their own lookups, and the map stays tiny (one row per
-// active device)
+// token → { userId, studyGroup, studyProgram, expiresAt };
+// entries are pruned lazily on their own lookups, so a token
+// that never returns (a logout, an expiry) would sit here
+// for good — an insert past SWEEP_AT rows sweeps every
+// expired entry, keeping the map at one row per LIVE device
 const cache = new Map();
+
+// The size at which an insert sweeps the expired entries
+const SWEEP_AT = 256;
 
 
 
@@ -88,5 +93,11 @@ export async function resolveIdentity(req) {
     expiresAt: Date.now() + CACHE_MS,
   };
   cache.set(token, entry);
+  if (cache.size > SWEEP_AT) {
+    const now = Date.now();
+    for (const [key, row] of cache) {
+      if (row.expiresAt <= now) cache.delete(key);
+    }
+  }
   return { userId: entry.userId, studyGroup: entry.studyGroup, studyProgram: entry.studyProgram };
 }

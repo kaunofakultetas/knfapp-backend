@@ -10,14 +10,19 @@
 //  placeholders). Cached for a minute — an admin's
 //  activation reaches the agent on the next cache turn, and
 //  a Django hiccup serves the last known answer instead of
-//  failing a chat turn (empty on a cold start: the code's
-//  bootstrap template steps in).
+//  failing a chat turn. With NOTHING known yet (a cold start
+//  while Django is still booting) the turn fails as 503
+//  PROMPT_UNAVAILABLE and the cache stays cold, so the very
+//  next turn asks again — an emptiness is never cached: that
+//  read as "no active prompt" for a whole minute while the
+//  row was active all along.
 //
 //  Split into:
 //
 //    activePrompt — { version, text }, cached
 // -----------------------------------------------------------
 
+import { HttpError } from "../middleware/errors.js";
 import { internalFetch } from "./django.js";
 
 
@@ -40,7 +45,11 @@ let cached = { at: 0, version: null, text: "" };
 //   activePrompt() → { version: number | null, text: string }
 //
 // The one reader. Failures keep the previous answer — a
-// stale prompt beats a failed chat turn.
+// stale prompt beats a failed chat turn — and throw 503
+// PROMPT_UNAVAILABLE when there is no previous answer to
+// keep. An empty `text` on a SUCCESSFUL fetch is Django's
+// own word that no version is active; the route turns that
+// into PROMPT_NOT_CONFIGURED, a different failure.
 //
 // Used by:
 //   - routes/chat.js — per turn
@@ -58,6 +67,14 @@ export async function activePrompt() {
       text: typeof answer?.text === "string" ? answer.text : "",
     };
   } catch (err) {
+    // Only a real previous answer earns another window — the
+    // stamp on an empty cache negative-cached the emptiness
+    if (!cached.text) {
+      console.error("Prompt fetch failed (nothing cached, next turn retries):", err?.message);
+      throw new HttpError(503, "PROMPT_UNAVAILABLE",
+                          "System prompt unavailable — the backend did not answer",
+                          { cause: err?.message || null });
+    }
     console.error("Prompt fetch failed (keeping previous):", err?.message);
     cached.at = Date.now();
   }

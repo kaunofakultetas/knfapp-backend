@@ -34,7 +34,7 @@ from django.http import FileResponse
 
 
 from knfapp.common import ratelimit
-from knfapp.common.http import json_error, json_response
+from knfapp.common.http import clean_param, json_error, json_response, require_methods
 from knfapp.common.timestamps import utc_now
 from knfapp.memes.models import Meme
 from knfapp.uploads.gates import reencode_image
@@ -112,9 +112,10 @@ _ROW_FIELDS = ("id", "filename", "title", "tags", "width", "height", "preview", 
 #   - the mobile composer's meme tab
 ############################################################
 
+@require_methods("GET")
 @require_auth
 def list_memes(request):
-    query = (request.GET.get("q") or "").strip()
+    query = (clean_param(request.GET.get("q")) or "").strip()
     try:
         offset = max(0, int(request.GET.get("offset", 0)))
     except (TypeError, ValueError):
@@ -146,12 +147,17 @@ def list_memes(request):
 # must open with the GIF signature and stays byte-identical;
 # anything else must survive the uploads gate's re-encode.
 # The client's filename only donates the default title; the
-# first frame yields the ~14px preview the grid blurs.
+# first frame yields the ~14px preview the grid blurs. Size
+# is refused as 413 file_too_large twice over: the 8 MB
+# ceiling on the declared size BEFORE a byte of the body is
+# read, the 5 MB static cap once the signature says the
+# file is not a GIF.
 #
 # Used by:
 #   - the mobile composer's meme tab — the push flow
 ############################################################
 
+@require_methods("POST")
 @require_auth
 @ratelimit.per_user("meme_push", max_attempts=20)
 def push_meme(request):
@@ -162,12 +168,18 @@ def push_meme(request):
         return json_error("No file provided", 400, code="no_file")
     if file.size == 0:
         return json_error("Empty file", 400, code="empty_file")
+    # The ceiling before the read: the kind is unknown until
+    # the signature is sniffed, so the bigger cap gates here
+    # and the per-kind one follows the sniff
+    ceiling = max(GIF_MAX_BYTES, IMAGE_MAX_BYTES)
+    if file.size > ceiling:
+        return json_error(f"File too large. Max {ceiling // (1024 * 1024)} MB", 413, code="file_too_large")
 
     blob = file.read()
     is_gif = blob.startswith((b"GIF87a", b"GIF89a"))
     cap = GIF_MAX_BYTES if is_gif else IMAGE_MAX_BYTES
     if file.size > cap:
-        return json_error(f"File too large. Max {cap // (1024 * 1024)} MB", 400, code="file_too_large")
+        return json_error(f"File too large. Max {cap // (1024 * 1024)} MB", 413, code="file_too_large")
 
 
     # STEP 2: a GIF is proven and kept; a static image clears
@@ -260,6 +272,7 @@ def push_meme(request):
 #     chat bubble whose imageUrl points here
 ############################################################
 
+@require_methods("DELETE")
 @require_auth
 def delete_meme(request, meme_id):
     row = Meme.objects.filter(id=meme_id).values("id", "filename", "added_by_id").first()
@@ -277,6 +290,7 @@ def delete_meme(request, meme_id):
     return json_response({"ok": True})
 
 
+@require_methods("GET")
 def serve_meme(request, name):
     if not FILENAME_RE.match(name):
         return json_error("Not found", 404)

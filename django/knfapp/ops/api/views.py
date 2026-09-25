@@ -15,7 +15,7 @@ from django.conf import settings
 from django.db import connection
 
 
-from knfapp.common.http import json_response
+from knfapp.common.http import json_response, require_methods
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 #     and useful for a manual curl after a deploy
 ############################################################
 
+@require_methods("GET")
 def health(request):
     # STEP 1: the database must answer a trivial query
     # ================================================

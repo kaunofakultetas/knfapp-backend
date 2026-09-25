@@ -4,17 +4,22 @@
 #  The two-treatment rule (a GIF keeps its bytes, a static
 #  image clears the uploads re-encode), the folded
 #  Lithuanian search, pusher-or-admin removal taking the
-#  file with the row, and the public serve gate.
+#  file with the row, the public serve gate, and the size
+#  order: the ceiling refuses on the declared size BEFORE
+#  the body is read, the per-kind cap after the sniff.
 ############################################################
 
 
 import io
+import json
 import shutil
 import tempfile
 
 
 from PIL import Image
-from django.test import Client, TestCase
+from django.http import QueryDict
+from django.test import Client, RequestFactory, TestCase
+from django.utils.datastructures import MultiValueDict
 
 
 from knfapp.common import ratelimit
@@ -106,6 +111,34 @@ class MemeLibraryTests(TestCase):
     def test_the_serve_gate_refuses_foreign_names(self):
         for name in ("../knfapp.sqlite3", "x.gif", "a" * 32 + ".exe"):
             self.assertEqual(self.client.get(f"/api/memes/file/{name}").status_code, 404, name)
+
+    def test_an_oversize_push_is_refused_before_its_body_is_read(self):
+        # The declared size trips the ceiling BEFORE file.read(): a
+        # part whose read() fails proves the order, through the real
+        # view with the request's parsed parts swapped in
+        class Unread:
+            name = "didelis.gif"
+            size = meme_views.GIF_MAX_BYTES + 1
+
+            def read(self, *_args):
+                raise AssertionError("the body was read before the size gate")
+
+        request = RequestFactory().post("/api/memes", HTTP_AUTHORIZATION=f"Bearer {self.token}")
+        request._post = QueryDict()
+        request._files = MultiValueDict({"file": [Unread()]})
+        response = meme_views.push_meme(request)
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(json.loads(response.content)["code"], "file_too_large")
+
+    def test_a_static_image_past_its_own_cap_is_a_413_after_the_sniff(self):
+        # Under the ceiling, over the static cap, not a GIF: refused
+        # on size once the signature is known, never re-encoded
+        blob = io.BytesIO(b"\xff\xd8\xff" + b"\0" * meme_views.IMAGE_MAX_BYTES)
+        blob.name = "didelis.jpg"
+        response = self._push(blob)
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["code"], "file_too_large")
+        self.assertEqual(Meme.objects.count(), 0)
 
     def test_the_library_needs_a_login_but_the_files_do_not(self):
         body = self._push(_jpg_bytes()).json()["meme"]

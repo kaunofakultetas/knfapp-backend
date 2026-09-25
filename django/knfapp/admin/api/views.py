@@ -41,7 +41,7 @@ from knfapp.admin.audit import write_audit
 from knfapp.admin.models import AdminAudit
 from knfapp.chat.models import Message
 from knfapp.common import ratelimit
-from knfapp.common.http import get_json_object, json_error, json_response
+from knfapp.common.http import clean_param, get_json_object, json_error, json_response, require_methods
 from knfapp.common.timestamps import parse_stored, utc_now, utc_now_iso
 from knfapp.news.models import DeletedSourceUrl, NewsComment, NewsPost
 from knfapp.notifications.models import PushToken
@@ -211,6 +211,7 @@ _INVITE_FIELDS = ("id", "code", "role", "max_uses", "use_count", "expires_at", "
 #   - services/api/admin.ts — the invitation screens
 ############################################################
 
+@require_methods("POST")
 @require_role("admin", "curator")
 @ratelimit.per_user("invite", max_attempts=30)
 def create_invitation(request):
@@ -273,6 +274,7 @@ def create_invitation(request):
     }, status=201)
 
 
+@require_methods("GET")
 @require_role("admin", "curator")
 def list_invitations(request):
     limit, offset, error = _pagination_clause(request)
@@ -288,6 +290,7 @@ def list_invitations(request):
     return json_response({"invitations": [_invitation_payload(r) for r in rows]})
 
 
+@require_methods("DELETE")
 @require_role("admin", "curator")
 def delete_invitation(request, code_id):
     base = InvitationCode.objects.filter(id=code_id)
@@ -387,6 +390,7 @@ _USER_FIELDS = ("id", "username", "email", "display_name", "role", "active", "cr
 #   - services/api/admin.ts — the admin-users screen
 ############################################################
 
+@require_methods("GET")
 @require_role("admin")
 def list_users(request):
     limit, offset, error = _pagination_clause(request)
@@ -397,6 +401,7 @@ def list_users(request):
     return json_response({"users": [_user_payload(r) for r in rows]})
 
 
+@require_methods("PATCH")
 @require_role("admin")
 def update_user(request, user_id):
     # STEP 1: the target must exist — an unknown id is a 404
@@ -486,6 +491,7 @@ def update_user(request, user_id):
     return json_response(_user_payload(updated))
 
 
+@require_methods("DELETE")
 @require_role("admin")
 def delete_user(request, user_id):
     # STEP 1: the target must exist, must not be the caller,
@@ -544,6 +550,7 @@ def delete_user(request, user_id):
 #   - services/api/admin.ts — the dashboard tiles
 ############################################################
 
+@require_methods("GET")
 @require_role("admin")
 def admin_stats(request):
     # STEP 1: serve the snapshot while it is fresh — a counter
@@ -771,6 +778,7 @@ def _spawn_broadcast(job_id, title, body_text, extra_data):
 #     wrapper; the pair exists so the job id is resolvable
 ############################################################
 
+@require_methods("POST")
 @require_role("admin")
 def send_admin_notification(request):
     # STEP 1: validate — strings only, trimmed, length-bounded
@@ -833,6 +841,7 @@ def send_admin_notification(request):
     return json_response(job, status=202)
 
 
+@require_methods("GET")
 @require_role("admin")
 def broadcast_job_status(request, job_id):
     job = _broadcast_job(job_id)
@@ -865,9 +874,10 @@ def broadcast_job_status(request, job_id):
 #   - the admin panel's reports view
 ############################################################
 
+@require_methods("GET")
 @require_role("admin", "curator")
 def list_reports(request):
-    status = request.GET.get("status", "open")
+    status = clean_param(request.GET.get("status", "open"))
     if status not in ("open", "resolved"):
         return json_error("status must be one of: open, resolved", 400)
 
@@ -899,6 +909,7 @@ def list_reports(request):
     })
 
 
+@require_methods("PUT")
 @require_role("admin", "curator")
 def resolve_report(request, report_id):
     # STEP 1: the body — a known status
@@ -948,6 +959,7 @@ def resolve_report(request, report_id):
 #   - the admin panel's audit view
 ############################################################
 
+@require_methods("GET")
 @require_role("admin")
 def list_audit(request):
     limit, offset, error = _pagination_clause(request)
@@ -1000,6 +1012,7 @@ def list_audit(request):
 #   - the admin panel's stored-files view
 ############################################################
 
+@require_methods("GET")
 @require_role("admin")
 def list_uploads(request):
     limit, offset, error = _pagination_clause(request)
@@ -1054,6 +1067,7 @@ def list_uploads(request):
 #   - the admin panel's report details view
 ############################################################
 
+@require_methods("GET")
 @require_role("admin", "curator")
 def get_reported_message(request, message_id):
     row = (
@@ -1107,6 +1121,7 @@ def get_reported_message(request, message_id):
 #   - the admin panel's deleted-sources view
 ############################################################
 
+@require_methods("GET")
 @require_role("admin")
 def list_tombstones(request):
     limit, offset, error = _pagination_clause(request)
@@ -1131,6 +1146,7 @@ def list_tombstones(request):
     })
 
 
+@require_methods("POST")
 @require_role("admin")
 def restore_tombstone(request):
     data = get_json_object(request)

@@ -19,7 +19,15 @@
 #    - Two independent read-state stores: the membership
 #      row's last_read_at drives unreadCount and the tab
 #      badge; per-message message_reads rows drive status
-#      and readBy. send_message and mark_read write both.
+#      and readBy. send_message and mark_read write both,
+#      through the one helper (_apply_mark_read).
+#    - Disappearing messages are a sweep AND a predicate:
+#      the room views hard-delete overdue rows on entry
+#      (_sweep_expired), and the surfaces read without a
+#      sweep (the conversation-list preview, the pin
+#      banner, the in-room search) filter on expires_at
+#      themselves, so an expired row is unreadable from
+#      the instant it lapses, not from the next sweep.
 #    - Presence (_connected_users in events.py) is a dict in
 #      this process — right only for the single gthread
 #      worker the stack runs (see chat/socket.py).
@@ -61,7 +69,7 @@ from knfapp.chat.models import (Conversation, ConversationParticipant, Message,
                                 MessageReaction, MessageRead)
 from knfapp.common import ratelimit
 from knfapp.common.db import execute as _exec, q as _q, q1 as _q1
-from knfapp.common.http import get_json_object, json_error
+from knfapp.common.http import clean_param, get_json_object, json_error, require_methods
 from knfapp.common.http import json_response as _json_response
 from knfapp.common.timestamps import as_aware, utc_now
 from knfapp.social.models import UserBlock
@@ -198,6 +206,16 @@ def _epoch_ms(value):
 # purpose: outside a request (the maintenance sweep) there
 # is no host to agree with, and stored paths are relative
 # anyway. A non-string answers False instead of raising.
+#
+# This is a SHAPE test, not an ownership test — on purpose.
+# The mobile client forwards a message by re-sending the
+# original sender's upload urls verbatim (packages/
+# chatengine/src/core/forward.ts), so a send-time owner
+# check would 400 every forward. Ownership is enforced on
+# the delete side instead: delete_message and
+# _sweep_expired hand each url to storage.delete_upload AS
+# THE SENDER, and the sink refuses a file the sender never
+# owned or one another live message still shows.
 #
 # The meme twin is kept APART: the unsend/expiry cleanup
 # deletes only /api/uploads/ files, never the library's.
@@ -416,29 +434,46 @@ def _gallery_payload(row, deleted=False):
 
 
 ############################################################
-# _sweep_expired
+# _sweep_expired / _delete_expired_uploads
 ############################################################
 #
 # Disappearing messages: hard-deletes this conversation's
-# rows whose expires_at has passed — files first (photo,
-# attachment, poster, link card image, every gallery photo),
-# then the reaction and receipt rows, then the messages.
-# Called opportunistically from get_messages and
-# send_message inside their own atomic blocks; clients also
-# drop expired rows by their own clocks, so a row that slips
-# into a page between sweeps still vanishes on screen. The
-# daily maintenance command runs the same sweep for rooms
-# nobody reopens.
+# rows whose expires_at has passed — the reaction and
+# receipt rows, then the messages, in one atomic block —
+# and hands their files (photo, attachment, poster, link
+# card image, every gallery photo) to the uploads sink ON
+# THE COMMIT, as the sender: the sink refuses a file the
+# sender never owned (a forwarded copy of somebody else's
+# photo) and one another live message still shows, and
+# because the expired rows are gone by the time the
+# callback runs, they cannot hold their own files back.
+# Called opportunistically from get_messages, send_message
+# and search_messages (autocommit views — the callback runs
+# right after the block commits; the partial index
+# idx_messages_expires makes the lookup a no-op for a room
+# without a TTL). The surfaces that read WITHOUT a sweep —
+# list_conversations' preview seek, get_pins — filter on
+# expires_at instead, and the room's clients drop expired
+# rows by their own clocks too, so a row that slips into a
+# page between sweeps still vanishes on screen. The daily
+# maintenance command runs the same sweep for rooms nobody
+# reopens — no transaction there, so on_commit runs at
+# once. A file that will not go is logged, never raised:
+# the rows stay gone either way.
 ############################################################
 
 def _sweep_expired(conv_id, request=None):
+    # STEP 1: the overdue rows and every upload slot they carry,
+    # each paired with the sender the delete acts for
+    # ==========================================================
     now = datetime.now(timezone.utc)
     rows = list(Message.objects.filter(
         conversation_id=conv_id, expires_at__isnull=False, expires_at__lte=now,
-    ).values("id", "image_url", "attachment_url", "attachment_meta", "link_preview", "gallery"))
+    ).values("id", "sender_id", "image_url", "attachment_url", "attachment_meta", "link_preview", "gallery"))
     if not rows:
         return
 
+    doomed = []
     for row in rows:
         stored_urls = [row["image_url"], row["attachment_url"]]
         if isinstance(row["attachment_meta"], dict):
@@ -447,15 +482,13 @@ def _sweep_expired(conv_id, request=None):
             stored_urls.append(row["link_preview"].get("imageUrl"))
         if isinstance(row["gallery"], list):
             stored_urls.extend(item.get("url") for item in row["gallery"] if isinstance(item, dict))
-        for stored in stored_urls:
-            if not _is_local_upload_url(stored, request):
-                continue
-            try:
-                from knfapp.uploads.storage import delete_upload
-                delete_upload(stored)
-            except Exception:
-                logger.exception("Upload cleanup failed for expired message")
+        doomed.extend((stored, row["sender_id"]) for stored in stored_urls
+                      if _is_local_upload_url(stored, request))
 
+
+    # STEP 2: the rows first — the files only once these are gone,
+    # so the reference guard never sees the expiring message itself
+    # =============================================================
     ids = [row["id"] for row in rows]
     marks = ",".join(["%s"] * len(ids))
     with transaction.atomic():
@@ -465,6 +498,18 @@ def _sweep_expired(conv_id, request=None):
         # reply-quote SET_NULL cascade and erase the ghost-quote
         # wire shape the read path relies on
         _exec(f"DELETE FROM messages WHERE id IN ({marks})", ids)
+
+    if doomed:
+        transaction.on_commit(lambda: _delete_expired_uploads(doomed))
+
+
+def _delete_expired_uploads(doomed):
+    from knfapp.uploads.storage import delete_upload
+    for stored, sender_id in doomed:
+        try:
+            delete_upload(stored, sender_id)
+        except Exception:
+            logger.exception("Upload cleanup failed for expired message")
 
 
 
@@ -689,10 +734,14 @@ def _find_direct_conversation(user_id, other_id):
 # GET /api/chat/conversations
 #
 # Every conversation the caller belongs to, pinned first
-# then newest activity, with participants, the last message
-# and an unread count per row — FOUR queries for the whole
-# tab (the memberships, then participants, last messages
-# and unread counts set-based over the id list).
+# then newest activity, with participants, the last LIVE
+# message and an unread count per row — FOUR queries for
+# the whole tab (the memberships, then participants, last
+# messages and unread counts set-based over the id list).
+# A disappearing message past its expires_at never
+# previews: the seek skips it and lands on the previous
+# live message, so the row reads exactly as it will after
+# the sweep instead of showing a lapsed body or going blank.
 # unreadCount is other people's messages newer than the
 # caller's last_read_at; a NULL last_read_at counts
 # everything, and unsent messages never count. A direct
@@ -707,6 +756,7 @@ def _find_direct_conversation(user_id, other_id):
 #   - services/api/chat.ts — fetchConversations
 ############################################################
 
+@require_methods("GET")
 @transaction.non_atomic_requests
 @require_auth
 def list_conversations(request):
@@ -745,10 +795,16 @@ def list_conversations(request):
             participants_map.setdefault(p["conversation_id"], []).append(p)
 
         # One descending index seek per room picks its newest
-        # message (the id tiebreak keeps the pick deterministic
-        # when two stamps match to the microsecond) — a window
-        # function over the same rows would visit EVERY message
-        # of every listed room, and this is the app-open query
+        # LIVE message (the id tiebreak keeps the pick
+        # deterministic when two stamps match to the
+        # microsecond) — a window function over the same rows
+        # would visit EVERY message of every listed room, and
+        # this is the app-open query. The expiry predicate sits
+        # INSIDE the correlated seek on purpose: filtering the
+        # picked row afterwards would blank the preview of a
+        # room whose newest row lapsed, instead of falling back
+        # to the previous live one
+        now = utc_now()
         for m in _q(
             f"""
             SELECT m.conversation_id, m.id, m.text, m.image_url, m.kind, m.created_at,
@@ -756,11 +812,12 @@ def list_conversations(request):
             FROM conversations c
             JOIN messages m ON m.id = (SELECT m2.id FROM messages m2
                                        WHERE m2.conversation_id = c.id
+                                         AND (m2.expires_at IS NULL OR m2.expires_at > %s)
                                        ORDER BY m2.created_at DESC, m2.id DESC LIMIT 1)
             JOIN users u ON u.id = m.sender_id
             WHERE c.id IN ({placeholders})
             """,
-            conv_ids,
+            [_bind(now)] + conv_ids,
         ):
             last_msg_map[m["conversation_id"]] = m
 
@@ -880,6 +937,7 @@ def list_conversations(request):
 #   - services/api/chat.ts — createConversation
 ############################################################
 
+@require_methods("POST")
 @transaction.non_atomic_requests
 @require_auth
 @ratelimit.per_user("chat_create", max_attempts=50)
@@ -1125,6 +1183,7 @@ def _page_rows(window, order, limit):
     )
 
 
+@require_methods("GET")
 @transaction.non_atomic_requests
 @require_auth
 def get_messages(request, conv_id):
@@ -1145,11 +1204,13 @@ def get_messages(request, conv_id):
     # parsed to aware datetimes so the ORM binds them in each
     # engine's own type; a stamp no page could have produced
     # reads as no cursor
-    before = as_aware(request.GET.get("before")) if request.GET.get("before") else None
-    before_id = request.GET.get("before_id")
-    after = as_aware(request.GET.get("after")) if request.GET.get("after") else None
-    after_id = request.GET.get("after_id")
-    around = request.GET.get("around")
+    before = clean_param(request.GET.get("before"))
+    before = as_aware(before) if before else None
+    before_id = clean_param(request.GET.get("before_id"))
+    after = clean_param(request.GET.get("after"))
+    after = as_aware(after) if after else None
+    after_id = clean_param(request.GET.get("after_id"))
+    around = clean_param(request.GET.get("around"))
     try:
         limit = int(request.GET.get("limit", 50))
     except (TypeError, ValueError):
@@ -1320,13 +1381,14 @@ def get_messages(request, conv_id):
     })
 
 
+@require_methods("GET")
 @transaction.non_atomic_requests
 @require_auth
 def get_changes(request, conv_id):
     # STEP 1: the cursor — an ISO stamp, nothing else
     # ===============================================
     user_id = request.user["id"]
-    since = (request.GET.get("since") or "").strip()
+    since = (clean_param(request.GET.get("since")) or "").strip()
     if not since:
         return json_error("since is required", 400)
     since_key = as_aware(since.replace("Z", "+00:00"))
@@ -1416,10 +1478,14 @@ def get_changes(request, conv_id):
 # attachment?, media?, gallery?, kind?, forwarded?}: text
 # is stripped, a string of at most 5000 chars; at least one
 # of text/imageUrl/attachment/gallery must be present.
-# imageUrl, when non-empty, must be an own /api/uploads/
+# imageUrl, when non-empty, must be a local /api/uploads/
 # path (or /api/memes/file/ for a shared meme) — anything
 # else is a 400, so a stored message can never point a
-# reader's client at a foreign server. replyToId must name
+# reader's client at a foreign server. The path's OWNER is
+# not checked here (a forward re-sends somebody else's
+# urls verbatim — see _is_local_upload_url); the unsend and
+# the expiry sweep enforce it when the file would go.
+# replyToId must name
 # a message in THIS conversation (400, blank included).
 # client_msg_id is the idempotency nonce: a repeat of one
 # already committed answers 200 with the EXISTING row — the
@@ -1427,12 +1493,20 @@ def get_changes(request, conv_id):
 # (403); a DIRECT chat between a blocked pair refuses the
 # send (403) — group sends are allowed, the push lane keeps
 # blocked phones quiet there. One transaction inserts the
-# message, bumps conversations.updated_at, moves the
-# sender's last_read_at forward and writes their own read
-# receipt.
+# message, bumps conversations.updated_at and settles the
+# sender's read state through _apply_mark_read — a receipt
+# for every foreign message up to this instant and the
+# watermark ADVANCED, never set back — plus the sender's
+# own receipt. Replying is reading: a reply typed inside
+# the client's read debounce used to move the watermark by
+# hand with no receipt pass, which excluded those messages
+# from every later mark_read for good and left the
+# counterpart's bubbles at "sent" forever.
 #
 # Fan-out after commit: 'new_message' to room conv:<id>,
-# then push for every member WITHOUT a socket in that very
+# 'messages_read' for the receipts the send wrote (targeted
+# exactly as mark_read targets them), then push for every
+# member WITHOUT a socket in that very
 # room — room membership, not global presence. The push
 # title is the sender's name (plus " · Group title" in a
 # group); preview is the first 100 chars or a Lithuanian
@@ -1443,10 +1517,24 @@ def get_changes(request, conv_id):
 # A URL in the text starts the unfurl task. Capped at 150
 # sends per 5 min per user (429).
 #
+# Every refusal carries a stable code the phone triages on
+# (the English prose is never shown): text_too_long and
+# quote_not_found are the two the mobile engine names —
+# "too long" and "the message you replied to no longer
+# exists" — and every other 400 (json_required, bad_text,
+# bad_attachment, bad_upload_url, bad_media,
+# gallery_invalid, bad_kind, kind_mismatch, empty_message,
+# bad_reply_id, bad_client_msg_id, bad_forwarded,
+# bad_image_url) reads as "could not send". The 403s are
+# not_a_participant and pair_blocked. edit_message,
+# react_to_message and set_message_ttl below code theirs
+# the same way.
+#
 # Used by:
 #   - services/api/chat.ts — sendMessageApi
 ############################################################
 
+@require_methods("POST")
 @transaction.non_atomic_requests
 @require_auth
 @ratelimit.per_user("chat_send", max_attempts=150)
@@ -1456,11 +1544,11 @@ def send_message(request, conv_id):
     user_id = request.user["id"]
     data = get_json_object(request)
     if not data:
-        return json_error("JSON body required", 400)
+        return json_error("JSON body required", 400, code="json_required")
 
     raw_text = data.get("text", "")
     if not isinstance(raw_text, str):
-        return json_error("Text must be a string", 400)
+        return json_error("Text must be a string", 400, code="bad_text")
     text = raw_text.strip()
     image_url = data.get("imageUrl")
 
@@ -1470,19 +1558,19 @@ def send_message(request, conv_id):
     attachment = data.get("attachment")
     if attachment is not None:
         if not isinstance(attachment, dict):
-            return json_error("attachment must be an object", 400)
+            return json_error("attachment must be an object", 400, code="bad_attachment")
         att_url = attachment.get("url")
         att_name = attachment.get("name", "")
         att_size = attachment.get("size", 0)
         att_mime = attachment.get("mime", "")
         if not isinstance(att_url, str) or not _is_local_upload_url(att_url, request):
-            return json_error("attachment.url must be an /api/uploads/ path", 400)
+            return json_error("attachment.url must be an /api/uploads/ path", 400, code="bad_upload_url")
         if not isinstance(att_name, str) or not att_name.strip() or len(att_name) > 200:
-            return json_error("attachment.name must be a non-blank string of at most 200 characters", 400)
+            return json_error("attachment.name must be a non-blank string of at most 200 characters", 400, code="bad_attachment")
         if not isinstance(att_size, int) or isinstance(att_size, bool) or att_size < 0:
-            return json_error("attachment.size must be a non-negative integer", 400)
+            return json_error("attachment.size must be a non-negative integer", 400, code="bad_attachment")
         if not isinstance(att_mime, str) or len(att_mime) > 100:
-            return json_error("attachment.mime must be a short string", 400)
+            return json_error("attachment.mime must be a short string", 400, code="bad_attachment")
         attachment = {"url": att_url, "name": att_name.strip(), "size": att_size, "mime": att_mime.strip()}
 
     # The frame of a photo / video: optional non-negative numbers
@@ -1490,19 +1578,19 @@ def send_message(request, conv_id):
     media = data.get("media")
     if media is not None:
         if not isinstance(media, dict):
-            return json_error("media must be an object", 400)
+            return json_error("media must be an object", 400, code="bad_media")
         clean = {}
         for key in ("width", "height", "duration"):
             value = media.get(key)
             if value is None:
                 continue
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 10_000_000:
-                return json_error(f"media.{key} must be a non-negative number", 400)
+                return json_error(f"media.{key} must be a non-negative number", 400, code="bad_media")
             clean[key] = value
         thumb = media.get("thumbnailUrl")
         if thumb is not None:
             if not isinstance(thumb, str) or not _is_local_upload_url(thumb, request):
-                return json_error("media.thumbnailUrl must be an /api/uploads/ path", 400)
+                return json_error("media.thumbnailUrl must be an /api/uploads/ path", 400, code="bad_upload_url")
             clean["thumbnailUrl"] = thumb
         # The ~14px micro copy, echoed back so every reader draws
         # the blur before the bytes; a data URI only — never a
@@ -1510,17 +1598,17 @@ def send_message(request, conv_id):
         preview_uri = media.get("preview")
         if preview_uri is not None:
             if not isinstance(preview_uri, str) or not preview_uri.startswith("data:image/") or len(preview_uri) > 2000:
-                return json_error("media.preview must be a small data:image/ URI", 400)
+                return json_error("media.preview must be a small data:image/ URI", 400, code="bad_media")
             clean["preview"] = preview_uri
         # A voice note's amplitude bars: up to 64 numbers in 0..1
         waveform = media.get("waveform")
         if waveform is not None:
             if not isinstance(waveform, list) or len(waveform) > 64:
-                return json_error("media.waveform must be a list of at most 64 numbers", 400)
+                return json_error("media.waveform must be a list of at most 64 numbers", 400, code="bad_media")
             bars = []
             for value in waveform:
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 1:
-                    return json_error("media.waveform values must be numbers between 0 and 1", 400)
+                    return json_error("media.waveform values must be numbers between 0 and 1", 400, code="bad_media")
                 bars.append(round(float(value), 3))
             clean["waveform"] = bars
         media = clean or None
@@ -1531,66 +1619,66 @@ def send_message(request, conv_id):
     gallery = data.get("gallery")
     if gallery is not None:
         if not isinstance(gallery, list) or not 2 <= len(gallery) <= 8:
-            return json_error("gallery must be a list of 2 to 8 photos", 400)
+            return json_error("gallery must be a list of 2 to 8 photos", 400, code="gallery_invalid")
         clean_items = []
         for item in gallery:
             if not isinstance(item, dict):
-                return json_error("every gallery item must be an object", 400)
+                return json_error("every gallery item must be an object", 400, code="gallery_invalid")
             item_url = item.get("url")
             if not isinstance(item_url, str) or not _is_local_upload_url(item_url, request):
-                return json_error("every gallery url must be an /api/uploads/ path", 400)
+                return json_error("every gallery url must be an /api/uploads/ path", 400, code="bad_upload_url")
             clean_item = {"url": item_url}
             for key in ("width", "height"):
                 value = item.get(key)
                 if value is None:
                     continue
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 10_000_000:
-                    return json_error(f"gallery {key} must be a non-negative number", 400)
+                    return json_error(f"gallery {key} must be a non-negative number", 400, code="gallery_invalid")
                 clean_item[key] = value
             item_preview = item.get("preview")
             if item_preview is not None:
                 if not isinstance(item_preview, str) or not item_preview.startswith("data:image/") or len(item_preview) > 2000:
-                    return json_error("gallery preview must be a small data:image/ URI", 400)
+                    return json_error("gallery preview must be a small data:image/ URI", 400, code="gallery_invalid")
                 clean_item["preview"] = item_preview
             clean_items.append(clean_item)
         gallery = clean_items
         if image_url or attachment:
-            return json_error("A gallery cannot ride with a single image or a file", 400)
+            return json_error("A gallery cannot ride with a single image or a file", 400, code="gallery_invalid")
         if data.get("kind") not in (None, "image"):
-            return json_error("A gallery message's kind is image", 400)
+            return json_error("A gallery message's kind is image", 400, code="gallery_invalid")
 
     # The declared kind must match the content
     kind_param = data.get("kind")
     if kind_param is not None and kind_param not in ("text", "image", "file", "video", "audio"):
-        return json_error("kind must be text, image, file, video or audio", 400)
+        return json_error("kind must be text, image, file, video or audio", 400, code="bad_kind")
     if kind_param in ("video", "audio") and not attachment:
-        return json_error("A video or audio message needs an attachment", 400)
+        return json_error("A video or audio message needs an attachment", 400, code="kind_mismatch")
     if kind_param == "image" and not image_url and not gallery:
-        return json_error("An image message needs imageUrl", 400)
+        return json_error("An image message needs imageUrl", 400, code="kind_mismatch")
 
     if not text and not image_url and not attachment and not gallery:
-        return json_error("Message must have text, an image or an attachment", 400)
+        return json_error("Message must have text, an image or an attachment", 400, code="empty_message")
 
     if text and len(text) > 5000:
-        return json_error("Message text must not exceed 5000 characters", 400)
+        return json_error("Message text must not exceed 5000 characters", 400, code="text_too_long")
 
     reply_to_id = data.get("replyToId")
     if reply_to_id is not None and not isinstance(reply_to_id, str):
-        return json_error("replyToId must be a string", 400)
+        return json_error("replyToId must be a string", 400, code="bad_reply_id")
     # A blank quote id is a client bug, not "no reply"
     if reply_to_id is not None and not reply_to_id.strip():
-        return json_error("replyToId must not be blank", 400)
+        return json_error("replyToId must not be blank", 400, code="bad_reply_id")
 
     client_msg_id = data.get("client_msg_id")
     if client_msg_id is not None and not isinstance(client_msg_id, str):
-        return json_error("client_msg_id must be a string", 400)
+        return json_error("client_msg_id must be a string", 400, code="bad_client_msg_id")
     if client_msg_id and len(client_msg_id) > 128:
-        return json_error("client_msg_id too long", 400)
+        return json_error("client_msg_id too long", 400, code="bad_client_msg_id")
 
     # A message re-sent from another room carries only this mark
     forwarded = data.get("forwarded")
     if forwarded is not None and not isinstance(forwarded, bool):
-        return json_error("forwarded must be a boolean", 400)
+        return json_error("forwarded must be a boolean", 400, code="bad_forwarded")
     forwarded = bool(forwarded)
 
 
@@ -1601,17 +1689,22 @@ def send_message(request, conv_id):
     # one falsy value that passes — stored and echoed as given
     # ======================================================
     if image_url is not None and not isinstance(image_url, str):
-        return json_error("imageUrl must be a string", 400)
+        return json_error("imageUrl must be a string", 400, code="bad_image_url")
 
+    # Shape only, no ownership check — here and for attachment,
+    # media.thumbnailUrl and gallery above: a forwarded message
+    # carries the original sender's urls, so owning them cannot
+    # be a condition of sending. Ownership is enforced where the
+    # file would leave disk (delete_message, _sweep_expired)
     if image_url and not _is_local_upload_url(image_url, request) and not _is_meme_library_url(image_url, request):
-        return json_error("imageUrl must be an /api/uploads/ or /api/memes/file/ path", 400)
+        return json_error("imageUrl must be an /api/uploads/ or /api/memes/file/ path", 400, code="bad_image_url")
 
 
     # STEP 2: membership gate — 403 for outsiders; a quoted
     # message must live in this very conversation (400)
     # =====================================================
     if not _is_member(conv_id, user_id):
-        return json_error("Not a participant", 403)
+        return json_error("Not a participant", 403, code="not_a_participant")
 
     # Disappearing messages leave before the room grows
     _sweep_expired(conv_id, request)
@@ -1634,7 +1727,7 @@ def send_message(request, conv_id):
                 | Q(blocker_id=counterpart["user_id"], blocked_id=user_id),
             ).exists()
             if pair_blocked:
-                return json_error("You cannot message this user", 403)
+                return json_error("You cannot message this user", 403, code="pair_blocked")
 
     reply_row = None
     if reply_to_id:
@@ -1643,7 +1736,7 @@ def send_message(request, conv_id):
             "attachment_name", sender_name=F("sender__display_name"),
         ).first()
         if not quoted:
-            return json_error("Quoted message not found in this conversation", 400)
+            return json_error("Quoted message not found in this conversation", 400, code="quote_not_found")
         # The reply_* keys _reply_payload shapes the quote from
         reply_row = {
             "reply_to_id": quoted["id"],
@@ -1674,12 +1767,14 @@ def send_message(request, conv_id):
     # STEP 3: one transaction — the message row, the
     # conversation bump that reorders the list, and the
     # sender's read state in BOTH stores so their own message
-    # never shows as unread to them. The idempotency index
+    # never shows as unread to them and everything they had
+    # in front of them counts as read. The idempotency index
     # turns a racing double-submit into an IntegrityError,
     # answered like the replay above
     # ======================================================
     msg_id = str(uuid.uuid4())
     now = utc_now()
+    newly_read_ids = []
 
     if attachment:
         kind = kind_param if kind_param in ("video", "audio") else "file"
@@ -1711,9 +1806,16 @@ def send_message(request, conv_id):
 
             Conversation.objects.filter(id=conv_id).update(updated_at=now)
 
-            ConversationParticipant.objects.filter(
-                conversation_id=conv_id, user_id=user_id,
-            ).update(last_read_at=now)
+            # The sender's read state through the ONE mark-read
+            # implementation: receipts for every foreign message
+            # up to this instant (bounded by _MARK_READ_CAP), then
+            # the watermark — advanced, never merely set, so a
+            # racing device cannot drag it back. Inside this
+            # atomic block the helper joins the transaction
+            # instead of opening its own (_begin_immediate). None
+            # back (the membership row vanished under the gate)
+            # is simply "nothing read" — the send still lands
+            newly_read_ids = _apply_mark_read(conv_id, user_id, now) or []
 
             # The sender's own receipt — refused silently when a
             # racing twin already wrote it (the composite key)
@@ -1773,6 +1875,14 @@ def send_message(request, conv_id):
 
     from knfapp.chat.events import emit_new_message
     emit_new_message(_get_sio(), conv_id, msg_data)
+
+    # The receipts the send wrote for what the sender had not yet
+    # marked: 'messages_read' to the affected senders and the
+    # reader's own devices, exactly what mark_read would have
+    # sent — the counterpart's bubbles flip live, not on refetch
+    if newly_read_ids:
+        from knfapp.chat.events import emit_read_receipt
+        emit_read_receipt(_get_sio(), conv_id, user_id, newly_read_ids)
 
 
     # STEP 5: push for members WITHOUT a socket in this very
@@ -1923,8 +2033,12 @@ def send_message(request, conv_id):
 # dropped and deleted_at set. An unsent photo's
 # /api/uploads/ files (single, attachment, poster, link
 # card, every gallery photo) are handed to the uploads
-# delete helper in BOTH the forms the send accepts, so
-# neither can leave an orphan. Outsider → 403, unknown →
+# sink in BOTH the forms the send accepts, so neither can
+# leave an orphan — AS THE SENDER: a forwarded copy of
+# somebody else's photo is refused and their file
+# survives, and a photo the sender still shows in another
+# message stays until that one goes; neither ever fails
+# the unsend. Outsider → 403, unknown →
 # 404, somebody else's → 403, already unsent → still 200.
 # Broadcasts 'message_deleted' ONLY on the call that
 # actually unsent it — a repeat is a silent 200. Capped at
@@ -1941,6 +2055,7 @@ def send_message(request, conv_id):
 #   - services/api/chat.ts — deleteMessageApi / editMessageApi
 ############################################################
 
+@require_methods("DELETE")
 @transaction.non_atomic_requests
 @require_auth
 @ratelimit.per_user("chat_delete", max_attempts=100)
@@ -1979,7 +2094,12 @@ def delete_message(request, conv_id, msg_id):
 
         # The photo blob goes with the message — matched by
         # _is_local_upload_url, the SAME rule the send accepted
-        # it under, so neither form can leave an orphan on disk
+        # it under, so neither form can leave an orphan on disk.
+        # The sink acts as the sender: "forbidden" (never theirs —
+        # a forward) and "referenced" (still shown by another
+        # message) keep the file and are only logged; the slots
+        # above are already NULL, so this row cannot hold its own
+        # file back
         poster = row["attachment_meta"].get("thumbnailUrl") if isinstance(row["attachment_meta"], dict) else None
         preview_image = row["link_preview"].get("imageUrl") if isinstance(row["link_preview"], dict) else None
         gallery_urls = [item.get("url") for item in row["gallery"] if isinstance(item, dict)] \
@@ -1989,7 +2109,9 @@ def delete_message(request, conv_id, msg_id):
                 continue
             try:
                 from knfapp.uploads.storage import delete_upload
-                delete_upload(stored)
+                outcome = delete_upload(stored, user_id)
+                if outcome in ("forbidden", "referenced"):
+                    logger.info("Unsend of message %s kept its upload (%s)", msg_id, outcome)
             except Exception:
                 logger.exception("Upload cleanup failed for unsent message")
 
@@ -1999,6 +2121,7 @@ def delete_message(request, conv_id, msg_id):
     return json_response({"ok": True})
 
 
+@require_methods("PUT")
 @transaction.non_atomic_requests
 @require_auth
 @ratelimit.per_user("chat_edit", max_attempts=100)
@@ -2008,32 +2131,32 @@ def edit_message(request, conv_id, msg_id):
     user_id = request.user["id"]
     data = get_json_object(request)
     if not data:
-        return json_error("JSON body required", 400)
+        return json_error("JSON body required", 400, code="json_required")
     raw_text = data.get("text")
     if not isinstance(raw_text, str):
-        return json_error("Text must be a string", 400)
+        return json_error("Text must be a string", 400, code="bad_text")
     text = raw_text.strip()
     if not text:
-        return json_error("Message text required", 400)
+        return json_error("Message text required", 400, code="empty_message")
     if len(text) > 5000:
-        return json_error("Message text must not exceed 5000 characters", 400)
+        return json_error("Message text must not exceed 5000 characters", 400, code="text_too_long")
 
 
     # STEP 2: membership, the row, its owner, its state
     # =================================================
     if not _is_member(conv_id, user_id):
-        return json_error("Not a participant", 403)
+        return json_error("Not a participant", 403, code="not_a_participant")
 
     row = Message.objects.filter(id=msg_id, conversation_id=conv_id) \
         .values("sender_id", "deleted_at", "kind").first()
     if not row:
-        return json_error("Message not found", 404)
+        return json_error("Message not found", 404, code="message_not_found")
     if row["sender_id"] != user_id:
-        return json_error("Only the sender can edit a message", 403)
+        return json_error("Only the sender can edit a message", 403, code="not_the_sender")
     if row["deleted_at"] is not None:
-        return json_error("An unsent message cannot be edited", 409)
+        return json_error("An unsent message cannot be edited", 409, code="message_unsent")
     if (row["kind"] or "text") not in ("text", "image"):
-        return json_error("Only text messages can be edited", 400)
+        return json_error("Only text messages can be edited", 400, code="not_editable")
 
 
     # STEP 3: the rewrite, stamped, then the broadcast
@@ -2080,6 +2203,7 @@ def edit_message(request, conv_id, msg_id):
 #   - the mobile chat room — pin banner, room menu
 ############################################################
 
+@require_methods("PUT", "DELETE")
 @transaction.non_atomic_requests
 @require_auth
 @ratelimit.per_user("chat_pin", max_attempts=60)
@@ -2098,8 +2222,9 @@ def pin_message(request, conv_id, msg_id):
         return json_error("System messages cannot be pinned", 400)
 
 
-    # STEP 2: flip the pin and tell the room
-    # ======================================
+    # STEP 2: flip the pin and tell the room — PUT pins, DELETE
+    # (the only other verb the guard admits) unpins
+    # =========================================================
     if request.method == "PUT":
         pinned_at = utc_now()
         pinned_by = user_id
@@ -2114,6 +2239,7 @@ def pin_message(request, conv_id, msg_id):
     return json_response({"pinnedAt": pinned_at, "pinnedBy": pinned_by})
 
 
+@require_methods("GET")
 @transaction.non_atomic_requests
 @require_auth
 def get_pins(request, conv_id):
@@ -2124,9 +2250,13 @@ def get_pins(request, conv_id):
         return json_error("Not a participant", 403)
 
 
-    # STEP 2: the pinned rows, shaped lean
-    # ====================================
+    # STEP 2: the pinned rows, shaped lean — a pin whose
+    # disappearing-message deadline has passed is out HERE,
+    # not at the next sweep: this list is read without one
+    # =====================================================
+    now = utc_now()
     rows = Message.objects.filter(
+        Q(expires_at__isnull=True) | Q(expires_at__gt=now),
         conversation_id=conv_id, pinned_at__isnull=False, deleted_at__isnull=True,
     ).order_by("-pinned_at").values(
         "id", "text", "image_url", "created_at", "client_msg_id", "sender_id",
@@ -2166,6 +2296,7 @@ def get_pins(request, conv_id):
     return json_response({"pins": pins})
 
 
+@require_methods("PUT")
 @transaction.non_atomic_requests
 @require_auth
 @ratelimit.per_user("chat_ttl", max_attempts=30)
@@ -2175,19 +2306,19 @@ def set_message_ttl(request, conv_id):
     user_id = request.user["id"]
     data = get_json_object(request)
     if data is None:
-        return json_error("JSON body required", 400)
+        return json_error("JSON body required", 400, code="json_required")
     seconds = data.get("seconds")
     if seconds is not None and (isinstance(seconds, bool) or not isinstance(seconds, int)):
-        return json_error("seconds must be an integer or null", 400)
+        return json_error("seconds must be an integer or null", 400, code="bad_ttl")
     if seconds is not None and seconds != 0 and not 60 <= seconds <= 31_536_000:
-        return json_error("seconds must be 0 (off) or between 60 and 31536000", 400)
+        return json_error("seconds must be 0 (off) or between 60 and 31536000", 400, code="bad_ttl")
     ttl = seconds or None
 
 
     # STEP 2: membership, the write, the narration
     # ============================================
     if not _is_member(conv_id, user_id):
-        return json_error("Not a participant", 403)
+        return json_error("Not a participant", 403, code="not_a_participant")
 
     with transaction.atomic():
         Conversation.objects.filter(id=conv_id).update(message_ttl_seconds=ttl)
@@ -2241,6 +2372,7 @@ def set_message_ttl(request, conv_id):
 #     removeReactionApi
 ############################################################
 
+@require_methods("POST")
 @transaction.non_atomic_requests
 @require_auth
 @ratelimit.per_user("chat_react", max_attempts=300)
@@ -2248,19 +2380,19 @@ def react_to_message(request, conv_id, msg_id):
     user_id = request.user["id"]
     data = get_json_object(request)
     if not data or not data.get("emoji"):
-        return json_error("emoji required", 400)
+        return json_error("emoji required", 400, code="emoji_required")
 
     if not isinstance(data["emoji"], str):
-        return json_error("emoji must be a string", 400)
+        return json_error("emoji must be a string", 400, code="bad_emoji")
 
     # The server-side allowlist mirrors the mobile picker's
     # REACTION_OPTIONS — the only six values a client can send
     emoji = data["emoji"]
     if emoji not in _ALLOWED_REACTIONS:
-        return json_error("emoji must be one of the supported reactions", 400)
+        return json_error("emoji must be one of the supported reactions", 400, code="bad_emoji")
 
     if not _is_member(conv_id, user_id):
-        return json_error("Not a participant", 403)
+        return json_error("Not a participant", 403, code="not_a_participant")
 
     # The conversation id in the URL is what the membership
     # check trusted, so the message must really live there —
@@ -2269,7 +2401,7 @@ def react_to_message(request, conv_id, msg_id):
         id=msg_id, conversation_id=conv_id, deleted_at__isnull=True,
     ).exists()
     if not msg:
-        return json_error("Message not found", 404)
+        return json_error("Message not found", 404, code="message_not_found")
 
     with transaction.atomic():
         # One emoji per user: replace, never accumulate
@@ -2290,6 +2422,7 @@ def react_to_message(request, conv_id, msg_id):
     return json_response({"ok": True, "emoji": emoji, "reactions": reactions})
 
 
+@require_methods("DELETE")
 @transaction.non_atomic_requests
 @require_auth
 @ratelimit.per_user("chat_react", max_attempts=300)
@@ -2339,6 +2472,7 @@ def remove_reaction(request, conv_id, msg_id):
 #   - services/api/chat.ts — togglePinApi
 ############################################################
 
+@require_methods("PUT")
 @transaction.non_atomic_requests
 @require_auth
 def toggle_pin(request, conv_id):
@@ -2482,6 +2616,7 @@ def _apply_mark_read(conv_id, user_id, now):
     return newly_read_ids
 
 
+@require_methods("PUT")
 @transaction.non_atomic_requests
 @require_auth
 def mark_read(request, conv_id):
@@ -2547,6 +2682,7 @@ def mark_read(request, conv_id):
 #     fetchTotalUnreadCount
 ############################################################
 
+@require_methods("DELETE")
 @transaction.non_atomic_requests
 @require_auth
 def leave_conversation(request, conv_id):
@@ -2626,6 +2762,7 @@ def leave_conversation(request, conv_id):
     return json_response({"ok": True})
 
 
+@require_methods("GET")
 @transaction.non_atomic_requests
 @require_auth
 def total_unread_count(request):
@@ -2660,31 +2797,43 @@ def total_unread_count(request):
 # ?q (required, 400 when blank after strip or over 200
 # chars) and ?limit (default 20, clamped into 1..50,
 # non-numeric → 400, parsed only after the membership gate).
-# Members only (403). ONE substring match both engines run
-# identically — case-insensitive contains on the room's
-# un-unsent rows, the needle's \, % and _ escaped by the
-# lookup so they match literally. A q carrying a NUL byte
-# answers {messages: [], total: 0} without a query at all
-# (see the guard below). Returns {messages, total}: the
-# newest `limit` hits reversed to chronological order, plus
-# the total so the UI can say "20 of 137" — the counter
-# SATURATES at _SEARCH_TOTAL_CAP, so that value means "this
-# many or more". Capped at 100 searches per 5 min per user
-# (429).
+# Members only (403). ONE substring match — the same
+# icontains on the room's un-unsent rows on both engines,
+# but the case folding is the ENGINE's: SQLite's LIKE folds
+# ASCII only, PostgreSQL folds by collation, so a capitalised
+# Lithuanian diacritic in the needle or the row misses only
+# on SQLite — the needle's \, % and _ escaped by the
+# lookup so they match literally. NUL and the other C0
+# controls are stripped from q before anything else looks
+# at it (clean_param — bound NUL-terminated, a NUL would
+# collapse the LIKE pattern to a bare '%' and page the
+# whole room), so "La\x00bas" searches for "Labas" and a
+# NUL alone is the blank-q 400. Returns {messages, total}:
+# the newest `limit` hits reversed to chronological order,
+# plus the total so the UI can say "20 of 137" — the
+# counter SATURATES at _SEARCH_TOTAL_CAP, so that value
+# means "this many or more". Capped at 100 searches per 5
+# min per user (429). A disappearing message past its
+# expires_at is never a hit: the room is swept first
+# (_sweep_expired — free for a room without a TTL) and the
+# query filters on expires_at besides, for the window
+# between the two; a hit carries expiresAt so the client
+# can drop it the moment it lapses on screen.
 #
 # Used by:
 #   - services/api/chat.ts — searchMessagesApi
 ############################################################
 
+@require_methods("GET")
 @transaction.non_atomic_requests
 @require_auth
 @ratelimit.per_user("chat_msg_search", max_attempts=100)
 def search_messages(request, conv_id):
-    # STEP 1: q — a blank q is a 400 (unlike search_users),
-    # and so is one no human would type
+    # STEP 1: q — a blank q is a 400 (unlike search_users);
+    # a control byte is gone before the length is judged
     # =====================================================
     user_id = request.user["id"]
-    q = request.GET.get("q", "").strip()
+    q = clean_param(request.GET.get("q", "")).strip()
     if len(q) < 1:
         return json_error("q parameter is required and must not be empty", 400)
     if len(q) > _SEARCH_Q_MAX:
@@ -2697,31 +2846,30 @@ def search_messages(request, conv_id):
     if not _is_member(conv_id, user_id):
         return json_error("Not a participant", 403)
 
+    # Disappearing messages leave before the room is searched
+    _sweep_expired(conv_id, request)
+
     try:
         limit = int(request.GET.get("limit", 20))
     except (TypeError, ValueError):
         return json_error("limit must be an integer", 400)
     limit = max(1, min(limit, 50))
 
-    # The driver binds TEXT NUL-TERMINATED, so a NUL in the
-    # needle truncates the pattern INSIDE SQLite and the LIKE
-    # pattern collapses to a bare '%' that answers the whole
-    # room. No message body holds one, so the needle is
-    # answered as what it is — a miss
-    if "\x00" in q:
-        return json_response({"messages": [], "total": 0})
 
-
-    # STEP 3: the newest `limit` hits plus the saturating
+    # STEP 3: the newest `limit` LIVE hits plus the saturating
     # total — icontains escapes the needle's wildcards itself
-    # and carries the case folding per engine
-    # ======================================================
+    # and carries the case folding per engine; the expiry
+    # predicate covers a row that lapses between the sweep
+    # above and this SELECT
+    # ========================================================
+    now = utc_now()
     hits = Message.objects.filter(
+        Q(expires_at__isnull=True) | Q(expires_at__gt=now),
         conversation_id=conv_id, deleted_at__isnull=True, text__icontains=q,
     )
     rows = list(
         hits.order_by("-created_at").values(
-            "id", "text", "image_url", "created_at", "sender_id",
+            "id", "text", "image_url", "created_at", "sender_id", "expires_at",
             sender_name=F("sender__display_name"), sender_avatar=F("sender__avatar_url"),
         )[:limit]
     )
@@ -2747,6 +2895,7 @@ def search_messages(request, conv_id):
             "time": _format_time(row["created_at"]),
             "createdAt": row["created_at"],
             "isOwn": row["sender_id"] == user_id,
+            "expiresAt": row["expires_at"],
         })
 
     messages.reverse()
@@ -2784,11 +2933,13 @@ def search_messages(request, conv_id):
 # by display name (NOCASE) with the id as the tiebreaker.
 # Every call spends the 120-per-5-min budget — that is what
 # actually stops directory enumeration; anything under 2
-# chars (or carrying a NUL byte, which would collapse the
-# pattern to '%') answers {users: []} with 200 so the
-# picker can call it on every keystroke. Returns id,
-# username, displayName, avatarUrl, role — no email;
-# username and role are required by the mobile
+# chars answers {users: []} with 200 so the picker can
+# call it on every keystroke. NUL and the other C0
+# controls are stripped first (clean_param — a NUL bound
+# NUL-terminated would collapse the pattern to '%' and page
+# the whole directory), so the 2-char floor judges what is
+# left. Returns id, username, displayName, avatarUrl, role
+# — no email; username and role are required by the mobile
 # SearchUserResult type (frozen contract).
 #
 # Used by:
@@ -2796,6 +2947,7 @@ def search_messages(request, conv_id):
 #     searchUsersApi
 ############################################################
 
+@require_methods("POST")
 @transaction.non_atomic_requests
 @require_auth
 def online_status(request):
@@ -2853,18 +3005,20 @@ def online_status(request):
     return json_response({"online": result, "lastSeen": last_seen})
 
 
+@require_methods("GET")
 @transaction.non_atomic_requests
 @require_auth
 @ratelimit.per_user("chat_user_search", max_attempts=120)
 def search_users(request):
     # Under 2 chars is the keystroke warm-up, not a search —
-    # answered empty with no directory hit at all. A NUL byte
-    # goes out the same door: bound NUL-terminated it would
-    # collapse the pattern to '%' and page the WHOLE directory,
-    # precisely the enumeration this gate exists to stop
+    # answered empty with no directory hit at all. The floor
+    # is judged AFTER clean_param has dropped any control
+    # byte: a NUL bound NUL-terminated would collapse the
+    # pattern to '%' and page the WHOLE directory, precisely
+    # the enumeration this gate exists to stop
     user_id = request.user["id"]
-    q = request.GET.get("q", "").strip()
-    if len(q) < 2 or "\x00" in q:
+    q = clean_param(request.GET.get("q", "")).strip()
+    if len(q) < 2:
         return json_response({"users": []})
 
     # The case-insensitive lookups carry the folding per

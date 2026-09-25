@@ -24,18 +24,35 @@ fi
 
 
 
-# STEP 3: Generate DBGate credentials if they don't exist
+# STEP 3: Generate DbGate credentials if they don't exist
 # =======================================================
+#
+# One password, two forms: DBGATE_PASSWORD is DbGate's own
+# login, DBGATE_BASIC_AUTH_HASH is its bcrypt for the ingress
+# gate in endpoint/Caddyfile (HTTP Basic, user "dbgate"). That
+# gate ships COMMENTED OUT by the owner's decision, so the hash
+# is generated ready but unused until it is uncommented. It is
+# single-quoted in .env because a bcrypt is full of $ and
+# compose interpolates unquoted values.
 if [ ! -f .env ] || ! grep -q "^DBGATE_PASSWORD=" .env; then
-    echo "Generating DBGATE credentials..."
+    echo "Generating DBGATE_PASSWORD ..."
     DBGATE_PASSWORD="$(openssl rand -hex 32)"
-    DBGATE_AUTH_HEADER="$(echo -n "dbgate:$DBGATE_PASSWORD" | base64 -w 0)"
 
     # Only add newline if file doesn't end with one
     [ -f .env ] && [ -n "$(tail -c1 .env 2>/dev/null)" ] && echo "" >> .env
     echo "DBGATE_PASSWORD=$DBGATE_PASSWORD" >> .env
-    echo "DBGATE_AUTH_HEADER=$DBGATE_AUTH_HEADER" >> .env
-    echo "DBGATE credentials added to .env"
+    echo "DBGATE_PASSWORD added to .env"
+fi
+
+if ! grep -q "^DBGATE_BASIC_AUTH_HASH=" .env; then
+    echo "Generating DBGATE_BASIC_AUTH_HASH ..."
+    DBGATE_PASSWORD="$(grep '^DBGATE_PASSWORD=' .env | cut -d= -f2-)"
+    DBGATE_BASIC_AUTH_HASH="$(sudo docker run --rm caddy:2.11-alpine \
+        caddy hash-password --plaintext "$DBGATE_PASSWORD")"
+
+    [ -n "$(tail -c1 .env 2>/dev/null)" ] && echo "" >> .env
+    echo "DBGATE_BASIC_AUTH_HASH='$DBGATE_BASIC_AUTH_HASH'" >> .env
+    echo "DBGATE_BASIC_AUTH_HASH added to .env"
 fi
 
 

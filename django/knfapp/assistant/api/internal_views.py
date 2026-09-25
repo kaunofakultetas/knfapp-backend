@@ -33,6 +33,7 @@
 ############################################################
 
 
+import hmac
 import logging
 import uuid
 from datetime import timedelta
@@ -47,7 +48,7 @@ from knfapp.assistant.models import (
     AssistantMessage, AssistantPrompt, AssistantThread, AssistantTurn, TURN_OUTCOMES,
 )
 from knfapp.assistant.search import search_chunks
-from knfapp.common.http import get_json_object, json_error, json_response
+from knfapp.common.http import clean_param, get_json_object, json_error, json_response, require_methods
 from knfapp.users.models import User
 
 
@@ -81,9 +82,11 @@ PREVIEW_CHARS = 120
 ############################################################
 #
 # The shared-secret gate every route below wears. Refuses
-# with 403 when the header is absent or wrong — and also
-# when the secret itself is unconfigured, so a
-# misconfigured deployment fails closed, never open.
+# with 403 when the header is absent or wrong — compared in
+# constant time, so a byte-by-byte timing never spells the
+# secret out — and also when the secret itself is
+# unconfigured, so a misconfigured deployment fails closed,
+# never open.
 #
 # Used by:
 #   - every view in this file
@@ -94,7 +97,7 @@ def require_internal(view):
     def decorated(request, *args, **kwargs):
         secret = settings.ASSISTANT_INTERNAL_SECRET
         presented = request.META.get("HTTP_X_INTERNAL_SECRET", "")
-        if not secret or presented != secret:
+        if not secret or not hmac.compare_digest(presented.encode(), secret.encode()):
             return json_error("Forbidden", 403)
         return view(request, *args, **kwargs)
     return decorated
@@ -183,10 +186,9 @@ def _thread_payload(thread):
 #   - the assistant container — tools/searchHandbook
 ############################################################
 
+@require_methods("POST")
 @require_internal
 def assistant_search(request):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     body = get_json_object(request)
     if body is None:
         return json_error("Invalid JSON", 400)
@@ -229,10 +231,9 @@ def assistant_search(request):
 #   - the assistant container — cached per minute
 ############################################################
 
+@require_methods("GET")
 @require_internal
 def active_prompt(request):
-    if request.method != "GET":
-        return json_error("Method not allowed", 405)
     row = AssistantPrompt.objects.filter(active=True).values("version", "text").first()
     if row is None:
         return json_response({"version": None, "text": ""})
@@ -256,14 +257,28 @@ def active_prompt(request):
 # it from the answer and, for guests, stores it as the
 # credential it is.
 #
+# An identity the users table does not know (the
+# container's session cache raced an account erasure) is
+# a 400, decided by a LOOKUP before the insert, as
+# threads_claim does. THE RULE on this stack: a
+# try/except IntegrityError around a statement catches
+# UNIQUE and CHECK violations but never a foreign key —
+# Django declares every FK on PostgreSQL DEFERRABLE
+# INITIALLY DEFERRED, so the FK is checked at COMMIT,
+# after the view has returned, and the request answers 500
+# instead. (SQLite checks it at statement time, which is
+# why the old except appeared to work under the suite.) An
+# inner transaction.atomic() would not help either: a
+# savepoint release does not evaluate deferred constraints.
+# The except stays as a belt for the other two violations.
+#
 # Used by:
 #   - the assistant container — POST /api/assistant/threads
 ############################################################
 
+@require_methods("POST")
 @require_internal
 def threads_create(request):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     body = get_json_object(request)
     if body is None:
         return json_error("Invalid JSON", 400)
@@ -271,17 +286,18 @@ def threads_create(request):
     language = body.get("language")
     if language not in ("lt", "en"):
         language = "lt"
+    user_id = body.get("user_id") or None
+    if user_id and not User.objects.filter(id=user_id).exists():
+        return json_error("unknown user_id", 400)
     now = timezone.now()
     try:
         thread = AssistantThread.objects.create(
-            user_id=body.get("user_id") or None,
+            user_id=user_id,
             language=language,
             created_at=now,
             last_message_at=now,
         )
     except IntegrityError:
-        # An identity the users table does not know — the
-        # container's session cache raced an account erasure
         return json_error("unknown user_id", 400)
     return json_response(_thread_payload(thread), status=201)
 
@@ -307,11 +323,10 @@ def threads_create(request):
 #   - the assistant container — GET /api/assistant/threads
 ############################################################
 
+@require_methods("GET")
 @require_internal
 def threads_list(request):
-    if request.method != "GET":
-        return json_error("Method not allowed", 405)
-    user_id = request.GET.get("user_id", "")
+    user_id = clean_param(request.GET.get("user_id", ""))
     if not user_id:
         return json_error("user_id is required", 400)
     threads = (AssistantThread.objects
@@ -343,10 +358,9 @@ def threads_list(request):
 #   - the assistant container — POST /api/assistant/threads/lookup
 ############################################################
 
+@require_methods("POST")
 @require_internal
 def threads_lookup(request):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     body = get_json_object(request)
     if body is None:
         return json_error("Invalid JSON", 400)
@@ -388,10 +402,9 @@ def threads_lookup(request):
 #   - the assistant container — POST /api/assistant/threads/claim
 ############################################################
 
+@require_methods("POST")
 @require_internal
 def threads_claim(request):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     body = get_json_object(request)
     if body is None:
         return json_error("Invalid JSON", 400)
@@ -465,10 +478,11 @@ def _valid_uuids(ids):
 #   - the assistant container — thread open + stream onFinish
 ############################################################
 
+@require_methods("GET", "POST")
 @require_internal
 def thread_messages(request, thread_id):
     if request.method == "GET":
-        thread = _thread_for(thread_id, request.GET.get("user_id"))
+        thread = _thread_for(thread_id, clean_param(request.GET.get("user_id")))
         if thread is None:
             return json_error("Not found", 404)
         rows = thread.messages.order_by("created_at", "id").values("id", "format", "content", "created_at")
@@ -478,8 +492,7 @@ def thread_messages(request, thread_id):
             for row in rows
         ]})
 
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
+    # POST — the turn upsert (the guard admits no third verb)
     body = get_json_object(request)
     if body is None:
         return json_error("Invalid JSON", 400)
@@ -624,10 +637,9 @@ def _first_user_text(messages):
 #   - the assistant container — the kit's thumbs buttons
 ############################################################
 
+@require_methods("POST")
 @require_internal
 def message_feedback(request, thread_id):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     body = get_json_object(request)
     if body is None:
         return json_error("Invalid JSON", 400)
@@ -671,10 +683,9 @@ def message_feedback(request, thread_id):
 #   - the assistant container — thread swipe-to-delete
 ############################################################
 
+@require_methods("POST")
 @require_internal
 def thread_delete(request, thread_id):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     body = get_json_object(request)
     if body is None:
         return json_error("Invalid JSON", 400)
@@ -707,10 +718,9 @@ def thread_delete(request, thread_id):
 #   - the assistant container — after every turn
 ############################################################
 
+@require_methods("POST")
 @require_internal
 def turn_log(request):
-    if request.method != "POST":
-        return json_error("Method not allowed", 405)
     body = get_json_object(request)
     if body is None:
         return json_error("Invalid JSON", 400)

@@ -3,13 +3,16 @@
 #
 #  The two read stores agreeing (the watermark that only
 #  ever advances, the receipt cap, the shared socket+REST
-#  budget), the relationship-gated presence oracle, the
+#  budget, and the send path settling both stores through
+#  the same helper — replying is reading), the
+#  relationship-gated presence oracle, the
 #  people picker's exclusions and ranking, the socket rate
 #  window, and the chat side of erasure and export.
 ############################################################
 
 
 import json
+from unittest.mock import patch
 
 
 from django.test import Client, TestCase
@@ -63,7 +66,7 @@ class MarkReadTests(ReadStateTestCase):
         # so the same statement holds on either engine
         _apply_mark_read(self.room.id, self.tomas.id, stale)
         row = ConversationParticipant.objects.get(conversation_id=self.room.id, user_id=self.tomas.id)
-        self.assertEqual(row.last_read_at.replace(tzinfo=None), fresh)
+        self.assertEqual(row.last_read_at, fresh)
 
     def test_a_non_member_writes_nothing_and_hears_403(self):
         outsider = create_user(username="pasalinis")
@@ -81,6 +84,56 @@ class MarkReadTests(ReadStateTestCase):
         response = bearer(self.client.put, f"/api/chat/conversations/{self.room.id}/read", self.tomas_token)
         self.assertEqual(response.status_code, 429)
         self.assertEqual(json.loads(response.content)["code"], "rate_limited")
+
+
+class SendReadStateTests(ReadStateTestCase):
+
+    def _send(self, token, text):
+        return bearer(self.client.post, f"/api/chat/conversations/{self.room.id}/messages", token,
+                      data=json.dumps({"text": text}), content_type="application/json")
+
+    def test_a_reply_writes_the_receipts_for_what_it_read(self):
+        # Replying is reading: Ona's two messages are in front of
+        # Tomas when he answers inside the client's read debounce.
+        # A hand-written watermark SET here once wrote no receipt
+        # and excluded both rows from every later mark_read
+        first = create_message(self.room, self.ona, minutes_ago=2)
+        second = create_message(self.room, self.ona, minutes_ago=1)
+        self.assertEqual(self._send(self.tomas_token, "gerai").status_code, 201)
+
+        receipts = set(MessageRead.objects.filter(user_id=self.tomas.id)
+                       .values_list("message_id", flat=True))
+        self.assertTrue({first.id, second.id} <= receipts)
+        # ...so Ona's bubbles read "read", never "sent" forever
+        page = json.loads(bearer(self.client.get, f"/api/chat/conversations/{self.room.id}/messages",
+                                 self.ona_token).content)
+        self.assertEqual({m["status"] for m in page["messages"] if m["isOwn"]}, {"read"})
+
+    def test_a_send_never_moves_the_watermark_backwards(self):
+        # A device that marked read a moment "later" (its own
+        # clock ahead) must not have its watermark dragged back
+        # by a send that took its `now` earlier
+        ahead = naive_now(minutes_ago=-10)
+        ConversationParticipant.objects.filter(conversation_id=self.room.id, user_id=self.tomas.id) \
+            .update(last_read_at=ahead)
+        self.assertEqual(self._send(self.tomas_token, "gerai").status_code, 201)
+        row = ConversationParticipant.objects.get(conversation_id=self.room.id, user_id=self.tomas.id)
+        self.assertEqual(row.last_read_at, ahead)
+
+    def test_the_send_fans_out_the_receipts_it_wrote(self):
+        # The counterpart's bubbles flip live — 'messages_read'
+        # rides out exactly as mark_read's would, and only when
+        # something was actually new
+        first = create_message(self.room, self.ona, minutes_ago=1)
+        with patch("knfapp.chat.events.emit_read_receipt") as emit:
+            self._send(self.tomas_token, "gerai")
+        emit.assert_called_once()
+        _, conv_id, reader_id, ids = emit.call_args[0]
+        self.assertEqual((conv_id, reader_id, ids), (self.room.id, self.tomas.id, [first.id]))
+
+        with patch("knfapp.chat.events.emit_read_receipt") as emit:
+            self._send(self.tomas_token, "dar")
+        emit.assert_not_called()
 
 
 class SocketHandshakeTests(TestCase):
